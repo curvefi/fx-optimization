@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+runs/
+# Market candles ship compressed (data/market/*/candles.xz via LFS); the
+# uncompressed JSON is a local working artifact and is not tracked.
+data/market/**/*.json
+data/market/**/*.csv

@@ -1,0 +1,19 @@
+# Smoke / test execution site profile
+schema_version = "site_profile_v1"
+name = "smoke"
+site_type = "local"
+description = "Fast single-worker local execution profile for tests and smoke workflows"
+
+[runner]
+type = "subprocess"
+max_workers = 2
+worker_concurrency = 1
+
+[harness]
+binary_name = "arb_evaluator_ld"
+default_real = "longdouble"
+timeout_seconds = 60
+
+[staging]
+local_scratch = "runs"
+clean_scratch_on_success = false

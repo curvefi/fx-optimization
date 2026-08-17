@@ -1,0 +1,6 @@
+[pair]
+id = "cadd"
+name = "Canadian dollar / US dollar"
+base_token = "CAD"
+quote_token = "USD"
+tags = ["production", "fx", "allowlisted"]

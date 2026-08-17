@@ -1,0 +1,6 @@
+[pair]
+id = "tgbp"
+name = "British pound / US dollar"
+base_token = "GBP"
+quote_token = "USD"
+tags = ["production", "fx", "allowlisted"]

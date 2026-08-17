@@ -1,0 +1,23 @@
+[scenario]
+id = "chfusd-production"
+pair_id = "chfusd"
+name = "CHF/USD allowlisted production window"
+description = "Full Git LFS CHF/USD candle input with Chainlink seed oracle."
+start_time = 1483333200
+end_time = 1779487080
+n_candles = 0
+candle_filter = 99.0
+min_swap = 0.000001
+max_swap = 1.0
+dustswap_freq_s = 3600
+tags = ["production", "allowlisted"]
+
+[[scenario.market_files]]
+path = "data/market/chfusd/candles.json"
+kind = "market"
+sha256 = "46231bbe6e42a99406133768fe4e37572b472b6b6a0cf6d1edbfece44bd95312"
+
+[[scenario.market_files]]
+path = "data/market/chfusd/chainlink-seed.csv"
+kind = "chainlink"
+sha256 = "fe67da78a5622217abe8fa341453a4514a3175c3d89e86c5214f0b0e0f2c03fd"

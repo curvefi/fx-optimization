@@ -1,0 +1,29 @@
+[optimization]
+id = "example-pool-dims"
+pair_id = "chfusd"
+policy_id = "native_policy_dual_ema_stale_cap_v1"
+algorithm = "tmrbcd"
+scenarios = ["chfusd-smoke"]
+
+[optimization.optimizer_config]
+budget = 16
+batch_size = 4
+seed = 42
+
+[optimization.scoring_config]
+score_key = "score_fx_lp_e15_slippage_v1"
+require_yb = false
+
+# Registry-backed parameter space: policy dims and pool-economics dims are
+# first-class search dimensions.  Policy names, defaults, and outer bounds
+# come from the PolicySpec; pool defaults come from the pair template
+# (configs/templates/chfusd-native.json, raw units converted by the
+# per-field scale lookup).  Pool bounds/step/transform come from each
+# parameter_space entry.
+#
+# out_fee is a pool dim (fraction units; default 0.002 from the template,
+# emitted as the raw 1e10-scaled override 20000000 to the harness).
+# kappa is a policy dim (PolicySpec ABI order, index 2).
+[optimization.parameter_space]
+out_fee = { min = 0.001, max = 0.005, step = 0.0005 }
+kappa = { min = 0.5, max = 1.5, step = 0.05 }

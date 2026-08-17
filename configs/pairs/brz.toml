@@ -1,0 +1,6 @@
+[pair]
+id = "brz"
+name = "Brazilian real / US dollar"
+base_token = "BRL"
+quote_token = "USD"
+tags = ["production", "fx", "allowlisted"]

@@ -1,0 +1,51 @@
+[policy]
+id = "native_policy_dual_ema_stale_cap_v1"
+header_file = "policies/native_policy_dual_ema_stale_cap_v1.hpp"
+source_sha256 = "2a73232c998b95cfe43e0cb96fe7542f06fd69594e1c55ea663c837dfb90bd9d"
+policy_abi = "twocrypto_policy_v1"
+policy_kind = "compiled"
+
+[[policy.parameters]]
+name = "fast_half_life_s"
+type = "float"
+default = 3600.0
+min = 60.0
+max = 86400.0
+step = 10.0
+description = "Fast EMA half life in seconds"
+
+[[policy.parameters]]
+name = "slow_half_life_s"
+type = "float"
+default = 86400.0
+min = 60.0
+max = 604800.0
+step = 10.0
+description = "Slow EMA half life in seconds"
+
+[[policy.parameters]]
+name = "kappa"
+type = "float"
+default = 1.0
+min = 0.0
+max = 5.0
+step = 0.05
+description = "Lead-lag gain multiplier"
+
+[[policy.parameters]]
+name = "min_cap_bps"
+type = "float"
+default = 10.0
+min = 0.0
+max = 250.0
+step = 0.5
+description = "Minimum price scale movement cap in basis points"
+
+[[policy.parameters]]
+name = "deadband_bps"
+type = "float"
+default = 0.0
+min = 0.0
+max = 100.0
+step = 0.5
+description = "Target gap deadband in basis points"

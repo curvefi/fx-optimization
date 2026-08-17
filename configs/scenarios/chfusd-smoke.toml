@@ -1,0 +1,20 @@
+[scenario]
+id = "chfusd-smoke"
+pair_id = "chfusd"
+name = "CHF/USD deterministic smoke fixture"
+description = "Checked-in seven-day fixture for local evaluator smoke commands."
+start_time = 1609794000
+end_time = 1610398800
+n_candles = 10080
+candle_filter = 99.0
+min_swap = 0.000001
+max_swap = 1.0
+dustswap_freq_s = 3600
+template_path = "configs/templates/chfusd-native.json"
+template_sha256 = "4978c7d75dee5101a1c50b28af33325f40cc33f73c2ac78f4ad425b8ec5dc992"
+tags = ["smoke", "fixture"]
+
+[[scenario.market_files]]
+path = "data/fixtures/chfusd-smoke.json"
+kind = "market"
+sha256 = "1977aa50f24a1895b817ebe5db93d99b9448568e8c72e89e1f9a54ce25c3728e"

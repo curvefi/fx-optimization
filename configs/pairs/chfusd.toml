@@ -1,0 +1,8 @@
+[pair]
+id = "chfusd"
+name = "Swiss franc / US dollar"
+base_token = "CHF"
+quote_token = "USD"
+base_decimals = 18
+quote_decimals = 18
+tags = ["production", "fx", "allowlisted"]

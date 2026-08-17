@@ -1,0 +1,6 @@
+[pair]
+id = "xauusd"
+name = "Gold / US dollar"
+base_token = "XAU"
+quote_token = "USD"
+tags = ["production", "commodity", "allowlisted"]

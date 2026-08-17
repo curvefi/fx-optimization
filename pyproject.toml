@@ -1,0 +1,32 @@
+[project]
+name = "curve-fx-sim"
+version = "0.1.0"
+description = "Curve FX pool simulation orchestrator, grids, optimization, replay, and evaluation"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "click>=8.1.0",
+    "curve_fx_harness_client",
+    "matplotlib>=3.8.0",
+    "nevergrad==1.0.12",
+    "numpy>=1.26.0",
+    "scipy>=1.11.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+fxsim = "curve_fx_sim.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/curve_fx_sim"]
+
+[tool.uv.sources]
+curve_fx_harness_client = { path = "../curve-fx-arb-harness/python", editable = true }

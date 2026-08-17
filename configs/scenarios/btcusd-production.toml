@@ -1,0 +1,23 @@
+[scenario]
+id = "btcusd-production"
+pair_id = "btcusd"
+name = "BTC/USD allowlisted production window"
+description = "Full Git LFS BTC/USD candles with Chainlink answer history."
+start_time = 1678602600
+end_time = 1781430780
+n_candles = 0
+candle_filter = 99.0
+min_swap = 0.000001
+max_swap = 1.0
+dustswap_freq_s = 3600
+tags = ["production", "allowlisted"]
+
+[[scenario.market_files]]
+path = "data/market/btcusd/candles.json"
+kind = "market"
+sha256 = "6850dbc2b57701e790c6071b48016a9567976adaa3ad42cb145d1b2fe6c7444c"
+
+[[scenario.market_files]]
+path = "data/market/btcusd/chainlink.csv"
+kind = "chainlink"
+sha256 = "3b21c8acda1a2b959807ed413d619a39da4e4294a07389207a29b03ca0d84456"

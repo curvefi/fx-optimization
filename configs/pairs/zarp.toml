@@ -1,0 +1,6 @@
+[pair]
+id = "zarp"
+name = "South African rand / US dollar"
+base_token = "ZAR"
+quote_token = "USD"
+tags = ["production", "fx", "allowlisted"]

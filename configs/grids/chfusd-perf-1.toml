@@ -1,0 +1,30 @@
+[grid]
+id = "chfusd-perf-1"
+pair_id = "chfusd"
+tags = ["test", "perf"]
+fee_equalize = true
+
+[[grid.axes]]
+name = "A"
+target = { path = "A", kind = "integer", scale = 10000 }
+values = [10]
+
+[[grid.axes]]
+name = "donation_apy"
+target = { path = "donation_apy", kind = "decimal" }
+values = [0.0]
+
+[[grid.axes]]
+name = "mid_fee_bps"
+target = { path = "mid_fee", kind = "decimal", scale = 1000000 }
+values = [1]
+
+[[grid.axes]]
+name = "reserved_profit_fraction"
+target = { path = "reserved_profit_fraction", kind = "decimal" }
+values = [100000000]
+
+[[grid.axes]]
+name = "user_swap_size_frac"
+target = { path = "user_swap_size_frac", kind = "decimal" }
+values = [0.0]
