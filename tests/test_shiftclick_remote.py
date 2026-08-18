@@ -47,6 +47,7 @@ def _core() -> dict[str, object]:
 
 class FakeSSHAdapter:
     instances: list["FakeSSHAdapter"] = []
+    fail_replay = False
     resolved_spec: dict[str, object] = {}
     selection: dict[str, object] = {}
     source_run_id = "source_grid"
@@ -58,6 +59,8 @@ class FakeSSHAdapter:
 
     def run_ssh(self, blade: str, command: str, **_kwargs: object) -> ProcessResult:
         self.calls.append(("ssh", blade, command))
+        if self.fail_replay and "replay shiftclick" in command:
+            return ProcessResult(1, "", "replay failed")
         return ProcessResult(0, "", "")
 
     def rsync_upload(self, local_path: Path, blade: str, remote_path: str) -> ProcessResult:
@@ -239,14 +242,18 @@ def _spec_and_remote_manifest(store: RunStore) -> ShiftclickSpec:
     return spec
 
 
-def _site() -> SiteProfile:
+def _site(*, transport: str = "rsync") -> SiteProfile:
     return SiteProfile(
         name="blades",
         site_type="ssh",
         cluster=ClusterConfig(
+            coordinator="blade-b6",
+            transport=transport,
             remote_base=PurePosixPath("/srv/fx"),
+            remote_run_root=PurePosixPath("/srv/fx/runs"),
             repository_root=PurePosixPath("/srv/fx/curve-fx-optimization"),
             worker_command="/srv/fx/bin/fxsim-worker",
+            blades=("blade-b6", "blade-a1"),
         ),
         harness=HarnessConfig(
             remote_binary_path=PurePosixPath("/srv/fx/bin/evaluator")
@@ -278,11 +285,13 @@ def test_remote_shiftclick_stages_source_and_persists_cluster_receipt(
     assert result.blade == "blade-a1"
     assert result.run_dir == store.runs_dir / "shiftclick_exact"
     assert result.manifest["shiftclick"]["source_run_id"] == "source_grid"
+    workspace = result.manifest["shiftclick"]["execution"]["remote_workspace"]
+    assert workspace.startswith("/srv/fx/.workspaces/shiftclick_exact/")
     assert result.manifest["shiftclick"]["execution"] == {
         "scope": "cluster",
         "site": "blades",
         "blade": "blade-a1",
-        "remote_workspace": "/srv/fx/runs/shiftclick_exact/replay_workspace",
+        "remote_workspace": workspace,
     }
     calls = FakeSSHAdapter.instances[0].calls
     commands = [str(call[2]) for call in calls if call[0] == "ssh"]
@@ -291,6 +300,71 @@ def test_remote_shiftclick_stages_source_and_persists_cluster_receipt(
     uploads = [call for call in calls if call[0] == "upload"]
     assert any(call[1] == store.runs_dir / "source_grid" for call in uploads)
     assert any(call[1] == spec_path.resolve() for call in uploads)
+    assert any(
+        call[1] == "blade-a1" and f"rm -rf -- {workspace}" in str(call[2])
+        for call in calls
+        if call[0] == "ssh"
+    )
+
+
+def test_remote_shiftclick_failure_retains_workspace_and_retry_uses_new_token(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='test'\n", encoding="utf-8")
+    store = RunStore(tmp_path)
+    _source_run(store)
+    spec = _spec_and_remote_manifest(store)
+    spec_path = tmp_path / "shiftclick.toml"
+    spec_path.write_text("[shiftclick]\nid='exact'\n", encoding="utf-8")
+    FakeSSHAdapter.instances.clear()
+    FakeSSHAdapter.fail_replay = True
+    monkeypatch.setattr("curve_fx_sim.shiftclick.remote.SSHProcessAdapter", FakeSSHAdapter)
+    tokens = iter(("failed-token", "retry-token"))
+    monkeypatch.setattr("curve_fx_sim.shiftclick.remote.secrets.token_hex", lambda _size: next(tokens))
+
+    with pytest.raises(RuntimeError, match="retained workspace"):
+        run_remote_shiftclick(spec, spec_path=spec_path, store=store, site=_site(), blade="blade-a1")
+    failed_calls = FakeSSHAdapter.instances[-1].calls
+    failed_setup = next(
+        str(call[2]) for call in failed_calls
+        if call[0] == "ssh" and ".workspaces/shiftclick_exact/" in str(call[2])
+    )
+    assert not any(call[0] == "ssh" and "rm -rf --" in str(call[2]) for call in failed_calls)
+
+    FakeSSHAdapter.fail_replay = False
+    result = run_remote_shiftclick(
+        spec, spec_path=spec_path, store=store, site=_site(), blade="blade-a1"
+    )
+    retry_calls = FakeSSHAdapter.instances[-1].calls
+    retry_setup = next(
+        str(call[2]) for call in retry_calls
+        if call[0] == "ssh" and ".workspaces/shiftclick_exact/" in str(call[2])
+    )
+    assert failed_setup != retry_setup
+    assert "/failed-token" in failed_setup and "/retry-token" in retry_setup
+    assert any(call[0] == "ssh" and "rm -rf --" in str(call[2]) for call in retry_calls)
+    assert result.run_dir.is_dir()
+
+
+def test_shared_nfs_shiftclick_transfers_on_coordinator_but_runs_on_selected_blade(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='test'\n", encoding="utf-8")
+    store = RunStore(tmp_path)
+    _source_run(store)
+    spec = _spec_and_remote_manifest(store)
+    spec_path = tmp_path / "shiftclick.toml"
+    spec_path.write_text("[shiftclick]\nid='exact'\n", encoding="utf-8")
+    FakeSSHAdapter.instances.clear()
+    monkeypatch.setattr("curve_fx_sim.shiftclick.remote.SSHProcessAdapter", FakeSSHAdapter)
+
+    run_remote_shiftclick(spec, spec_path=spec_path, store=store, site=_site(transport="shared_nfs"), blade="blade-a1")
+
+    calls = FakeSSHAdapter.instances[0].calls
+    transfer_targets = {call[2][0] for call in calls if call[0] == "upload"}
+    transfer_targets.update(call[1] for call in calls if call[0] == "download")
+    assert transfer_targets == {"blade-b6"}
+    assert any(call[1] == "blade-a1" and "fxsim-worker replay shiftclick" in str(call[2]) for call in calls if call[0] == "ssh")
 
 
 def test_remote_shiftclick_rejects_wrong_source_receipt(

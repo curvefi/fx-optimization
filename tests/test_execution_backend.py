@@ -17,6 +17,7 @@ from curve_fx_harness_client.models import (
 
 from curve_fx_sim.artifacts.manifest import new_grid_manifest, write_manifest_atomic
 from curve_fx_sim.execution.backend import ExecutionBackend, ExecutionBackendError
+from curve_fx_sim.execution.adapter import MockProcessAdapter, ProcessResult
 from curve_fx_sim.execution.collection import (
     CollectionError,
     grid_request_set_sha256,
@@ -24,7 +25,9 @@ from curve_fx_sim.execution.collection import (
     write_shard_result,
 )
 from curve_fx_sim.execution.sharding import make_assignments
-from curve_fx_sim.execution.site import SiteProfile
+from curve_fx_sim.execution.site import ClusterConfig, SiteProfile
+from curve_fx_sim.execution.staging import prepare_work_bundle
+from pathlib import PurePosixPath
 
 
 class MockBatchEvaluatorClient:
@@ -256,9 +259,7 @@ def test_execution_backend_never_reuses_process_across_runs(tmp_path: Path) -> N
     assert created_clients[1].current_session_id == "sess_run_B_local"
 
 
-def test_is_shard_complete_checks_row_count_only(tmp_path: Path) -> None:
-    """_is_shard_complete treats a receipt as complete by row count alone,
-    without per-shard digest/identity re-verification."""
+def test_is_shard_complete_rejects_changed_request_identity(tmp_path: Path) -> None:
     from curve_fx_sim.execution.backend import _is_shard_complete
 
     run_dir = tmp_path / "count_only"
@@ -289,19 +290,59 @@ def test_is_shard_complete_checks_row_count_only(tmp_path: Path) -> None:
         request_set_sha256=grid_request_set_sha256(manifest, session_attestation),
         session_attestation=session_attestation,
     )
-    assert _is_shard_complete(receipt, assignments[0].ranges) is True
-    # The candidate set changed after the receipt was written; the count-only
-    # check still considers the shard complete.
+    kwargs = {
+        "run_id": "count_only",
+        "request_set_sha256": grid_request_set_sha256(manifest, session_attestation),
+        "session_attestation": session_attestation,
+    }
+    assert _is_shard_complete(receipt, assignments[0], **kwargs) is True
     manifest["grid"]["pools"][0]["policy_params"] = [1.0]
-    assert _is_shard_complete(receipt, assignments[0].ranges) is True
-    # A missing receipt or a mismatched row count is not complete.
-    assert _is_shard_complete(receipt.with_name("missing.json"), assignments[0].ranges) is False
+    kwargs["request_set_sha256"] = grid_request_set_sha256(manifest, session_attestation)
+    assert _is_shard_complete(receipt, assignments[0], **kwargs) is False
+    assert _is_shard_complete(receipt.with_name("missing.json"), assignments[0], **kwargs) is False
     with receipt.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
     payload["rows"].pop()
     payload["row_count"] = len(payload["rows"])
     receipt.write_text(json.dumps(payload), encoding="utf-8")
-    assert _is_shard_complete(receipt, assignments[0].ranges) is False
+    assert _is_shard_complete(receipt, assignments[0], **kwargs) is False
+
+
+def test_rsync_stages_each_target_and_checks_failures(tmp_path: Path) -> None:
+    run_dir = tmp_path / "rsync_stage"
+    run_dir.mkdir()
+    manifest_file = run_dir / "manifest.json"
+    _write_manifest(manifest_file, _manifest("rsync_stage", 1))
+    bundle = prepare_work_bundle(manifest_file, root=tmp_path, remote_base="/srv/fx")
+    site = SiteProfile(
+        name="nfs", site_type="ssh",
+        cluster=ClusterConfig(
+            coordinator="blade-c", transport="rsync",
+            remote_base=PurePosixPath("/srv/fx"),
+            remote_run_root=PurePosixPath("/srv/fx/runs"),
+            repository_root=PurePosixPath("/srv/fx/repo"),
+            worker_command="/srv/fx/bin/worker", blades=("blade-c", "blade-w"),
+        ),
+    )
+    adapter = MockProcessAdapter()
+    ExecutionBackend(site_profile=site, process_adapter=adapter)._stage_remote_bundle(
+        bundle, ["blade-w", "blade-c"], include_shards=True
+    )
+    targets = {
+        argument.split("@", 1)[-1].split(":", 1)[0]
+        for call in adapter.calls
+        if call["argv"][0] == "rsync"
+        for argument in call["argv"]
+        if "@blade-" in argument
+    }
+    assert targets == {"blade-c", "blade-w"}
+    assert all("--protect-args" in call["argv"] for call in adapter.calls if call["argv"][0] == "rsync")
+    failing = MockProcessAdapter()
+    failing.register_handler(
+        lambda argv: argv[0] == "rsync", ProcessResult(23, "", "copy failed")
+    )
+    with pytest.raises(ExecutionBackendError, match="failed to stage"):
+        ExecutionBackend(site_profile=site, process_adapter=failing)._stage_remote_bundle(bundle, ["blade-w"], include_shards=False)
 
 
 def test_resume_reexecutes_shard_with_mismatched_row_count(tmp_path: Path) -> None:

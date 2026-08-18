@@ -428,13 +428,31 @@ def fetch_remote_shards(
     ssh_config: SSHConfig | None = None,
     adapter: ProcessAdapter | None = None,
 ) -> None:
-    """Download all canonical remote shard artifacts to local results directory."""
+    """Collect remote receipts, once through the coordinator for shared NFS."""
     run_id = validate_run_id(str(manifest.get("run_id", "")))
     remote_base = PurePosixPath(str(manifest.get("remote_base", "/home/heswithme/arb")))
     assignments, _ = _manifest_grid_shards(manifest)
 
     ssh_adapter = SSHProcessAdapter(ssh_config=ssh_config, process_runner=adapter)
     local_results_dir.mkdir(parents=True, exist_ok=True)
+
+    if manifest.get("remote_transport") == "shared_nfs":
+        coordinator = str(manifest.get("remote_coordinator", ""))
+        if not coordinator:
+            raise CollectionError("shared-NFS manifest has no remote_coordinator")
+        remote_results = scoped_remote_path(
+            run_id, "results", remote_base=remote_base
+        )
+        result = ssh_adapter.rsync_download(
+            coordinator,
+            str(remote_results),
+            local_results_dir.parent,
+        )
+        if not result.ok:
+            raise CollectionError(
+                f"failed to fetch shared results through {coordinator}:{remote_results}: {result.stderr}"
+            )
+        return
 
     for desc in assignments:
         blade = str(desc.get("blade", ""))

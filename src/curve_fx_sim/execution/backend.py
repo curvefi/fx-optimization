@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import shlex
 import time
 import uuid
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ from ..artifacts.manifest import load_manifest, write_manifest_atomic
 from .collection import (
     CollectionError,
     _load_shard_records,
+    _rows_checksum,
     collect_grid_results,
     grid_request_set_sha256,
     normalize_session_attestation,
@@ -32,6 +34,14 @@ from .collection import (
 from .evaluator_pool import EvaluatorRegistry
 from .sharding import ShardAssignment, make_assignments, write_ranges_file
 from .site import SiteProfile, load_site_profile
+from .shared_nfs import (
+    SharedRunLease,
+    fetch_authoritative_run,
+    grid_identity_sha256,
+    shared_run_lease,
+    stage_local_file_immutable,
+    stage_run_directory_atomic,
+)
 from .staging import WorkBundle, prepare_work_bundle, remote_run_paths, validate_run_id
 
 
@@ -87,17 +97,42 @@ def _attempt_recorded(manifest_file: Path, attempt_id: int) -> bool:
 
 def _is_shard_complete(
     shard_file: Path,
-    ranges: Sequence[tuple[int, int]],
+    assignment: ShardAssignment,
+    *,
+    run_id: str,
+    request_set_sha256: str,
+    session_attestation: Mapping[str, str],
 ) -> bool:
-    """Return true when a shard receipt exists with the full expected row count."""
+    """Accept resume state only when its complete identity still matches."""
     if not shard_file.is_file():
         return False
     try:
         payload, records = _load_shard_records(shard_file)
     except Exception:  # noqa: BLE001
         return False
-    expected_count = sum(end - start for start, end in ranges)
-    return payload.get("row_count") == expected_count and len(records) == expected_count
+    expected_indices = [
+        index for start, end in assignment.ranges for index in range(start, end)
+    ]
+    try:
+        observed_attestation = normalize_session_attestation(
+            payload.get("session_attestation"),
+            expected_session_id=str(session_attestation["session_id"]),
+        )
+        observed_indices = [int(record["pool_index"]) for record in records]
+    except (CollectionError, KeyError, TypeError, ValueError):
+        return False
+    return (
+        payload.get("run_id") == run_id
+        and payload.get("shard_id") == assignment.shard_id
+        and payload.get("shard_index") == assignment.shard_index
+        and payload.get("ranges") == [list(item) for item in assignment.ranges]
+        and payload.get("row_count") == len(expected_indices)
+        and len(records) == len(expected_indices)
+        and observed_indices == expected_indices
+        and payload.get("rows_sha256") == _rows_checksum(records)
+        and payload.get("request_set_sha256") == request_set_sha256
+        and observed_attestation == dict(session_attestation)
+    )
 
 
 def _extract_candidates_for_ranges(manifest: Mapping[str, Any], ranges: Sequence[tuple[int, int]]) -> list[dict[str, Any]]:
@@ -260,6 +295,7 @@ class ExecutionBackend:
         client_factory: Callable[[str, str], EvaluatorClient] | None = None,
     ) -> None:
         self.site = site_profile or load_site_profile("local")
+        self.site.validate()
         self.adapter = process_adapter or LocalProcessAdapter()
         self.harness_binary = Path(harness_binary) if harness_binary else None
         binary_path: Path | PurePosixPath | str = self.harness_binary or self.site.harness.binary_name
@@ -270,6 +306,162 @@ class ExecutionBackend:
             binary_path=binary_path,
             ssh_config=self.site.ssh,
             default_timeout=self.site.harness.timeout_seconds,
+        )
+
+    def _shared_run_is_mounted(self, path: Path) -> bool:
+        if self.site.cluster.transport != "shared_nfs":
+            return False
+        try:
+            path.resolve().relative_to(Path(str(self.site.cluster.remote_run_root)).resolve())
+        except ValueError:
+            return False
+        return True
+
+    @staticmethod
+    def _require_ok(result: Any, action: str) -> None:
+        if not result.ok:
+            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            raise ExecutionBackendError(f"{action}: {detail}")
+
+    def _materialize_shared_bundle(self, bundle: WorkBundle) -> None:
+        """Place immutable inputs once in the NFS run namespace."""
+        copies: list[tuple[Path, Path]] = [
+            (
+                bundle.session_manifest_local.parent / "session_manifest.remote.json",
+                Path(str(bundle.session_manifest_remote)),
+            )
+        ]
+        if bundle.template_local is not None and bundle.template_remote is not None:
+            copies.append((bundle.template_local, Path(str(bundle.template_remote))))
+        copies.extend(
+            (entry.local_path, Path(str(entry.remote_path))) for entry in bundle.market_files
+        )
+        for source, destination in copies:
+            if source.resolve() != destination.resolve():
+                stage_local_file_immutable(source, destination)
+
+    def _stage_remote_bundle(
+        self,
+        bundle: WorkBundle,
+        blades: Sequence[str],
+        *,
+        include_shards: bool,
+    ) -> None:
+        if self.site.cluster.transport == "shared_nfs" and self._shared_run_is_mounted(bundle.manifest_local):
+            self._materialize_shared_bundle(bundle)
+            return
+        if self.site.cluster.transport == "shared_nfs":
+            raise ExecutionBackendError(
+                "off-mount shared-NFS staging must use the leased coordinator run path"
+            )
+        ssh = SSHProcessAdapter(ssh_config=self.site.ssh, process_runner=self.adapter)
+        paths = remote_run_paths(bundle.run_id, remote_base=self.site.cluster.remote_base)
+        targets = (
+            [self.site.cluster.coordinator]
+            if self.site.cluster.transport == "shared_nfs"
+            else list(dict.fromkeys(blades))
+        )
+        for blade in targets:
+            self._require_ok(
+                ssh.run_ssh(
+                    blade,
+                    "mkdir -p " + " ".join(
+                        shlex.quote(str(paths[key]))
+                        for key in ("root", "inputs", "shards", "results", "logs", "data")
+                    ),
+                ),
+                f"failed to prepare run namespace on {blade}",
+            )
+            uploads: list[tuple[Path, PurePosixPath]] = [
+                (bundle.manifest_local, paths["manifest"]),
+                (
+                    bundle.session_manifest_local.parent / "session_manifest.remote.json",
+                    bundle.session_manifest_remote,
+                ),
+            ]
+            if bundle.template_local is not None and bundle.template_remote is not None:
+                uploads.append((bundle.template_local, bundle.template_remote))
+            uploads.extend((entry.local_path, entry.remote_path) for entry in bundle.market_files)
+            if include_shards and bundle.shards_local_dir is not None:
+                uploads.append((bundle.shards_local_dir, paths["shards"]))
+            for source, destination in uploads:
+                self._require_ok(
+                    ssh.rsync_upload(source, blade, str(destination)),
+                    f"failed to stage {source.name} through {blade}",
+                )
+
+    def _run_grid_via_coordinator(
+        self,
+        manifest_file: Path,
+        *,
+        resume: bool,
+        blades: Sequence[str] | None,
+        chunk_size: int | None,
+        lease: SharedRunLease,
+    ) -> ExecutionSummary:
+        """Stage a run once, then let the NFS coordinator own execution."""
+        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+        run_id = validate_run_id(str(manifest.get("run_id", manifest_file.parent.name)))
+        paths = remote_run_paths(run_id, remote_base=self.site.cluster.remote_base)
+        coordinator = self.site.cluster.coordinator
+        ssh = SSHProcessAdapter(ssh_config=self.site.ssh, process_runner=self.adapter)
+        immutable_identity = grid_identity_sha256(manifest)
+        if resume:
+            fetch_authoritative_run(lease, manifest_file.parent.parent)
+            remote_manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            if grid_identity_sha256(remote_manifest) != immutable_identity:
+                raise ExecutionBackendError(
+                    "remote resume authority does not match the local immutable grid request"
+                )
+        else:
+            stage_run_directory_atomic(lease, manifest_file.parent)
+        worker = shlex.quote(self.site.cluster.worker_command)
+        command = (
+            f"cd {shlex.quote(str(self.site.cluster.repository_root))} && "
+            f"env FXSIM_RUN_LEASE_TOKEN={shlex.quote(lease.token)} "
+            f"{worker} grid run {shlex.quote(str(paths['manifest']))} "
+            f"--site {shlex.quote(self.site.name)}"
+        )
+        for blade in blades or ():
+            command += f" --blades {shlex.quote(blade)}"
+        if resume:
+            command += " --resume"
+        if chunk_size is not None:
+            command += f" --chunk-size {int(chunk_size)}"
+        executed = ssh.run_ssh(
+            coordinator, command, timeout=self.site.harness.timeout_seconds
+        )
+        if not executed.ok:
+            try:
+                fetch_authoritative_run(lease, manifest_file.parent.parent)
+            except Exception as recovery_error:
+                raise ExecutionBackendError(
+                    f"shared-NFS grid execution failed on {coordinator}: {executed.stderr}; "
+                    f"failed to recover its run journal: {recovery_error}"
+                ) from recovery_error
+            self._require_ok(
+                executed, f"shared-NFS grid execution failed on {coordinator}"
+            )
+        fetch_authoritative_run(lease, manifest_file.parent.parent)
+        finished = json.loads(manifest_file.read_text(encoding="utf-8"))
+        attempts = finished.get("attempt_history", [])
+        if not isinstance(attempts, list) or not attempts or attempts[-1].get("status") != "succeeded":
+            raise ExecutionBackendError("remote grid command returned without a succeeded attempt receipt")
+        topology = attempts[-1].get("topology_metadata", {})
+        output = manifest_file.parent / "grid_results.npz"
+        if not output.is_file():
+            raise ExecutionBackendError("remote grid command did not publish grid_results.npz")
+        return ExecutionSummary(
+            run_id=run_id,
+            scope="cluster",
+            status="succeeded",
+            total_pools=int(finished["grid"]["pool_count"]),
+            duration_seconds=executed.duration_seconds,
+            output_path=output,
+            manifest_path=manifest_file,
+            attempts_count=len(attempts),
+            skipped_shards=int(topology.get("skipped_shards", 0)),
+            executed_shards=int(topology.get("executed_shards", 0)),
         )
 
     def dispatch_candidates(
@@ -313,26 +505,13 @@ class ExecutionBackend:
 
         is_cluster = self.site.site_type == "ssh" or bool(blades)
         active_blades = list(blades) if blades else list(self.site.cluster.blades)
+        if is_cluster:
+            self.site.validate_blades(active_blades)
         if not active_blades:
             active_blades = ["local"] if not is_cluster else ["blade-b1"]
 
-        # Stage bundle to blades if cluster
         if is_cluster:
-            ssh_adapter = SSHProcessAdapter(ssh_config=self.site.ssh, process_runner=self.adapter)
-            remote_base = self.site.cluster.remote_base
-            paths = remote_run_paths(bundle.run_id, remote_base=remote_base)
-            for b in set(active_blades):
-                ssh_adapter.run_ssh(b, f"mkdir -p {paths['root']} {paths['inputs']} {paths['shards']} {paths['results']} {paths['logs']} {paths['data']}")
-                ssh_adapter.rsync_upload(bundle.manifest_local, b, str(paths["manifest"]))
-                ssh_adapter.rsync_upload(
-                    bundle.session_manifest_local.parent / "session_manifest.remote.json",
-                    b,
-                    str(bundle.session_manifest_remote),
-                )
-                if bundle.template_local and bundle.template_remote:
-                    ssh_adapter.rsync_upload(bundle.template_local, b, str(bundle.template_remote))
-                for m in bundle.market_files:
-                    ssh_adapter.rsync_upload(m.local_path, b, str(m.remote_path))
+            self._stage_remote_bundle(bundle, active_blades, include_shards=False)
 
         # Chunk candidates across blades
         chunk_size = min(len(candidates), self.site.harness.chunk_size)
@@ -372,10 +551,56 @@ class ExecutionBackend:
         blades: Sequence[str] | None = None,
         chunk_size: int | None = None,
     ) -> ExecutionSummary:
+        manifest_file = Path(manifest_path).resolve()
+        if blades:
+            self.site.validate_blades(blades)
+        if self.site.cluster.transport != "shared_nfs":
+            return self._run_grid_unlocked(
+                manifest_file, resume=resume, blades=blades, chunk_size=chunk_size
+            )
+        if not manifest_file.is_file():
+            raise FileNotFoundError(f"manifest file not found at {manifest_file}")
+        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+        run_id = validate_run_id(str(manifest.get("run_id", manifest_file.parent.name)))
+        with shared_run_lease(self.site, run_id, adapter=self.adapter) as lease:
+            if self._shared_run_is_mounted(manifest_file) and not lease.inherited:
+                raise ExecutionBackendError(
+                    "shared-NFS grid runs must enter through the coordinator staging path"
+                )
+            return self._run_grid_unlocked(
+                manifest_file,
+                resume=resume,
+                blades=blades,
+                chunk_size=chunk_size,
+                lease=lease,
+            )
+
+    def _run_grid_unlocked(
+        self,
+        manifest_path: Path | str,
+        *,
+        resume: bool = False,
+        blades: Sequence[str] | None = None,
+        chunk_size: int | None = None,
+        lease: SharedRunLease | None = None,
+    ) -> ExecutionSummary:
         """Execute a grid run partitioned across local workers or cluster blades."""
         manifest_file = Path(manifest_path).resolve()
         if not manifest_file.is_file():
             raise FileNotFoundError(f"manifest file not found at {manifest_file}")
+        if (
+            self.site.site_type == "ssh"
+            and self.site.cluster.transport == "shared_nfs"
+            and not self._shared_run_is_mounted(manifest_file)
+        ):
+            assert lease is not None
+            return self._run_grid_via_coordinator(
+                manifest_file,
+                resume=resume,
+                blades=blades,
+                chunk_size=chunk_size,
+                lease=lease,
+            )
         with manifest_file.open("r", encoding="utf-8") as handle:
             manifest = json.load(handle)
         run_id = validate_run_id(str(manifest.get("run_id", manifest_file.parent.name)))
@@ -432,6 +657,10 @@ class ExecutionBackend:
             write_ranges_file(shards_dir / f"{assignment.shard_id}.ranges", assignment.ranges)
         manifest.setdefault("grid", {})["shards"] = [a.to_dict() for a in assignments]
         manifest["scope"] = "cluster" if is_cluster else "local"
+        if is_cluster:
+            manifest["remote_base"] = str(self.site.cluster.remote_base)
+            manifest["remote_transport"] = self.site.cluster.transport
+            manifest["remote_coordinator"] = self.site.cluster.coordinator
         write_manifest_atomic(manifest_file, manifest, expected_kind=str(manifest.get("run_kind", "grid")))
         try:
             bundle = prepare_work_bundle(
@@ -548,7 +777,13 @@ class ExecutionBackend:
         pending = []
         for assignment in assignments:
             shard_out = results_dir / f"{assignment.shard_id}.json"
-            if resume and _is_shard_complete(shard_out, assignment.ranges):
+            if resume and _is_shard_complete(
+                shard_out,
+                assignment,
+                run_id=run_id,
+                request_set_sha256=request_set_sha256,
+                session_attestation=attestation,
+            ):
                 skipped_count += 1
             else:
                 pending.append(assignment)
@@ -658,32 +893,8 @@ class ExecutionBackend:
         results_dir = run_dir / "results"
         run_id = bundle.run_id
         total_pools = len(manifest.get("grid", {}).get("pools", ()))
-        remote_base = self.site.cluster.remote_base
-        paths = remote_run_paths(run_id, remote_base=remote_base)
-        ssh_adapter = SSHProcessAdapter(ssh_config=self.site.ssh, process_runner=self.adapter)
-
-        # Keep first-seen assignment order for staging, worker creation, and
-        # diagnostics; set iteration would make manifests nondeterministic.
         active_blades = list(dict.fromkeys(assignment.blade for assignment in assignments))
-        for blade in active_blades:
-            ssh_adapter.run_ssh(
-                blade,
-                f"mkdir -p {paths['root']} {paths['inputs']} {paths['shards']} {paths['results']} {paths['logs']} {paths['data']}",
-            )
-            ssh_adapter.rsync_upload(manifest_file, blade, str(paths["manifest"]))
-            ssh_adapter.rsync_upload(
-                bundle.session_manifest_local.parent / "session_manifest.remote.json",
-                blade,
-                str(bundle.session_manifest_remote),
-            )
-            if bundle.template_local and bundle.template_remote:
-                ssh_adapter.run_ssh(blade, f"mkdir -p {bundle.template_remote.parent}")
-                ssh_adapter.rsync_upload(bundle.template_local, blade, str(bundle.template_remote))
-            for market in bundle.market_files:
-                ssh_adapter.run_ssh(blade, f"mkdir -p {market.remote_path.parent}")
-                ssh_adapter.rsync_upload(market.local_path, blade, str(market.remote_path))
-            if bundle.shards_local_dir:
-                ssh_adapter.rsync_upload(bundle.shards_local_dir, blade, str(paths["shards"]))
+        self._stage_remote_bundle(bundle, active_blades, include_shards=True)
 
         clients: dict[str, EvaluatorClient] = {}
         session_attestations: dict[str, dict[str, str]] = {}
@@ -708,7 +919,10 @@ class ExecutionBackend:
             blade = assignment.blade
             if resume and _is_shard_complete(
                 results_dir / f"{assignment.shard_id}.json",
-                assignment.ranges,
+                assignment,
+                run_id=run_id,
+                request_set_sha256=request_set_digests[blade],
+                session_attestation=session_attestations[blade],
             ):
                 skipped_count += 1
             else:

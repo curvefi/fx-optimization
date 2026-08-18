@@ -30,6 +30,14 @@ from curve_fx_harness_client.models import CandidateSpec, ObservationSpec
 from ..evaluation.selection import SelectionRef
 from ..execution.adapter import SSHProcessAdapter
 from ..execution.site import SiteProfile, load_site_profile
+from ..execution.shared_nfs import (
+    canonical_sha256,
+    execution_site_payload,
+    expected_worker_sha256,
+    fetch_authoritative_run,
+    package_identity_sha256,
+    shared_run_lease,
+)
 from ..execution.staging import remote_run_paths, scoped_remote_path
 from ..specs.common import repository_root
 from ..specs.optimization import OptimizationSpec, load_optimization_spec
@@ -113,15 +121,35 @@ def _dispatch_remote_bundle(
     if local_result.is_file():
         return load_checked()
     paths = remote_run_paths(bundle.run_id, remote_base=site.cluster.remote_base)
-    remote_bundle = scoped_remote_path(bundle.run_id, f"inputs/{local_bundle.name}", remote_base=site.cluster.remote_base)
-    remote_result = scoped_remote_path(bundle.run_id, f"results/{local_result.name}", remote_base=site.cluster.remote_base)
+    shared = site.cluster.transport == "shared_nfs"
+    if shared:
+        try:
+            run_dir.resolve().relative_to(Path(str(site.cluster.remote_run_root)).resolve())
+        except ValueError as exc:
+            raise RuntimeError(
+                "shared-NFS optimization must be launched through the configured coordinator"
+            ) from exc
+        remote_bundle = local_bundle
+        remote_result = local_result
+    else:
+        remote_bundle = scoped_remote_path(
+            bundle.run_id,
+            f"inputs/{local_bundle.name}",
+            remote_base=site.cluster.remote_base,
+        )
+        remote_result = scoped_remote_path(
+            bundle.run_id,
+            f"results/{local_result.name}",
+            remote_base=site.cluster.remote_base,
+        )
     ssh = SSHProcessAdapter(ssh_config=site.ssh)
-    setup = ssh.run_ssh(blade, f"mkdir -p {shlex.quote(str(paths['inputs']))} {shlex.quote(str(paths['results']))}")
-    if not setup.ok:
-        raise RuntimeError(f"failed to prepare remote run on {blade}: {setup.stderr}")
-    uploaded = ssh.rsync_upload(local_bundle, blade, str(remote_bundle))
-    if not uploaded.ok:
-        raise RuntimeError(f"failed to stage optimization bundle {bundle.bundle_id}: {uploaded.stderr}")
+    if not shared:
+        setup = ssh.run_ssh(blade, f"mkdir -p {shlex.quote(str(paths['inputs']))} {shlex.quote(str(paths['results']))}")
+        if not setup.ok:
+            raise RuntimeError(f"failed to prepare remote run on {blade}: {setup.stderr}")
+        uploaded = ssh.rsync_upload(local_bundle, blade, str(remote_bundle))
+        if not uploaded.ok:
+            raise RuntimeError(f"failed to stage optimization bundle {bundle.bundle_id}: {uploaded.stderr}")
     worker = shlex.quote(site.cluster.worker_command)
     repository = shlex.quote(str(site.cluster.repository_root))
     harness = shlex.quote(str(site.harness.remote_binary_path or site.harness.binary_name))
@@ -134,10 +162,119 @@ def _dispatch_remote_bundle(
     executed = ssh.run_ssh(blade, command)
     if not executed.ok:
         raise RuntimeError(f"remote optimization worker failed on {blade}: {executed.stderr}")
-    downloaded = ssh.rsync_download(blade, str(remote_result), local_result)
-    if not downloaded.ok:
-        raise RuntimeError(f"failed to collect optimization result {bundle.bundle_id}: {downloaded.stderr}")
+    if not shared:
+        downloaded = ssh.rsync_download(blade, str(remote_result), local_result)
+        if not downloaded.ok:
+            raise RuntimeError(f"failed to collect optimization result {bundle.bundle_id}: {downloaded.stderr}")
+    elif not local_result.is_file():
+        raise RuntimeError(
+            f"shared-NFS worker did not publish optimization result {bundle.bundle_id}"
+        )
     return load_checked()
+
+
+def _run_optimization_via_coordinator(
+    opt_spec: OptimizationSpec,
+    *,
+    run_store: RunStore,
+    root: Path,
+    site: SiteProfile,
+    blades: Sequence[str],
+    run_id: str,
+    resume: bool,
+    budget: int | None,
+    batch_size: int | None,
+    top_k_count: int,
+    execution_closure_sha256: str,
+    lease: Any,
+) -> OptimizationResult:
+    """Launch the control plane on NFS and collect the completed run once."""
+    configured_budget = int(opt_spec.optimizer_config.get("budget", 100))
+    configured_batch = int(opt_spec.optimizer_config.get("batch_size", 4))
+    if (
+        (budget is not None and int(budget) != configured_budget)
+        or (batch_size is not None and int(batch_size) != configured_batch)
+        or top_k_count != 8
+    ):
+        raise ValueError(
+            "shared-NFS coordinator launch requires budget, batch_size, and top_k in the immutable spec"
+        )
+    if opt_spec.source_path is None:
+        raise ValueError("shared-NFS coordinator launch requires a checked-in optimization spec")
+    local_spec = (root / opt_spec.source_path).resolve()
+    remote_spec = site.cluster.repository_root / opt_spec.source_path.as_posix()
+    ssh = SSHProcessAdapter(ssh_config=site.ssh)
+    coordinator = site.cluster.coordinator
+    inspected = ssh.run_ssh(
+        coordinator,
+        f"sha256sum {shlex.quote(str(remote_spec))}",
+    )
+    if not inspected.ok:
+        raise RuntimeError(f"failed to inspect optimization spec on {coordinator}: {inspected.stderr}")
+    remote_digest = inspected.stdout.strip().split(maxsplit=1)[0] if inspected.stdout.strip() else ""
+    if remote_digest != sha256_path(local_spec):
+        raise RuntimeError("remote optimization spec differs from the local checked-in authority")
+    if not resume:
+        remote_run = site.cluster.remote_run_root / run_id
+        absent = ssh.run_ssh(
+            coordinator, f"test ! -e {shlex.quote(str(remote_run))}"
+        )
+        if not absent.ok:
+            raise RuntimeError("non-resume optimization destination already exists")
+    worker = shlex.quote(site.cluster.worker_command)
+    repository = shlex.quote(str(site.cluster.repository_root))
+    command = (
+        f"cd {repository} && "
+        f"env FXSIM_RUN_LEASE_TOKEN={shlex.quote(lease.token)} "
+        f"FXSIM_EXECUTION_CLOSURE_SHA256={shlex.quote(execution_closure_sha256)} "
+        f"{worker} optimize run {shlex.quote(str(remote_spec))} "
+        f"--site {shlex.quote(site.name)} --run-id {shlex.quote(run_id)} "
+        f"--output-root {repository}"
+    )
+    for blade in blades:
+        command += f" --blades {shlex.quote(blade)}"
+    if resume:
+        command += " --resume"
+    executed = ssh.run_ssh(coordinator, command, timeout=site.harness.timeout_seconds)
+    if not executed.ok:
+        try:
+            fetch_authoritative_run(lease, run_store.runs_dir)
+        except Exception as recovery_error:
+            raise RuntimeError(
+                f"shared-NFS optimization failed on {coordinator}: {executed.stderr}; "
+                f"failed to recover its run journal: {recovery_error}"
+            ) from recovery_error
+        raise RuntimeError(f"shared-NFS optimization failed on {coordinator}: {executed.stderr}")
+    fetch_authoritative_run(lease, run_store.runs_dir)
+    result = collect_optimization(run_id, store=run_store, repository=root)
+    manifest = run_store.load_manifest(run_id, expected_kind="optimization")
+    if manifest.get("resolved_spec", {}).get("execution_closure_sha256") != execution_closure_sha256:
+        raise RuntimeError("remote optimization manifest has the wrong execution closure")
+    return result
+
+
+def _inspect_remote_execution_closure(site: SiteProfile) -> dict[str, str]:
+    repository = str(site.cluster.repository_root)
+    python = site.cluster.repository_root / ".venv" / "bin" / "python"
+    command = (
+        f"sha256sum {shlex.quote(site.cluster.worker_command)} && "
+        f"{shlex.quote(str(python))} -m curve_fx_sim.execution.shared_nfs "
+        f"{shlex.quote(repository)}"
+    )
+    result = SSHProcessAdapter(ssh_config=site.ssh).run_ssh(
+        site.cluster.coordinator, command
+    )
+    if not result.ok:
+        raise RuntimeError(
+            f"failed to inspect remote execution closure on {site.cluster.coordinator}: {result.stderr}"
+        )
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(lines) != 2:
+        raise RuntimeError("remote execution closure inspection returned invalid output")
+    return {
+        "worker_sha256": lines[0].split(maxsplit=1)[0],
+        "package_sha256": lines[1],
+    }
 
 
 def _inspect_remote_core(site: SiteProfile, blade: str) -> dict[str, Any]:
@@ -293,6 +430,8 @@ def _run_optimization(
     )
     if distributed and not target_blades:
         raise ValueError(f"site {site_profile.name!r} has no blades configured")
+    if site_profile is not None:
+        site_profile.validate_blades(target_blades)
 
     if isinstance(spec_or_path, OptimizationSpec):
         opt_spec = spec_or_path
@@ -482,6 +621,52 @@ def _run_optimization(
         "score_key": score_key,
     }
     run_identity_sha256 = hashlib.sha256(canonical_json_bytes(run_identity)).hexdigest()
+    execution_closure_sha256: str | None = None
+    if distributed and site_profile is not None and site_profile.cluster.transport == "shared_nfs":
+        remote_execution = _inspect_remote_execution_closure(site_profile)
+        local_package_sha256 = package_identity_sha256(root)
+        if remote_execution["package_sha256"] != local_package_sha256:
+            raise ValueError("remote optimizer package differs from the local execution closure")
+        if remote_execution["worker_sha256"] != expected_worker_sha256(site_profile):
+            raise ValueError("remote worker wrapper differs from the configured bootstrap closure")
+        execution_closure_sha256 = canonical_sha256(
+            {
+                "run_identity": run_identity,
+                "package_sha256": local_package_sha256,
+                "worker_sha256": remote_execution["worker_sha256"],
+                "site": execution_site_payload(site_profile, target_blades),
+            }
+        )
+        expected_closure = os.environ.get("FXSIM_EXECUTION_CLOSURE_SHA256")
+        if expected_closure and expected_closure != execution_closure_sha256:
+            raise ValueError("remote resolved execution closure differs from coordinator request")
+        if root.as_posix() != str(site_profile.cluster.repository_root):
+            if resume:
+                local_identity = run_identity_sha256
+            with shared_run_lease(site_profile, actual_run_id) as lease:
+                if resume:
+                    fetch_authoritative_run(lease, run_store.runs_dir)
+                    checkpoint = run_store.get_run_dir(actual_run_id) / "checkpoint.json"
+                    try:
+                        remote_checkpoint = json.loads(checkpoint.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError) as exc:
+                        raise ValueError("remote resume authority has no valid checkpoint") from exc
+                    if remote_checkpoint.get("run_identity_sha256") != local_identity:
+                        raise ValueError("remote resume authority has a different immutable identity")
+                return _run_optimization_via_coordinator(
+                    opt_spec,
+                    run_store=run_store,
+                    root=root,
+                    site=site_profile,
+                    blades=target_blades,
+                    run_id=actual_run_id,
+                    resume=resume,
+                    budget=budget,
+                    batch_size=batch_size,
+                    top_k_count=top_k_count,
+                    execution_closure_sha256=execution_closure_sha256,
+                    lease=lease,
+                )
     run_dir = (
         run_store.get_run_dir(actual_run_id)
         if resume
@@ -520,6 +705,8 @@ def _run_optimization(
             )
         if cp_data.get("run_identity_sha256") != run_identity_sha256:
             raise ValueError("Resume identity mismatch: policy, lattice, scenario, or evaluator changed")
+        if cp_data.get("execution_closure_sha256") != execution_closure_sha256:
+            raise ValueError("Resume identity mismatch: execution closure changed")
 
         # The journal is the plain row log: rows already in it are already
         # evaluated and are skipped, not re-run.  A crash between a journal
@@ -576,6 +763,7 @@ def _run_optimization(
         "evaluator_identity": evaluator_ident_dict,
         "yb_settings": yb_settings,
         "score_key": score_key,
+        "execution_closure_sha256": execution_closure_sha256,
     }
 
     # Publish a compact checkpoint after each journal batch is appended.
@@ -595,6 +783,7 @@ def _run_optimization(
             "yb_settings": yb_settings,
             "score_key": score_key,
             "run_identity_sha256": run_identity_sha256,
+            "execution_closure_sha256": execution_closure_sha256,
             "step": step,
             "optimizer_state": opt_snapshot,
         }
@@ -993,6 +1182,7 @@ def _run_optimization(
             "policy_source_sha256": verified_policy_sha256,
             "yb_settings": yb_settings,
             "metric_projection": metric_projection.to_dict(),
+            "execution_closure_sha256": execution_closure_sha256,
         },
         candidates_evaluated=len(eval_rows),
         best_candidate={
@@ -1051,6 +1241,39 @@ def run_optimization(
     """Execute an optimization run and close every internally pooled evaluator."""
     owned_clients: list[ScenarioHarnessClient] = []
     try:
+        root = repository.resolve() if repository is not None else repository_root()
+        distributed = site != "local" or bool(blades)
+        profile = load_site_profile(site, root=root) if distributed else None
+        if profile is not None and profile.cluster.transport == "shared_nfs":
+            spec = (
+                spec_or_path
+                if isinstance(spec_or_path, OptimizationSpec)
+                else load_optimization_spec(spec_or_path, repository=root)
+            )
+            actual_run_id = run_id or spec.id or f"opt_{uuid.uuid4().hex[:12]}"
+            with shared_run_lease(profile, actual_run_id) as lease:
+                previous = os.environ.get("FXSIM_RUN_LEASE_TOKEN")
+                os.environ["FXSIM_RUN_LEASE_TOKEN"] = lease.token
+                try:
+                    return _run_optimization(
+                        spec,
+                        store=store,
+                        client=client,
+                        run_id=actual_run_id,
+                        resume=resume,
+                        budget=budget,
+                        batch_size=batch_size,
+                        top_k_count=top_k_count,
+                        repository=root,
+                        site=site,
+                        blades=blades,
+                        _owned_clients=owned_clients,
+                    )
+                finally:
+                    if previous is None:
+                        os.environ.pop("FXSIM_RUN_LEASE_TOKEN", None)
+                    else:
+                        os.environ["FXSIM_RUN_LEASE_TOKEN"] = previous
         return _run_optimization(
             spec_or_path,
             store=store,

@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
-from .site import SSHConfig
+from .site import SSHConfig, validate_remote_host, validate_remote_path
 
 
 @dataclass(frozen=True)
@@ -120,6 +120,8 @@ class SSHProcessAdapter:
 
     def build_ssh_argv(self, blade: str, command: str) -> list[str]:
         """Construct the full argv list for an SSH invocation."""
+        self.ssh_config.validate()
+        validate_remote_host(blade, "SSH target")
         argv: list[str] = ["ssh"]
         argv.extend(self.ssh_config.options)
         if self.ssh_config.key:
@@ -157,6 +159,9 @@ class SSHProcessAdapter:
         delete: bool = False,
     ) -> ProcessResult:
         """Upload a local file or directory to a remote blade using rsync."""
+        self.ssh_config.validate()
+        validate_remote_host(blade, "rsync target")
+        remote_path = str(validate_remote_path(remote_path, "rsync remote path"))
         ssh_cmd_parts = ["ssh"] + list(self.ssh_config.options)
         if self.ssh_config.key:
             ssh_cmd_parts.extend(["-i", str(self.ssh_config.key)])
@@ -165,10 +170,10 @@ class SSHProcessAdapter:
         ssh_str = " ".join(shlex.quote(p) for p in ssh_cmd_parts)
 
         target = f"{self.ssh_config.user}@{blade}:{remote_path}" if self.ssh_config.user else f"{blade}:{remote_path}"
-        argv: list[str] = ["rsync", "-avz", "-e", ssh_str]
+        argv: list[str] = ["rsync", "-az", "--protect-args", "-e", ssh_str]
         if delete:
             argv.append("--delete")
-        argv.extend([str(local_path), target])
+        argv.extend(["--", str(local_path), target])
 
         return self._runner.run(argv, timeout=timeout)
 
@@ -181,6 +186,9 @@ class SSHProcessAdapter:
         timeout: float = 300.0,
     ) -> ProcessResult:
         """Download a remote file or directory to the local filesystem using rsync."""
+        self.ssh_config.validate()
+        validate_remote_host(blade, "rsync source")
+        remote_path = str(validate_remote_path(remote_path, "rsync remote path"))
         ssh_cmd_parts = ["ssh"] + list(self.ssh_config.options)
         if self.ssh_config.key:
             ssh_cmd_parts.extend(["-i", str(self.ssh_config.key)])
@@ -190,7 +198,10 @@ class SSHProcessAdapter:
 
         source = f"{self.ssh_config.user}@{blade}:{remote_path}" if self.ssh_config.user else f"{blade}:{remote_path}"
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        argv: list[str] = ["rsync", "-avz", "-e", ssh_str, source, str(local_path)]
+        argv: list[str] = [
+            "rsync", "-az", "--protect-args", "-e", ssh_str,
+            "--", source, str(local_path),
+        ]
 
         return self._runner.run(argv, timeout=timeout)
 

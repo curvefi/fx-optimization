@@ -1,4 +1,4 @@
-"""Masked metric derivation, shared by the interactive viewer and the heatmap CLI.
+"""Masked metric derivation shared by heatmap rendering and the CLI.
 
 Semantics are the legacy ``plot_heatmap_nd_opt.py`` masks verbatim: every
 masked metric is its source metric with NaN wherever ``max_7d_rel_price_diff``

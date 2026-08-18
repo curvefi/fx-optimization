@@ -1,5 +1,5 @@
 # Remote cluster blades site profile for curve-fx-optimization
-schema_version = "site_profile_v1"
+schema_version = "site_profile_v2"
 name = "blades"
 site_type = "ssh"
 description = "Remote shared-NFS Ice Lake blade cluster"
@@ -10,16 +10,16 @@ key = "~/.ssh/id_rsa2"
 port = 22
 connect_timeout = 10
 options = [
-    "-o", "StrictHostKeyChecking=no",
-    "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "StrictHostKeyChecking=accept-new",
     "-o", "BatchMode=yes",
     "-o", "ConnectTimeout=10",
 ]
 
 [cluster]
 coordinator = "blade-b6"
-remote_base = "/home/heswithme/arb"
-remote_run_root = "/home/heswithme/arb/runs"
+transport = "shared_nfs"
+remote_base = "/home/heswithme/arb/curve-fx-optimization"
+remote_run_root = "/home/heswithme/arb/curve-fx-optimization/runs"
 repository_root = "/home/heswithme/arb/curve-fx-optimization"
 worker_command = "/home/heswithme/arb/bin/fxsim-worker"
 logical_cores_per_blade = 128

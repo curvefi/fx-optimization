@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import shlex
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -16,7 +17,7 @@ from ..artifacts.store import RunStore
 from ..evaluation.selection import load_attested_evaluation_table, normalize_selection
 from ..execution.adapter import SSHProcessAdapter
 from ..execution.site import SiteProfile
-from ..execution.staging import scoped_remote_path
+from ..execution.shared_nfs import shared_run_lease
 from ..specs.shiftclick import ShiftclickSpec
 from .runner import selection_from_spec
 
@@ -182,6 +183,42 @@ def run_remote_shiftclick(
     site: SiteProfile,
     blade: str,
 ) -> RemoteShiftclickResult:
+    site.validate()
+    site.validate_blades((blade,))
+    run_id = f"shiftclick_{spec.id}"
+    ssh = SSHProcessAdapter(ssh_config=site.ssh)
+    if site.cluster.transport == "shared_nfs":
+        with shared_run_lease(site, run_id, ssh_adapter=ssh) as lease:
+            return _run_remote_shiftclick_unlocked(
+                spec,
+                spec_path=spec_path,
+                store=store,
+                site=site,
+                blade=blade,
+                attempt_token=lease.token,
+                ssh=ssh,
+            )
+    return _run_remote_shiftclick_unlocked(
+        spec,
+        spec_path=spec_path,
+        store=store,
+        site=site,
+        blade=blade,
+        attempt_token=secrets.token_hex(16),
+        ssh=ssh,
+    )
+
+
+def _run_remote_shiftclick_unlocked(
+    spec: ShiftclickSpec,
+    *,
+    spec_path: Path,
+    store: RunStore,
+    site: SiteProfile,
+    blade: str,
+    attempt_token: str,
+    ssh: SSHProcessAdapter,
+) -> RemoteShiftclickResult:
     """Stage one source run into an isolated remote workspace and replay it."""
     if site.site_type != "ssh":
         raise ValueError(f"remote shiftclick requires an SSH site, got {site.site_type!r}")
@@ -193,31 +230,64 @@ def run_remote_shiftclick(
     if local_run_dir.exists():
         raise FileExistsError(f"immutable shiftclick output already exists: {local_run_dir}")
 
-    workspace = scoped_remote_path(
-        run_id,
-        "replay_workspace",
-        remote_base=site.cluster.remote_base,
+    shared_mounted = False
+    if site.cluster.transport == "shared_nfs":
+        try:
+            source_dir.resolve().relative_to(
+                Path(str(site.cluster.remote_run_root)).resolve()
+            )
+            spec_path.resolve().relative_to(
+                Path(str(site.cluster.repository_root)).resolve()
+            )
+            shared_mounted = True
+        except ValueError:
+            pass
+    workspace = (
+        site.cluster.remote_base / ".workspaces" / run_id / attempt_token
     )
     workspace_runs = workspace / "runs"
-    remote_spec = workspace / "shiftclick.toml"
+    remote_spec = (
+        spec_path.resolve() if shared_mounted else workspace / "shiftclick.toml"
+    )
     remote_repo = site.cluster.repository_root
-    ssh = SSHProcessAdapter(ssh_config=site.ssh)
+    transfer_host = (
+        site.cluster.coordinator
+        if site.cluster.transport == "shared_nfs"
+        else blade
+    )
+    runs_setup = (
+        f"ln -s {shlex.quote(str(site.cluster.remote_run_root))} "
+        f"{shlex.quote(str(workspace_runs))}"
+        if shared_mounted
+        else f"mkdir -p {shlex.quote(str(workspace_runs))}"
+    )
     setup_command = (
-        f"test ! -e {shlex.quote(str(workspace))} && "
-        f"mkdir -p {shlex.quote(str(workspace_runs))} && "
+        f"mkdir -p {shlex.quote(str(workspace.parent))} && "
+        f"mkdir {shlex.quote(str(workspace))} && "
+        f"{runs_setup} && "
         f"touch {shlex.quote(str(workspace / 'pyproject.toml'))} && "
         f"ln -s {shlex.quote(str(remote_repo / 'data'))} {shlex.quote(str(workspace / 'data'))} && "
         f"ln -s {shlex.quote(str(remote_repo / 'configs'))} {shlex.quote(str(workspace / 'configs'))}"
     )
-    setup = ssh.run_ssh(blade, setup_command)
+    setup = ssh.run_ssh(transfer_host, setup_command)
     if not setup.ok:
-        raise RuntimeError(f"failed to create remote shiftclick workspace on {blade}: {setup.stderr}")
-    source_upload = ssh.rsync_upload(source_dir, blade, f"{workspace_runs}/")
-    if not source_upload.ok:
-        raise RuntimeError(f"failed to stage source run on {blade}: {source_upload.stderr}")
-    spec_upload = ssh.rsync_upload(spec_path.resolve(), blade, str(remote_spec))
-    if not spec_upload.ok:
-        raise RuntimeError(f"failed to stage shiftclick spec on {blade}: {spec_upload.stderr}")
+        raise RuntimeError(
+            f"failed to create remote shiftclick workspace on {transfer_host}: {setup.stderr}; "
+            f"attempt workspace: {workspace}"
+        )
+    if not shared_mounted:
+        source_upload = ssh.rsync_upload(source_dir, transfer_host, f"{workspace_runs}/")
+        if not source_upload.ok:
+            raise RuntimeError(
+                f"failed to stage source run on {transfer_host}: {source_upload.stderr}; "
+                f"retained workspace: {workspace}"
+            )
+        spec_upload = ssh.rsync_upload(spec_path.resolve(), transfer_host, str(remote_spec))
+        if not spec_upload.ok:
+            raise RuntimeError(
+                f"failed to stage shiftclick spec on {transfer_host}: {spec_upload.stderr}; "
+                f"retained workspace: {workspace}"
+            )
 
     worker = shlex.quote(site.cluster.worker_command)
     harness = shlex.quote(str(site.harness.remote_binary_path or site.harness.binary_name))
@@ -227,12 +297,22 @@ def run_remote_shiftclick(
     )
     executed = ssh.run_ssh(blade, command, timeout=site.harness.timeout_seconds)
     if not executed.ok:
-        raise RuntimeError(f"remote shiftclick failed on {blade}: {executed.stderr}")
+        raise RuntimeError(
+            f"remote shiftclick failed on {blade}: {executed.stderr}; "
+            f"retained workspace: {workspace}"
+        )
 
-    remote_result = workspace_runs / run_id
-    downloaded = ssh.rsync_download(blade, str(remote_result), store.runs_dir)
-    if not downloaded.ok:
-        raise RuntimeError(f"failed to collect remote shiftclick from {blade}: {downloaded.stderr}")
+    if shared_mounted:
+        if not local_run_dir.is_dir():
+            raise RuntimeError("shared-NFS shiftclick did not publish its run directory")
+    else:
+        remote_result = workspace_runs / run_id
+        downloaded = ssh.rsync_download(transfer_host, str(remote_result), store.runs_dir)
+        if not downloaded.ok:
+            raise RuntimeError(
+                f"failed to collect remote shiftclick from {transfer_host}: {downloaded.stderr}; "
+                f"retained workspace: {workspace}"
+            )
     manifest_path = local_run_dir / "manifest.json"
     manifest = load_manifest(manifest_path, expected_kind="shiftclick")
     verify_manifest_artifacts(manifest, run_dir=local_run_dir)
@@ -256,6 +336,14 @@ def run_remote_shiftclick(
     )
     write_manifest_atomic(manifest_path, manifest, expected_kind="shiftclick")
     manifest = load_manifest(manifest_path, expected_kind="shiftclick")
+    cleanup = ssh.run_ssh(
+        transfer_host,
+        f"rm -rf -- {shlex.quote(str(workspace))}",
+    )
+    if not cleanup.ok:
+        raise RuntimeError(
+            f"verified shiftclick result but failed to clean workspace {workspace}: {cleanup.stderr}"
+        )
     return RemoteShiftclickResult(
         blade=blade,
         run_dir=local_run_dir,

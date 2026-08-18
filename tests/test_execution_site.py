@@ -13,6 +13,8 @@ from curve_fx_sim.execution.site import (
     SiteProfileError,
     find_site_profile_path,
     load_site_profile,
+    validate_remote_host,
+    validate_remote_path,
 )
 
 
@@ -31,6 +33,7 @@ def test_blades_profile() -> None:
     assert "blade-b1" in profile.cluster.blades
     assert profile.ssh.user == "heswithme"
     assert profile.cluster.coordinator == "blade-b6"
+    assert profile.cluster.transport == "shared_nfs"
     assert profile.cluster.repository_root == PurePosixPath("/home/heswithme/arb/curve-fx-optimization")
     assert profile.cluster.worker_command == "/home/heswithme/arb/bin/fxsim-worker"
     assert profile.harness.remote_binary_path == PurePosixPath("/home/heswithme/arb/bin/arb_evaluator_ld")
@@ -78,3 +81,39 @@ def test_site_profile_from_dict() -> None:
     assert profile.harness.binary_name == "custom_eval"
     assert profile.harness.remote_binary_path == PurePosixPath("/opt/evaluators/custom_eval")
     assert profile.runner.max_workers == 8
+
+
+def test_ssh_defaults_and_insecure_options() -> None:
+    assert SSHConfig().options == (
+        "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+    )
+    for options in (
+        ("-o", "StrictHostKeyChecking=no"),
+        ("-o", "UserKnownHostsFile=/dev/null"),
+    ):
+        with pytest.raises(SiteProfileError, match="allow-listed"):
+            SSHConfig.from_dict({"options": options})
+
+    with pytest.raises(SiteProfileError, match="unsafe characters"):
+        validate_remote_host("blade-1;rm")
+    with pytest.raises(SiteProfileError, match="non-root absolute"):
+        validate_remote_path("/srv/fx/../tmp")
+
+
+def test_shared_nfs_site_validation_and_transport() -> None:
+    data = {
+        "name": "nfs", "site_type": "ssh",
+        "cluster": {
+            "coordinator": "node-1", "blades": ["node-1", "node-2"],
+            "transport": "shared_nfs", "remote_base": "/srv/fx",
+            "repository_root": "/srv/fx/repo", "worker_command": "/srv/fx/bin/worker",
+        },
+    }
+    assert SiteProfile.from_dict(data).cluster.transport == "shared_nfs"
+    with pytest.raises(SiteProfileError, match="coordinator"):
+        SiteProfile.from_dict({**data, "cluster": {**data["cluster"], "coordinator": "node-3"}})
+    with pytest.raises(SiteProfileError, match="unsupported cluster"):
+        SiteProfile.from_dict({**data, "cluster": {**data["cluster"], "extra": True}})
+    with pytest.raises(SiteProfileError, match="shared_nfs transport"):
+        SiteProfile.from_dict({**data, "site_type": "local"})

@@ -1,5 +1,5 @@
 # Local execution site profile for curve-fx-optimization
-schema_version = "site_profile_v1"
+schema_version = "site_profile_v2"
 name = "local"
 site_type = "local"
 description = "Local workstation execution using subprocess workers"
@@ -17,7 +17,3 @@ worker_concurrency = 1
 binary_name = "arb_evaluator_ld"
 default_real = "longdouble"
 timeout_seconds = 3600
-
-[staging]
-local_scratch = "runs"
-clean_scratch_on_success = false

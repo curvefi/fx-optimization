@@ -1,7 +1,7 @@
 """Deterministic tests for optimization runtime, status, resume lifecycle, and artifact generation."""
 
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Mapping, Sequence
 
 import pytest
@@ -9,6 +9,8 @@ import pytest
 from curve_fx_sim.artifacts.store import RunStore
 from curve_fx_sim.artifacts.io import atomic_write_json, sha256_path
 from curve_fx_sim.artifacts.tables import EvaluationTable
+from curve_fx_sim.execution.adapter import ProcessResult
+from curve_fx_sim.execution.site import ClusterConfig, SiteProfile
 from curve_fx_sim.evaluation.client import HarnessClient, ScenarioHarnessClient
 from curve_fx_sim.evaluation.identity import VerifiedEvaluator
 from curve_fx_harness_client.models import (
@@ -23,6 +25,7 @@ from curve_fx_harness_client.models import (
 from curve_fx_sim.evaluation.selection import SelectionRef
 from curve_fx_sim.optimization.runtime import (
     EVALUATION_JOURNAL_FILENAME,
+    _dispatch_remote_bundle,
     collect_optimization,
     run_optimization,
     status_optimization,
@@ -622,6 +625,52 @@ def test_blade_work_bundle_preserves_primary_metrics_and_evaluation_status(
     result_path = tmp_path / "bundle-result.json"
     result.to_json(result_path)
     assert OptimizationBundleResult.from_json(result_path) == result
+
+
+def test_shared_nfs_bundle_skips_per_bundle_transfers(tmp_path: Path, mock_specs, monkeypatch) -> None:
+    store, pair, scenario, policy, opt_spec = mock_specs
+    identity = MockHarnessClient(policy).prepare()
+    profile = profile_from_policy_spec(policy)
+    bundle = create_work_bundle(
+        run_id="shared-opt", optimization_id=opt_spec.id, island_id="blade-a1", step=0,
+        profile=profile, pair_spec=pair, scenarios=(scenario,),
+        evaluator_identity=identity.to_dict(), yb_settings={"require_yb": False},
+        score_key="score_fx_lp_e15_slippage_v1",
+        proposals=({"ordinal": 0, "ask_id": "ask_0", "params": [1.0, 2.0]},),
+    )
+    site = SiteProfile(
+        name="nfs", site_type="ssh",
+        cluster=ClusterConfig(
+            coordinator="blade-b6", transport="shared_nfs",
+            remote_base=PurePosixPath(tmp_path),
+            remote_run_root=PurePosixPath(store.runs_dir),
+            repository_root=PurePosixPath("/srv/fx"), worker_command="/srv/fx/bin/worker",
+            blades=("blade-b6", "blade-a1"),
+        ),
+    )
+    class FakeSSH:
+        uploads: list[object] = []
+        downloads: list[object] = []
+        def __init__(self, **_kwargs: object) -> None: pass
+        def run_ssh(self, blade: str, command: str, **_kwargs: object) -> ProcessResult:
+            out = Path(command.split("--out ", 1)[1].split()[0].strip("'\""))
+            OptimizationBundleResult(
+                bundle_id=bundle.bundle_id, bundle_sha256=bundle.bundle_sha256,
+                island_id=bundle.island_id,
+                results=({"ask_id": "ask_0"},), elapsed_ms=0.0,
+            ).to_json(out)
+            return ProcessResult(0, "", "")
+        def rsync_upload(self, *args: object, **_kwargs: object) -> ProcessResult:
+            self.uploads.append(args); return ProcessResult(0, "", "")
+        def rsync_download(self, *args: object, **_kwargs: object) -> ProcessResult:
+            self.downloads.append(args); return ProcessResult(0, "", "")
+    monkeypatch.setattr("curve_fx_sim.optimization.runtime.SSHProcessAdapter", FakeSSH)
+    result = _dispatch_remote_bundle(
+        bundle, run_dir=store.runs_dir / bundle.run_id, site=site, blade="blade-a1",
+        expected_ask_ids=frozenset({"ask_0"}),
+    )
+    assert result.results[0]["ask_id"] == "ask_0"
+    assert not FakeSSH.uploads and not FakeSSH.downloads
 
 
 def test_blade_work_bundle_splits_policy_and_pool_dims_per_candidate(

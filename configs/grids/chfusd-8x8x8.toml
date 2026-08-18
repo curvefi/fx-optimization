@@ -1,0 +1,41 @@
+[grid]
+id = "chfusd-8x8x8"
+pair_id = "chfusd"
+tags = ["production", "native-pool", "fx", "8x8x8"]
+fee_equalize = true
+
+# 8x8x8 grid (512 points) over primary axes: A x donation_apy x mid_fee_bps
+# with baseline reserved_profit_fraction (10%) and user_swap_size_frac (2%).
+[[grid.axes]]
+name = "A"
+target = { path = "A", scale = 10000, kind = "integer" }
+values = [10, 14.7189, 23.8626, 35.1231, 56.9425, 76.0927, 135.8799, 200]
+
+[[grid.axes]]
+name = "donation_apy"
+target = { path = "donation_apy", kind = "decimal" }
+values = [
+  0.0,
+  0.012903225806451613,
+  0.02903225806451613,
+  0.041935483870967745,
+  0.05806451612903226,
+  0.07096774193548387,
+  0.08709677419354839,
+  0.1,
+]
+
+[[grid.axes]]
+name = "mid_fee_bps"
+target = { path = "mid_fee", scale = 1000000, kind = "decimal" }
+values = [1, 2.16129, 3.612903, 4.774194, 6.225806, 7.387097, 8.83871, 10]
+
+[[grid.axes]]
+name = "reserved_profit_fraction"
+target = { path = "reserved_profit_fraction", kind = "decimal" }
+values = [1000000000]
+
+[[grid.axes]]
+name = "user_swap_size_frac"
+target = { path = "user_swap_size_frac", kind = "decimal" }
+values = [0.02]
