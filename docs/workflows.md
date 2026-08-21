@@ -37,7 +37,7 @@ uv run --frozen --no-sync fxsim grid collect \
   runs/grid_yb_weth_a_fee_donation_8/manifest.json
 ```
 
-The generated manifest records grouped candidate plans compiled from the selected schema. Run it locally without `--harness`; grouped blade execution requires the configured Linux coordinator and its selected artifact.
+The generated manifest records grouped candidate plans compiled from the selected schema. Run it locally with the selected artifact; grouped blade execution requires the configured Linux coordinator and its selected artifact.
 
 ## Optimization lifecycle
 
@@ -69,22 +69,18 @@ uv run --frozen --no-sync fxsim view \
 
 `fxsim view RUN_DIR` opens separate Heatmaps, Controls, and Metrics windows. Use
 `--out` for a PNG export and adjacent state sidecar; export is immutable and
-does not open a legacy `--arb` compatibility path. Plain clicks update the
+does not open a direct-binary path. Plain clicks update the
 metrics window. Shift-click replays the exact table cell with its attested
 source YieldBasis mode and strict economic comparison. Right-click selects the
 same `SelectionRef`, disables YieldBasis, and records a sparse counterfactual
-trace targeting roughly 10,000 observations. Both use `--harness` locally or a
-configured `--site`/`--blade` remotely.
+trace targeting roughly 10,000 observations. Both use the selected artifact
+locally or a configured `--site`/`--blade` remotely.
 Heatmaps read the attested `evaluation_table.npz`; trajectories read an attested
 trace selected from a shiftclick `manifest.json`.
 
-## Compatibility-only legacy mode
-
-Direct `--harness` execution and a site `remote_binary_path` are retained only for older binary-selected runs. They are not equivalent to the selected artifact authority or the grouped grid/optimization workflow above.
-
 ## Shiftclick selections
 
-The replay examples below use the compatibility binary path; they do not replace the selected artifact authority.
+The replay examples below use the selected evaluator artifact.
 
 Create the directory and a TOML under `configs/shiftclick/` with a required `source_run_id`:
 
@@ -104,10 +100,9 @@ Run it with:
 
 ```sh
 uv run --frozen --no-sync fxsim replay shiftclick \
-  configs/shiftclick/chfusd_optimizer_winner.toml \
-  --harness /path/to/curve-fx-arb-harness/build/arb_evaluator_ld
+  configs/shiftclick/chfusd_optimizer_winner.toml
 ```
 
-For one-blade replay, use `--site blades --blades blade-b6` instead of the local harness option. The command stages the source run in an isolated remote workspace, runs the same exact selection against the deployed compiled evaluator, verifies fingerprint/metrics/sidecars there, and downloads the attested shiftclick run.
+For one-blade replay, use `--site blades --blades blade-b6`. The command stages the source run in an isolated remote workspace, runs the same exact selection against the deployed compiled evaluator, verifies fingerprint/metrics and the packed NPZ/companion there, and downloads the attested shiftclick run.
 
-For a grid point, use `source_kind = "grid"`, `selection_kind = "coordinates"`, and a non-empty `selection_value` mapping (or select an integer `index`/`candidate_id`); grid `best` is intentionally ambiguous and rejected. A shiftclick run is written to `runs/shiftclick_{id}/` with `trace/` sidecars, `replay_result.json`, `economic_comparison.json`, and `manifest.json`. Sidecar hashes and the summary/full economic fingerprint are checked before publication.
+For a grid point, use `source_kind = "grid"`, `selection_kind = "coordinates"`, and a non-empty `selection_value` mapping (or select an integer `index`/`candidate_id`); grid `best` is intentionally ambiguous and rejected. A shiftclick run is written to `runs/shiftclick_{id}/` with `replay_trace.npz`, `replay_trace.json`, `replay_result.json`, `economic_comparison.json`, and `manifest.json`. Private evaluator JSON staging is removed after packing; packed hashes and the summary/full economic fingerprint are checked before publication.

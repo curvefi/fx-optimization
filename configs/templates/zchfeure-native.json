@@ -1,0 +1,38 @@
+{
+  "pools": [
+    {
+      "tag": "zchfeure_native_fx",
+      "pool": {
+        "initial_liquidity": [
+          "20585255318123935738067",
+          "20882548678390474679515"
+        ],
+        "A": "1000000",
+        "gamma": "100000000000000",
+        "mid_fee": "3000000",
+        "out_fee": "3000000",
+        "fee_gamma": "1000000000000000",
+        "adjustment_step_min": "1000000",
+        "adjustment_step_max": "5000000000000000",
+        "ma_time": "14420",
+        "reserved_profit_fraction": "5000000000",
+        "admin_fee": "5000000000",
+        "policy": {
+          "kind": "none"
+        },
+        "initial_price": "932100000000000000",
+        "start_timestamp": "1734307200",
+        "donation_apy": "0",
+        "donation_frequency": "3600",
+        "donation_duration": "604800",
+        "donation_coins_ratio": "0.5"
+      },
+      "costs": {
+        "arb_fee_bps": 10,
+        "gas_coin0": 0.0,
+        "use_volume_cap": false,
+        "volume_cap_mult": 1
+      }
+    }
+  ]
+}

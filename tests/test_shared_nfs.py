@@ -129,7 +129,6 @@ def test_load_site_profile_table(tmp_path: Path) -> None:
         (project_root, "local", ("local", "local", "rsync")),
         (project_root, "blades", (
             "blades", "ssh", "shared_nfs", "blade-b6", "blade-b1", "blade-d2", 18,
-            "/home/heswithme/arb/bin/arb_evaluator_ld",
         )),
         (invalid_root, "unknown", SiteProfileError),
     )
@@ -141,9 +140,8 @@ def test_load_site_profile_table(tmp_path: Path) -> None:
         profile = load_site_profile(name, root=root)
         assert isinstance(profile, SiteProfile)
         assert (profile.name, profile.site_type, profile.cluster.transport) == expected[:3]
-        if len(expected) == 8:
+        if len(expected) == 7:
             assert profile.cluster.coordinator == expected[3]
             assert profile.cluster.blades[0] == expected[4]
             assert profile.cluster.blades[-1] == expected[5]
             assert len(profile.cluster.blades) == expected[6]
-            assert str(profile.harness.remote_binary_path) == expected[7]

@@ -10,6 +10,4 @@ max_workers = 2
 worker_concurrency = 1
 
 [harness]
-binary_name = "arb_evaluator_ld"
-default_real = "longdouble"
 timeout_seconds = 60

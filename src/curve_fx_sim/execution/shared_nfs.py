@@ -2,10 +2,11 @@ from __future__ import annotations
 from contextlib import contextmanager
 import hashlib, json, os
 from pathlib import Path, PurePosixPath; from typing import Any, Iterator, Mapping, Sequence
-import secrets, shlex, shutil
+import secrets, shlex
 from .adapter import ProcessAdapter, SSHProcessAdapter
+from ..artifacts.io import sha256_path
 from .site import SiteProfile
-from .staging import sha256_path, validate_run_id
+from .paths import validate_run_id
 class SharedNFSError(RuntimeError): pass
 def canonical_sha256(value: Any) -> str:
     return hashlib.sha256(json.dumps(
@@ -17,7 +18,7 @@ def grid_identity_sha256(manifest: Mapping[str, Any]) -> str:
     return canonical_sha256({"run_id": manifest.get("run_id"),
         "resolved_spec": manifest.get("resolved_spec"), "core": manifest.get("core"),
         "grid": {key: grid.get(key) for key in
-                 ("grid_id", "pool_count", "resolved_axes", "pools")},
+                 ("grid_id", "pool_count", "plan")},
     })
 class SharedRunLease:
     def __init__(self, site: SiteProfile, run_id: str, *, adapter: ProcessAdapter | None = None,
@@ -111,23 +112,6 @@ def fetch_authoritative_run(lease: SharedRunLease, local_runs_dir: Path) -> Path
         lease.site.cluster.coordinator, str(remote), local_runs_dir)
     if not result.ok: raise SharedNFSError(f"failed to fetch authoritative remote run: {result.stderr}")
     return local_runs_dir / lease.run_id
-def stage_local_file_immutable(source: Path, destination: Path) -> None:
-    expected = sha256_path(source); destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists():
-        if not destination.is_file() or sha256_path(destination) != expected:
-            raise SharedNFSError(f"immutable shared input differs: {destination}")
-        return
-    temporary = destination.with_name(f".{destination.name}.{secrets.token_hex(12)}.tmp")
-    shutil.copyfile(source, temporary)
-    try:
-        try:
-            os.link(temporary, destination)
-        except FileExistsError:
-            if not destination.is_file() or sha256_path(destination) != expected:
-                raise SharedNFSError(
-                    f"immutable shared input raced with different content: {destination}")
-    finally:
-        temporary.unlink(missing_ok=True)
 def package_identity_sha256(root: Path) -> str:
     files = [p.relative_to(root) for p in (root / "src" / "curve_fx_sim").rglob("*.py")
              if p.is_file()]
@@ -141,8 +125,7 @@ def package_identity_sha256(root: Path) -> str:
         digest.update(relative.as_posix().encode() + b"\0"); digest.update(
             bytes.fromhex(sha256_path(root / relative)))
     return digest.hexdigest()
-def execution_site_payload(site: SiteProfile, blades: Sequence[str], *,
-                           artifact_selected: bool = False) -> dict[str, Any]:
+def execution_site_payload(site: SiteProfile, blades: Sequence[str]) -> dict[str, Any]:
     payload = {
         "name": site.name, "transport": site.cluster.transport,
         "coordinator": site.cluster.coordinator, "blades": list(blades),
@@ -150,7 +133,5 @@ def execution_site_payload(site: SiteProfile, blades: Sequence[str], *,
         "repository_root": str(site.cluster.repository_root), "worker_command": site.cluster.worker_command,
         "ssh_user": site.ssh.user, "ssh_port": site.ssh.port, "ssh_options": list(site.ssh.options),
     }
-    key, value = (("evaluator_source", "run_local_artifact") if artifact_selected else
-                  ("harness_binary", str(site.harness.remote_binary_path or site.harness.binary_name)))
-    payload[key] = value
+    payload["evaluator_source"] = "run_local_artifact"
     return payload

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import shutil
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -12,9 +11,6 @@ from ..analysis.economics import EconomicComparison, compare_economics
 from ..artifacts.io import atomic_write_json, sha256_path
 from ..artifacts.manifest import new_shiftclick_manifest, write_manifest_atomic
 from ..artifacts.store import RunStore
-from ..evaluation.client import HarnessClient
-from ..evaluation.identity import VerifiedEvaluator, validate_evaluator_identity
-from curve_fx_harness_client.models import CandidateSpec, ObservationSpec
 from ..evaluation.selection import (
     ReplayPlan,
     SelectionRef,
@@ -24,10 +20,12 @@ from ..evaluation.selection import (
 )
 from ..evaluation.selected import SelectedEvaluator
 from ..evaluation.session import LocalSessionMaterialization
+from ..evaluation.grouping import CompiledEvaluation, bind_local_session_group, group_evaluations
+from ..execution.grouped import execute_local_groups
 from ..specs.scenario import ScenarioSpec
 from ..specs.shiftclick import ShiftclickSpec
 from ..specs.common import assert_contained_path
-from ..plotting.trajectory import load_trajectory
+from .archive import pack_replay_archive
 
 
 class ShiftclickError(ValueError):
@@ -153,67 +151,43 @@ def selection_from_spec(spec: ShiftclickSpec) -> SelectionRef:
     raise ShiftclickError(f"unsupported shiftclick selection_kind {kind!r}")
 
 
-def _artifact_path(raw: str, *, run_dir: Path, root: Path, label: str) -> Path:
-    candidate = Path(raw)
-    if not candidate.is_absolute():
-        candidate = (root / candidate).resolve()
-        if not candidate.is_file():
-            candidate = (run_dir / raw).resolve()
-    else:
-        candidate = candidate.resolve()
-    try:
-        candidate.relative_to(run_dir.resolve())
-    except ValueError as exc:
-        raise ShiftclickError(f"{label} escapes shiftclick run directory: {raw!r}") from exc
-    if not candidate.is_file():
-        raise ShiftclickError(f"{label} artifact is missing: {raw!r}")
-    return candidate
+def _source_scenarios(manifest: Mapping[str, Any], primary: ScenarioSpec) -> tuple[ScenarioSpec, ...]:
+    resolved = manifest.get("resolved_spec", {})
+    raw = resolved.get("scenario_specs") if isinstance(resolved, Mapping) else None
+    scenarios = (primary,) if raw is None else tuple(ScenarioSpec.from_dict(item) for item in raw)
+    if not scenarios or len({item.id for item in scenarios}) != len(scenarios) or primary.id != scenarios[0].id:
+        raise ShiftclickError("source scenario_specs are empty, duplicated, or reorder the primary scenario")
+    return scenarios
 
 
-def _result_artifacts(
-    result: Any,
-    *,
-    run_dir: Path,
-    root: Path,
-    require_actions: bool = False,
-) -> tuple[dict[str, Any], ...]:
-    artifacts = result.artifacts
-    if artifacts is None or not artifacts.trace_path:
-        raise ShiftclickError("full replay returned no trace artifact")
-    descriptors: list[dict[str, Any]] = []
-    for label, raw, expected in (
-        ("trace", artifacts.trace_path, artifacts.trace_sha256),
-        ("actions", artifacts.actions_path, artifacts.actions_sha256),
-    ):
-        if not raw:
-            if label == "trace" or require_actions:
-                raise ShiftclickError(f"full replay returned no {label} artifact")
-            continue
-        path = _artifact_path(raw, run_dir=run_dir, root=root, label=label)
-        digest = sha256_path(path)
-        if expected and digest.lower() != expected.lower():
-            raise ShiftclickError(f"{label} artifact hash mismatch")
-        item = {
-            "path": path.relative_to(run_dir).as_posix(),
-            "kind": label,
-            "bytes": path.stat().st_size,
-            "sha256": digest,
-        }
-        if label == "trace":
-            load_trajectory(path)
-        descriptors.append(item)
-    return tuple(descriptors)
+def _evaluation_ids(plan: ReplayPlan, scenarios: Sequence[ScenarioSpec], run_kind: str) -> tuple[str, ...]:
+    if run_kind == "grid":
+        if len(scenarios) != 1:
+            raise ShiftclickError("grid replay must contain exactly one scenario")
+        return (plan.source_row.candidate_id,)
+    lineage = plan.source_row.params.get("evaluation_lineage")
+    if not isinstance(lineage, list):
+        raise ShiftclickError("optimizer replay has no evaluation lineage")
+    by_scenario = {item.get("scenario_id"): item.get("evaluation_id") for item in lineage if isinstance(item, Mapping)}
+    result = tuple(by_scenario.get(scenario.id) for scenario in scenarios)
+    if any(not isinstance(value, str) or not value for value in result) or len(set(result)) != len(result):
+        raise ShiftclickError("optimizer replay lineage lacks exact scenario coverage")
+    return result  # type: ignore[return-value]
+
+
+def _artifact(path: Path, run_dir: Path, kind: str) -> dict[str, Any]:
+    return {"path": path.relative_to(run_dir).as_posix(), "kind": kind,
+            "bytes": path.stat().st_size, "sha256": sha256_path(path)}
+
+
 def run_shiftclick(
     spec: ShiftclickSpec,
     *,
     store: RunStore,
-    client: HarnessClient,
     selection: SelectionRef | None = None,
-    pair_spec: Any | None = None,
-    scenario_spec: Any | None = None,
     output_dir: Path | None = None,
 ) -> ShiftclickResult:
-    """Replay exactly one normalized source candidate with full observation."""
+    """Replay one artifact-selected candidate across its ordered source scenarios."""
     if selection is None:
         selection = selection_from_spec(spec)
     else:
@@ -252,42 +226,20 @@ def run_shiftclick(
             store=store,
             run_id=selection.run_id,
         )
-        plan = normalize_selection(
-            selection,
-            store=store,
-            pair_spec=pair_spec,
-            scenario_spec=scenario_spec,
-            observation_level="full_trace",
-            trace_interval=spec.trace_interval,
-            trace_actions=spec.trace_actions,
-            artifact_dir=run_dir / "trace",
-            evaluation_table=source_table,
-        )
+        plan = normalize_selection(selection, store=store, observation_level="full_trace",
+            trace_interval=spec.trace_interval, trace_actions=spec.trace_actions,
+            evaluation_table=source_table)
         resolved = source_manifest.get("resolved_spec", {})
         artifact_selection = resolved.get("evaluator_artifact_selection") if isinstance(resolved, Mapping) else None
         named_runtime = resolved.get("named_runtime") if isinstance(resolved, Mapping) else None
         if artifact_selection is None and isinstance(named_runtime, Mapping):
             artifact_selection = named_runtime.get("selected_evaluator")
         artifact_path = store.get_run_dir(selection.run_id) / "evaluator_artifact"
-        materialization = None
-        if artifact_selection is not None or artifact_path.exists():
-            if not isinstance(artifact_selection, Mapping):
-                raise ShiftclickError("artifact-selected source has no evaluator provenance")
-            selected = SelectedEvaluator.load(artifact_path)
-            if selected.provenance != dict(artifact_selection):
-                raise ShiftclickError("run-local evaluator differs from source provenance")
-            client_binary = getattr(client, "binary_path", None)
-            if client_binary is None or Path(client_binary).resolve() != selected.binary_path.resolve():
-                raise ShiftclickError("artifact-selected replay rejects an external harness")
-            materialization = LocalSessionMaterialization.from_scenario(
-                plan.scenario_spec, repository=store.root_dir,
-                manifest_root=run_dir / "session_transport", session_id=run_id).validated()
-            plan = compile_selected_replay(
-                plan, manifest=source_manifest, selected_evaluator=selected,
-                materialization=materialization,
-                yb_off=not policy.compare_to_source)
-        else:
-            plan = replace(plan, scenario_spec=policy.scenario(plan.scenario_spec))
+        if not isinstance(artifact_selection, Mapping):
+            raise ShiftclickError("source run has no selected evaluator provenance")
+        selected = SelectedEvaluator.load(artifact_path)
+        if selected.provenance != dict(artifact_selection):
+            raise ShiftclickError("run-local evaluator differs from source provenance")
         if plan.pair_spec.id != spec.pair_id:
             raise ShiftclickError("shiftclick pair_id does not match the source run")
         if plan.scenario_spec.id != spec.scenario_id:
@@ -297,72 +249,72 @@ def run_shiftclick(
         source_row = plan.source_row
         if source_row.status != "ok":
             raise ShiftclickError(f"cannot replay non-successful source row: {source_row.status!r}")
-        candidate_id = source_row.candidate_id
-        ordinal = source_row.ordinal
-        policy_params = plan.policy_params
-        if isinstance(policy_params, Mapping) and "vector" in policy_params:
-            policy_params = policy_params["vector"]
-        request = CandidateSpec(
-            ordinal=ordinal,
-            candidate_id=candidate_id,
-            policy_params=copy.deepcopy(policy_params),
-            pool_overrides=copy.deepcopy(plan.pool_overrides),
-        )
-        identity = client.prepare()
-        if not isinstance(identity, VerifiedEvaluator):
-            raise TypeError("HarnessClient.prepare() must return a VerifiedEvaluator")
-        source_core = source_manifest.get("core", {})
-        expected_policy_id = str(source_core.get("policy_id") or plan.policy_id)
-        if not expected_policy_id or plan.policy_id != expected_policy_id:
-            raise ShiftclickError("source manifest and replay plan policy identities disagree")
-        if spec.policy_id != expected_policy_id:
-            raise ShiftclickError("shiftclick policy_id does not match the selected source run")
-        validate_evaluator_identity(
-            identity,
-            expected_policy_id=expected_policy_id,
-            expected_policy_source_sha256=source_core.get("policy_source_sha256"),
-            expected_policy_abi=source_core.get("policy_abi"),
-            expected_policy_parameter_count=source_core.get("policy_parameter_count"),
-        )
-        if plan.compiled_candidate is not None:
-            assert materialization is not None
-            client.open_compiled_session(plan.compiled_candidate, materialization)
-        else:
-            client.open_session(plan.scenario_spec, session_id=run_id)
-        response = client.evaluate_batch(
-            (request,),
-            observation=ObservationSpec(
-                kind="full_trace",
-                trace_interval=plan.trace_interval,
-                trace_actions=plan.trace_actions,
-                artifact_dir=client.artifact_directory(run_dir / "trace"),
-            ),
-        )
-        if response.status != "complete" or len(response.results) != 1:
-            raise ShiftclickError("full replay did not return exactly one complete result")
-        replay = response.results[0]
-        if replay.candidate_id != candidate_id or replay.ordinal != ordinal:
-            raise ShiftclickError("full replay identity does not match source candidate")
-        artifact_descriptors = _result_artifacts(
-            replay,
-            run_dir=run_dir,
-            root=client.artifact_root,
-            require_actions=plan.trace_actions,
-        )
+        candidate_id, ordinal = source_row.candidate_id, source_row.ordinal
+        scenarios = _source_scenarios(source_manifest, plan.scenario_spec)
+        evaluation_ids = _evaluation_ids(plan, scenarios, str(source_manifest.get("run_kind")))
+        staging = run_dir / ".replay_staging"
+        materials, evaluations, compiled_plans = {}, [], []
+        observation = {item.name: value for item in selected.compiler.schema.descriptors
+            for path, value in (("evaluate_batch.metric_projection", "full"),
+                ("evaluate_batch.observation.kind", "full_trace"),
+                ("evaluate_batch.observation.trace_interval", spec.trace_interval),
+                ("evaluate_batch.observation.trace_actions", spec.trace_actions))
+            if item.lowering_path == path}
+        for index, (scenario, evaluation_id) in enumerate(zip(scenarios, evaluation_ids, strict=True)):
+            scenario = policy.scenario(scenario)
+            material = LocalSessionMaterialization.from_scenario(scenario, repository=store.root_dir,
+                manifest_root=staging / "sessions", session_id=f"{run_id}_{index:03d}").validated()
+            scenario_plan = compile_selected_replay(replace(plan, scenario_spec=scenario),
+                manifest=source_manifest, selected_evaluator=selected, materialization=material,
+                yb_off=not policy.compare_to_source, evaluation_id=evaluation_id)
+            compiled = scenario_plan.compiled_candidate
+            assert compiled is not None
+            evaluations.append(CompiledEvaluation.from_plan(compiled, compiler=selected.compiler,
+                artifact_sha256=selected.artifact_sha256, observation=observation,
+                ordinal=ordinal * len(scenarios) + index, evaluation_id=evaluation_id))
+            compiled_plans.append(scenario_plan); materials[compiled.scenario_key.sha256] = material
+        groups = group_evaluations(evaluations, artifact_sha256=selected.artifact_sha256,
+            parameter_schema=selected.compiler.schema)
+        executed = execute_local_groups(selected, groups,
+            lambda group: bind_local_session_group(group, materials[group.scenario_key.sha256]),
+            evaluation_ids, work_dir=staging, chunk_size=1,
+            max_workers=min(len(groups), 10), artifact_dir="sidecars")
+        replays = [executed.results_by_evaluation_id[value] for value in evaluation_ids]
+        if any(result.status != "ok" or result.artifacts is None for result in replays):
+            raise ShiftclickError("full replay did not return complete trace artifacts")
+        npz_path, trace_json, _ = pack_replay_archive(run_dir, staging,
+            source_run_id=selection.run_id, candidate_id=candidate_id, ordinal=ordinal,
+            require_actions=spec.trace_actions,
+            scenarios=[{"id": scenario.id, "evaluation_id": evaluation_id,
+                "economic_fingerprint": result.economic_fingerprint, "artifacts": result.artifacts}
+                for scenario, evaluation_id, result in zip(scenarios, evaluation_ids, replays, strict=True)])
+        replay = replays[0]
         projection = source_table.metric_projection
         if projection is None:
             raise ShiftclickError("source evaluation table has no MetricProjection")
+        projected = set(projection.fields)
+        comparison_fields = tuple(
+            field for field in selected.verified_evaluator.metric_fields
+            if field in projected
+        )
+        if not comparison_fields:
+            raise ShiftclickError("table projection has no evaluator metrics to compare")
         comparison, comparison_receipt = policy.compare(
             source_row.metrics,
             replay.metrics,
             expected_fingerprint=source_row.economic_fingerprint or "",
             observed_fingerprint=replay.economic_fingerprint,
-            fields=projection.fields,
+            fields=comparison_fields,
         )
-        replay_payload = replay.model_dump()
+        replay_payload = {"candidate_id": candidate_id, "ordinal": ordinal, "status": "ok",
+            "economic_fingerprint": replay.economic_fingerprint, "metrics": replay.metrics,
+            "scenarios": [{"id": scenario.id, "evaluation_id": evaluation_id,
+                "economic_fingerprint": result.economic_fingerprint, "metrics": result.metrics}
+                for scenario, evaluation_id, result in zip(scenarios, evaluation_ids, replays, strict=True)]}
         atomic_write_json(run_dir / "replay_result.json", replay_payload)
         atomic_write_json(run_dir / "economic_comparison.json", comparison_receipt)
-        artifacts = list(artifact_descriptors)
+        artifacts = [_artifact(npz_path, run_dir, "replay_trace_npz"),
+            _artifact(trace_json, run_dir, "replay_trace_companion")]
         for path, kind in ((run_dir / "replay_result.json", "replay_result"), (run_dir / "economic_comparison.json", "economic_comparison")):
             artifacts.append({"path": path.relative_to(run_dir).as_posix(), "kind": kind, "bytes": path.stat().st_size, "sha256": sha256_path(path)})
         manifest = new_shiftclick_manifest(
@@ -374,17 +326,20 @@ def run_shiftclick(
             resolved_spec={
                 "shiftclick": spec.to_dict(),
                 "observation_policy": policy.to_dict(),
-                "replay_plan": plan.to_dict(),
+                "replay_plan": replace(plan, artifact_dir=None).to_dict(),
                 "metric_projection": projection.to_dict(),
+                "evaluator_source": {"source_run_id": selection.run_id,
+                    "selected_evaluator": selected.provenance},
             },
             execution={"scope": "local"},
-            core=identity.to_core_dict(),
+            core=selected.manifest_core(
+                binary_override=f"source_run/{selection.run_id}/evaluator_artifact/evaluator"),
             artifacts=artifacts,
         )
         write_manifest_atomic(run_dir / "manifest.json", manifest, expected_kind="shiftclick")
         return ShiftclickResult(
             run_dir,
-            plan,
+            replace(compiled_plans[0], artifact_dir=None),
             candidate_id,
             replay_payload,
             comparison,
@@ -397,8 +352,6 @@ def run_shiftclick(
             if run_dir.is_dir():
                 shutil.rmtree(run_dir)
         raise
-    finally:
-        client.close()
 
 
 

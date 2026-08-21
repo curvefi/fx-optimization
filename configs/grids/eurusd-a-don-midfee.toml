@@ -3,17 +3,20 @@ id = "eurusd-a-don-midfee"
 pair_id = "eurusd"
 tags = ["production", "native-pool", "fx", "16x16x3"]
 
+[grid.static_overrides]
+"run.metric_projection" = "summary"
+
 [[grid.axes]]
 name = "A"
-target = { path = "A", scale = 10000, kind = "integer" }
+target = { path = "pool.A", scale = 10000, kind = "integer" }
 range = { start = 1, stop = 10, num = 16, scale = "linear" }
 
 [[grid.axes]]
 name = "donation_apy"
-target = { path = "donation_apy", kind = "decimal" }
+target = { path = "pool.donation_apy", kind = "decimal" }
 range = { start = 0, stop = 0.05, num = 16, scale = "linear" }
 
 [[grid.axes]]
 name = "mid_fee_bps"
-target = { path = "mid_fee", scale = 1000000, kind = "decimal" }
+target = { path = "pool.mid_fee", display_scale = 10000, kind = "decimal" }
 values = [1, 2, 5]

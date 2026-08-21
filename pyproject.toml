@@ -15,13 +15,14 @@ dependencies = [
 
 [project.scripts]
 fxsim = "curve_fx_sim.cli:main"
+fxopt = "fxopt.cli:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/curve_fx_sim"]
+packages = ["src/curve_fx_sim", "src/fxopt"]
 
 [tool.uv.sources]
 curve_fx_harness_client = { path = "../curve-fx-arb-harness/python", editable = true }

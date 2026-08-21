@@ -42,6 +42,8 @@ blades = [
     "blade-b6",
     "blade-b7",
     "blade-b8",
+    "blade-b9",
+    "blade-b10",
     "blade-c1",
     "blade-c2",
     "blade-c3",
@@ -55,13 +57,9 @@ blades = [
 ]
 
 [harness]
-binary_name = "arb_evaluator_ld"
-remote_binary_path = "/home/heswithme/arb/bin/arb_evaluator_ld"
-default_real = "longdouble"
 timeout_seconds = 7200
-persistent_evaluator = true
 chunk_size = 2048
 
 [runner]
 max_workers = 18
-worker_concurrency = 1
+worker_concurrency = 128

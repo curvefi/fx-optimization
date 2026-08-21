@@ -1,4 +1,4 @@
-"""Strict shard fetch, attestation, validation, and deterministic collection."""
+"""Compact ordinal-only grid shard publication and streaming collection."""
 
 from __future__ import annotations
 
@@ -6,711 +6,541 @@ import hashlib
 import json
 import os
 import re
-from pathlib import Path, PurePosixPath
-from typing import Any, Mapping, Sequence
 import tempfile
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
 
-from .adapter import ProcessAdapter, SSHProcessAdapter
-from .site import SSHConfig
 import numpy as np
-from .staging import scoped_remote_path, sha256_path, validate_run_id
+
+from ..artifacts.io import atomic_write_json, sha256_path
+from ..artifacts.manifest import load_manifest, write_manifest_atomic
+from ..artifacts.tables import GRID_TABLE_SCHEMA_VERSION, MetricProjection
+from ..specs.common import canonical_json_bytes
+
+if TYPE_CHECKING:
+    from ..grids.model import CartesianGridPlan
+
+SHARD_NPZ_SCHEMA_VERSION = "fxsim_grid_shard_npz_v1"
+SHARD_RECEIPT_SCHEMA_VERSION = "fxsim_grid_shard_receipt_v1"
+SESSION_ATTESTATION_FIELDS = (
+    "scenario_set_sha256", "session_fingerprint", "session_config_sha256",
+    "metric_schema_sha256",
+)
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_STATUS = {"ok": 0, "failed": 1, "cancelled": 2}
 
 
 class CollectionError(RuntimeError):
-    """Raised when shard collection or validation detects invalid shard data."""
+    """A shard or collected table violates its immutable grid contract."""
 
 
-GRID_RESULTS_SCHEMA_VERSION = "fxsim_grid_results_npz_v1"
-SHARD_RESULT_SCHEMA_VERSION = "fxsim_grid_shard_v2"
-GRID_REQUEST_SCHEMA_VERSION = "fxsim_grid_request_v1"
-SESSION_ATTESTATION_FIELDS = (
-    "scenario_set_sha256",
-    "session_fingerprint",
-    "session_config_sha256",
-    "metric_schema_sha256",
-)
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_SHARD_RESULT_FIELDS = frozenset(
-    {
-        "schema_version",
-        "run_id",
-        "shard_id",
-        "shard_index",
-        "ranges",
-        "row_count",
-        "rows_sha256",
-        "request_set_sha256",
-        "session_attestation",
-        "rows",
-    }
-)
+def _digest(value: Any) -> str:
+    return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
-def _canonical_json(value: Any) -> bytes:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
+def _require_sha(value: Any, label: str) -> str:
+    if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+        raise CollectionError(f"{label} must be a lowercase SHA-256 digest")
+    return value
 
 
-def _canonical_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    normalized: list[dict[str, Any]] = []
-    for row in rows:
-        item = dict(row)
-        if item.get("pool_index") is None:
-            if item.get("ordinal") is None:
-                raise CollectionError("shard result row lacks pool_index and ordinal")
-            item["pool_index"] = int(item["ordinal"])
-        normalized.append(item)
-    return normalized
-
-
-def _rows_checksum(rows: Sequence[Mapping[str, Any]]) -> str:
-    return hashlib.sha256(_canonical_json(list(rows))).hexdigest()
-
-
-def normalize_session_attestation(
-    value: Any,
-    *,
-    expected_session_id: str | None = None,
-) -> dict[str, str]:
-    """Return the exact evaluator session proof persisted with every shard."""
-    if hasattr(value, "model_dump") and callable(value.model_dump):
-        value = value.model_dump()
-    if not isinstance(value, Mapping):
-        raise CollectionError("evaluator session attestation must be an object")
-    session_id = value.get("session_id")
-    if not isinstance(session_id, str) or not session_id:
-        raise CollectionError("evaluator session attestation has no session_id")
-    if expected_session_id is not None and session_id != expected_session_id:
-        raise CollectionError(
-            f"evaluator session attestation has session_id {session_id!r}, expected {expected_session_id!r}"
-        )
-    result = {"session_id": session_id}
-    for field in SESSION_ATTESTATION_FIELDS:
-        digest = value.get(field)
-        if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
-            raise CollectionError(
-                f"evaluator session attestation {field} must be a lowercase SHA-256 digest"
-            )
-        result[field] = digest
-    return result
-
-
-def _session_digest_view(value: Any) -> dict[str, str]:
-    attestation = normalize_session_attestation(value)
-    return {field: attestation[field] for field in SESSION_ATTESTATION_FIELDS}
-
-
-def grid_request_set_sha256(
-    manifest: Mapping[str, Any],
-    session_attestation: Any,
-) -> str:
-    """Bind a shard to its exact candidates, economics, core, and opened session."""
-    grid = manifest.get("grid")
-    resolved = manifest.get("resolved_spec")
-    core = manifest.get("core")
-    if not isinstance(grid, Mapping) or not isinstance(grid.get("pools"), list):
-        raise CollectionError("cannot attest a manifest without grid.pools")
-    if not isinstance(resolved, Mapping):
-        raise CollectionError("cannot attest a manifest without resolved_spec")
-    if not isinstance(core, Mapping):
-        raise CollectionError("cannot attest a manifest without core identity")
-    request = {
-        "schema_version": GRID_REQUEST_SCHEMA_VERSION,
-        "run_id": manifest.get("run_id"),
-        "grid_id": grid.get("grid_id"),
-        "pools": grid["pools"],
-        "scenario": resolved.get("scenario"),
-        "policy": resolved.get("policy"),
-        "metric_projection": resolved.get("metric_projection"),
-        "core": core,
-        "session_attestation": _session_digest_view(session_attestation),
-    }
-    return hashlib.sha256(_canonical_json(request)).hexdigest()
-
-
-def group_request_set_sha256(
-    manifest: Mapping[str, Any],
-    ordinals: Sequence[int],
-    session_attestation: Any,
-) -> str:
-    """Bind one homogeneous shard to its portable group and local request proof."""
-    grid = manifest.get("grid")
-    resolved = manifest.get("resolved_spec")
-    core = manifest.get("core")
-    pools = grid.get("pools") if isinstance(grid, Mapping) else None
-    if not isinstance(pools, list) or not isinstance(resolved, Mapping) or not isinstance(core, Mapping):
-        raise CollectionError("cannot attest a grouped shard without its canonical manifest")
+def _sha_bytes(value: bytes) -> bool:
     try:
-        selected = [pools[int(ordinal)] for ordinal in ordinals]
-    except (IndexError, TypeError, ValueError) as exc:
-        raise CollectionError("grouped shard ordinals are outside grid.pools") from exc
-    request = {
-        "schema_version": "fxsim_group_request_v1",
-        "run_id": manifest.get("run_id"),
-        "grid_id": grid.get("grid_id"),
-        "pools": selected,
-        "resolved_spec": resolved,
-        "core": core,
-        "session_attestation": _session_digest_view(session_attestation),
-    }
-    return hashlib.sha256(_canonical_json(request)).hexdigest()
-
-
-def make_shard_result(
-    *,
-    run_id: str,
-    shard_id: str,
-    shard_index: int,
-    ranges: Sequence[tuple[int, int]],
-    rows: Sequence[Mapping[str, Any]],
-    request_set_sha256: str,
-    session_attestation: Any,
-) -> dict[str, Any]:
-    """Build the attested, canonical shard result envelope."""
-    if not isinstance(request_set_sha256, str) or not _SHA256_RE.fullmatch(request_set_sha256):
-        raise CollectionError("request_set_sha256 must be a lowercase SHA-256 digest")
-    normalized_attestation = normalize_session_attestation(session_attestation)
-    normalized_rows = _canonical_rows(rows)
-    return {
-        "schema_version": SHARD_RESULT_SCHEMA_VERSION,
-        "run_id": run_id,
-        "shard_id": shard_id,
-        "shard_index": int(shard_index),
-        "ranges": [list(r) for r in ranges],
-        "row_count": len(normalized_rows),
-        "rows_sha256": _rows_checksum(normalized_rows),
-        "request_set_sha256": request_set_sha256,
-        "session_attestation": normalized_attestation,
-        "rows": normalized_rows,
-    }
-
-
-def write_shard_result(
-    path: Path,
-    *,
-    run_id: str,
-    shard_id: str,
-    shard_index: int,
-    ranges: Sequence[tuple[int, int]],
-    rows: Sequence[Mapping[str, Any]],
-    request_set_sha256: str,
-    session_attestation: Any,
-) -> str:
-    """Atomically write one canonical shard envelope and return its file digest."""
-    payload = make_shard_result(
-        run_id=run_id,
-        shard_id=shard_id,
-        shard_index=shard_index,
-        ranges=ranges,
-        rows=rows,
-        request_set_sha256=request_set_sha256,
-        session_attestation=session_attestation,
-    )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_bytes(_canonical_json(payload) + b"\n")
-    os.replace(temporary, path)
-    return sha256_path(path)
-
-
-def _ranges(descriptor: Mapping[str, Any]) -> list[tuple[int, int]]:
-    val = descriptor.get("ranges")
-    if not isinstance(val, (list, tuple)):
-        raise CollectionError(f"shard descriptor has no valid ranges: {descriptor.get('shard_id', '<unknown>')}")
-    try:
-        ranges = [(int(r[0]), int(r[1])) for r in val]
-    except (TypeError, ValueError, IndexError) as exc:
-        raise CollectionError(
-            f"shard descriptor has no valid ranges: {descriptor.get('shard_id', '<unknown>')}"
-        ) from exc
-    if any(start < 0 or start >= end for start, end in ranges):
-        raise CollectionError(f"shard descriptor has invalid ranges: {descriptor.get('shard_id', '<unknown>')}")
-    return ranges
-
-
-def _load_shard_records(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    if not path.is_file():
-        raise CollectionError(f"missing shard result file: {path}")
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise CollectionError(f"invalid shard result JSON in {path}: {exc}") from exc
-
-    if not isinstance(payload, Mapping):
-        raise CollectionError(
-            f"invalid shard result schema in {path}: expected an object with schema_version and rows"
-        )
-    rows = payload.get("rows")
-    if payload.get("schema_version") != SHARD_RESULT_SCHEMA_VERSION or set(payload) != _SHARD_RESULT_FIELDS or not isinstance(rows, list):
-        raise CollectionError(
-            f"invalid shard result schema in {path}: expected {SHARD_RESULT_SCHEMA_VERSION!r}"
-        )
-    if not all(isinstance(row, Mapping) for row in rows):
-        raise CollectionError(f"invalid shard result rows in {path}: every row must be an object")
-    return dict(payload), [dict(row) for row in rows]
-
-
-def _record_index(record: Mapping[str, Any]) -> int:
-    if "pool_index" not in record or record["pool_index"] is None:
-        raise CollectionError(f"record lacks canonical pool_index field: {record}")
-    try:
-        return int(record["pool_index"])
-    except (TypeError, ValueError) as exc:
-        raise CollectionError(f"record has invalid pool_index: {record}") from exc
-
-
-def is_grouped_shard_complete(
-    manifest: Mapping[str, Any], descriptor: Mapping[str, Any], path: Path
-) -> bool:
-    """Return whether one durable grouped shard is exact and relocation-safe."""
-    try:
-        payload, rows = _load_shard_records(path)
-        ranges = _ranges(descriptor)
-        ordinals = [value for start, end in ranges for value in range(start, end)]
-        group_id = str(descriptor["session_group_id"])
-        observation_id = str(descriptor["observation_id"])
-        pools = manifest["grid"]["pools"]
-        if any(
-            pools[value]["session_group_id"] != group_id
-            or pools[value]["observation_id"] != observation_id
-            for value in ordinals
-        ):
-            return False
-        attestation = normalize_session_attestation(
-            payload["session_attestation"],
-            expected_session_id=f"sess_{manifest['run_id']}_{group_id[:12]}",
-        )
-        return (
-            payload["run_id"] == manifest["run_id"]
-            and payload["shard_id"] == descriptor["shard_id"]
-            and payload["shard_index"] == descriptor["shard_index"]
-            and payload["ranges"] == [list(value) for value in ranges]
-            and payload["rows_sha256"] == _rows_checksum(rows)
-            and [int(row["pool_index"]) for row in rows] == ordinals
-            and payload["request_set_sha256"]
-            == group_request_set_sha256(manifest, ordinals, attestation)
-        )
-    except (CollectionError, IndexError, KeyError, TypeError, ValueError):
+        return len(value) == 64 and _SHA256.fullmatch(value.decode("ascii")) is not None
+    except UnicodeDecodeError:
         return False
 
 
-def _descriptor_checksum_error(
-    descriptor: Mapping[str, Any],
-    path: Path,
-    payload: Mapping[str, Any],
-) -> str | None:
-    rows = payload.get("rows")
-    if not isinstance(rows, list) or not all(isinstance(row, Mapping) for row in rows):
-        return f"shard result {path} has invalid rows"
-    actual_rows_checksum = _rows_checksum([dict(row) for row in rows])
-    if payload.get("rows_sha256") != actual_rows_checksum:
-        return f"shard result {path} has invalid rows_sha256 checksum"
-
-    expected_rows = descriptor.get("rows_sha256") or descriptor.get("content_sha256")
-    if expected_rows and str(expected_rows) != actual_rows_checksum:
-        return f"shard result {path} does not match attested rows checksum"
-
-    expected_file = descriptor.get("result_sha256") or descriptor.get("file_sha256")
-    if expected_file and str(expected_file) != sha256_path(path):
-        return f"shard result {path} does not match attested file checksum"
-
-    expected_generic = descriptor.get("checksum")
-    if expected_generic and str(expected_generic) not in {actual_rows_checksum, sha256_path(path)}:
-        return f"shard result {path} does not match attested checksum"
-    return None
+def normalize_session_attestation(value: Any, *, expected_session_id: str | None = None) -> dict[str, str]:
+    if hasattr(value, "model_dump"):
+        value = value.model_dump()
+    if not isinstance(value, Mapping):
+        raise CollectionError("session attestation must be an object")
+    session_id = value.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        raise CollectionError("session attestation has no session_id")
+    if expected_session_id is not None and session_id != expected_session_id:
+        raise CollectionError("session attestation has the wrong session_id")
+    result = {"session_id": session_id}
+    for field in SESSION_ATTESTATION_FIELDS:
+        result[field] = _require_sha(value.get(field), f"session attestation {field}")
+    return result
 
 
-def _metric_schema(record: Mapping[str, Any]) -> tuple[str, ...]:
-    metrics = record.get("metrics")
-    if metrics is None:
-        metrics = record
-    if not isinstance(metrics, Mapping):
-        raise CollectionError(f"record has invalid metrics schema: {record}")
-    return tuple(sorted(str(key) for key in metrics))
-def _manifest_grid_shards(manifest: Mapping[str, Any]) -> tuple[list[Mapping[str, Any]], int]:
-    grid = manifest.get("grid")
-    if not isinstance(grid, Mapping):
-        raise CollectionError("grid manifest has no grid section")
-    assignments = grid.get("shards")
-    pools = grid.get("pools")
-    if not isinstance(assignments, list) or not assignments:
-        raise CollectionError("manifest grid.shards must be a non-empty array")
-    if not isinstance(pools, list) or not pools:
-        raise CollectionError("manifest grid.pools must be a non-empty array")
-    return assignments, len(pools)
-
-
-
-def validate_shards(
-    manifest: Mapping[str, Any],
-    results_dir: Path,
-) -> tuple[list[dict[str, Any]], str]:
-    """Validate all canonical shard envelopes against manifest assignments.
-
-    Presence is checked for every assignment before any present file is parsed. This
-    makes a partial collection report all absent shards instead of masking them with
-    an unrelated malformed row in an earlier shard.
-    """
-    assignments, expected_total = _manifest_grid_shards(manifest)
-    resolved = manifest.get("resolved_spec")
-    compilation = resolved.get("candidate_compilation") if isinstance(resolved, Mapping) else None
-    grouped = isinstance(compilation, Mapping) and compilation.get("mode") == "schema_grouped_v1"
-    pools = manifest["grid"]["pools"]
-    expected_indices: set[int] = set()
-    descriptor_ranges: dict[str, set[int]] = {}
-    for desc in assignments:
-        if not isinstance(desc, Mapping):
-            raise CollectionError(f"invalid shard descriptor: {desc!r}")
-        shard_id = str(desc.get("shard_id", ""))
-        if not shard_id or Path(shard_id).name != shard_id or shard_id in descriptor_ranges:
-            raise CollectionError(f"invalid or duplicate shard_id {shard_id!r}")
-        shard_expected: set[int] = set()
-        for start, end in _ranges(desc):
-            shard_expected.update(range(start, end))
-        descriptor_ranges[shard_id] = shard_expected
-        if expected_indices.intersection(shard_expected):
-            raise CollectionError(f"shard assignments overlap at pool indices for {shard_id}")
-        expected_indices.update(shard_expected)
-        if grouped:
-            group_id = desc.get("session_group_id")
-            observation_id = desc.get("observation_id")
-            if not isinstance(group_id, str) or not isinstance(observation_id, str):
-                raise CollectionError(f"grouped shard {shard_id} has no group/observation identity")
-            if any(
-                pools[index].get("session_group_id") != group_id
-                or pools[index].get("observation_id") != observation_id
-                for index in shard_expected
-            ):
-                raise CollectionError(f"grouped shard {shard_id} is not homogeneous")
-
-    if expected_indices != set(range(expected_total)):
-        raise CollectionError("shard assignments do not exactly partition grid.pools")
-
-    # Presence pass: report every missing canonical file before reading any row.
-    shard_paths: dict[str, Path] = {}
-    missing: list[str] = []
-    for desc in assignments:
-        shard_id = str(desc["shard_id"])
-        shard_file = results_dir / f"{shard_id}.json"
-        shard_paths[shard_id] = shard_file
-        if not shard_file.is_file():
-            missing.append(shard_id)
-    if missing:
-        raise CollectionError(f"missing shard result files: {', '.join(missing)}")
-
-    collected_records: list[dict[str, Any]] = []
-    seen_indices: set[int] = set()
-    schema_fields: tuple[str, ...] | None = None
-    run_id = manifest.get("run_id")
-    common_session_digests: dict[str, str] | None = None
-    common_request_set_sha256: str | None = None
-    grouped_proofs: dict[str, dict[str, str]] = {}
-
-    for desc in assignments:
-        shard_id = str(desc["shard_id"])
-        shard_file = shard_paths[shard_id]
-        payload, records = _load_shard_records(shard_file)
-        if payload.get("shard_id") != shard_id:
-            raise CollectionError(f"shard result {shard_file} has wrong shard_id")
-        if run_id is not None and payload.get("run_id") != run_id:
-            raise CollectionError(f"shard result {shard_file} has wrong run_id")
-        if payload.get("shard_index") != int(desc.get("shard_index", -1)):
-            raise CollectionError(f"shard result {shard_file} has wrong shard_index")
-        if payload.get("ranges") != [list(r) for r in _ranges(desc)]:
-            raise CollectionError(f"shard result {shard_file} has wrong assigned ranges")
-        if payload.get("row_count") != len(records):
-            raise CollectionError(f"shard result {shard_file} has wrong row_count")
-        checksum_error = _descriptor_checksum_error(desc, shard_file, payload)
-        if checksum_error:
-            raise CollectionError(checksum_error)
-
-        raw_attestation = payload.get("session_attestation")
-        if not isinstance(raw_attestation, Mapping) or set(raw_attestation) != {
-            "session_id",
-            *SESSION_ATTESTATION_FIELDS,
-        }:
-            raise CollectionError(f"shard result {shard_file} has invalid session_attestation fields")
-        if grouped:
-            group_id = str(desc["session_group_id"])
-            attestation = normalize_session_attestation(
-                raw_attestation, expected_session_id=f"sess_{run_id}_{group_id[:12]}"
-            )
-        else:
-            blade = str(desc.get("blade", ""))
-            attestation = normalize_session_attestation(
-                raw_attestation,
-                expected_session_id=f"sess_{run_id}_{blade}",
-            )
-        session_digests = _session_digest_view(attestation)
-        if grouped:
-            previous = grouped_proofs.get(group_id)
-            if previous is None:
-                grouped_proofs[group_id] = session_digests
-            elif previous != session_digests:
-                raise CollectionError(
-                    f"shard result {shard_file} has a different attestation for its session group"
-                )
-            expected_request_sha256 = group_request_set_sha256(
-                manifest, sorted(descriptor_ranges[shard_id]), attestation
-            )
-        else:
-            if common_session_digests is None:
-                common_session_digests = session_digests
-            elif session_digests != common_session_digests:
-                raise CollectionError(f"shard result {shard_file} was evaluated against a different opened session")
-            expected_request_sha256 = grid_request_set_sha256(manifest, attestation)
-        if payload.get("request_set_sha256") != expected_request_sha256:
-            raise CollectionError(f"shard result {shard_file} does not match the manifest request set")
-        if not grouped:
-            if common_request_set_sha256 is None:
-                common_request_set_sha256 = expected_request_sha256
-            elif expected_request_sha256 != common_request_set_sha256:
-                raise CollectionError(f"shard result {shard_file} has a different request set")
-
-        shard_expected = descriptor_ranges[shard_id]
-        shard_actual: set[int] = set()
-        for record in records:
-            idx = _record_index(record)
-            if idx in shard_actual or idx in seen_indices:
-                raise CollectionError(f"duplicate pool index {idx} in shard {shard_id}")
-            shard_actual.add(idx)
-            if idx not in shard_expected:
-                raise CollectionError(f"unexpected pool index {idx} in shard {shard_id}")
-            fields = _metric_schema(record)
-            if schema_fields is None:
-                schema_fields = fields
-            elif fields != schema_fields:
-                raise CollectionError(f"metric schema mismatch in shard {shard_id} at pool index {idx}")
-            collected_records.append(record)
-
-        if [int(record["pool_index"]) for record in records] != sorted(
-            int(record["pool_index"]) for record in records
-        ):
-            raise CollectionError(f"shard {shard_id} rows are not in canonical pool_index order")
-        if shard_actual != shard_expected:
-            missing_in_shard = sorted(shard_expected - shard_actual)
-            extra_in_shard = sorted(shard_actual - shard_expected)
-            raise CollectionError(
-                f"shard {shard_id} has non-exact pool index coverage: "
-                f"missing={missing_in_shard[:5]}, extra={extra_in_shard[:5]}"
-            )
-        seen_indices.update(shard_actual)
-
-    if seen_indices != expected_indices:
-        missing_total = sorted(expected_indices - seen_indices)
-        extra_total = sorted(seen_indices - expected_indices)
-        raise CollectionError(
-            f"collection has non-exact pool index coverage: "
-            f"missing={missing_total[:5]}, extra={extra_total[:5]}"
-        )
-
-    sorted_records = sorted(collected_records, key=_record_index)
-    schema_sig = json.dumps({"fields": list(schema_fields or ())}, sort_keys=True)
-    return sorted_records, schema_sig
-
-
-def fetch_remote_shards(
-    manifest: Mapping[str, Any],
-    local_results_dir: Path,
-    ssh_config: SSHConfig | None = None,
-    adapter: ProcessAdapter | None = None,
-) -> None:
-    """Collect remote receipts, once through the coordinator for shared NFS."""
-    run_id = validate_run_id(str(manifest.get("run_id", "")))
-    remote_base = PurePosixPath(str(manifest.get("remote_base", "/home/heswithme/arb")))
-    assignments, _ = _manifest_grid_shards(manifest)
-
-    ssh_adapter = SSHProcessAdapter(ssh_config=ssh_config, process_runner=adapter)
-    local_results_dir.mkdir(parents=True, exist_ok=True)
-
-    if manifest.get("remote_transport") == "shared_nfs":
-        coordinator = str(manifest.get("remote_coordinator", ""))
-        if not coordinator:
-            raise CollectionError("shared-NFS manifest has no remote_coordinator")
-        remote_results = scoped_remote_path(
-            run_id, "results", remote_base=remote_base
-        )
-        result = ssh_adapter.rsync_download(
-            coordinator,
-            str(remote_results),
-            local_results_dir.parent,
-        )
-        if not result.ok:
-            raise CollectionError(
-                f"failed to fetch shared results through {coordinator}:{remote_results}: {result.stderr}"
-            )
-        return
-
-    for desc in assignments:
-        blade = str(desc.get("blade", ""))
-        shard_id = str(desc.get("shard_id", ""))
-        remote_file = scoped_remote_path(run_id, f"results/{shard_id}.json", remote_base=remote_base)
-        local_target = local_results_dir / f"{shard_id}.json"
-        res = ssh_adapter.rsync_download(blade, str(remote_file), local_target)
-        if not res.ok:
-            raise CollectionError(
-                f"failed to fetch shard {shard_id} from {blade}:{remote_file}: {res.stderr}"
-            )
-
-
-def write_grid_results_npz(
-    path: Path,
-    *,
-    run_id: str,
-    schema_signature: str,
-    request_set_sha256: str,
-    session_attestation: Mapping[str, Any],
-    rows: Sequence[Mapping[str, Any]],
-) -> Path:
-    """Atomically write collected result rows as compressed, pickle-free NPZ."""
-    destination = Path(path)
-    if destination.suffix != ".npz":
-        raise CollectionError("collected grid result path must end in .npz")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "schema_version": np.asarray(GRID_RESULTS_SCHEMA_VERSION),
-        "run_id": np.asarray(run_id),
-        "schema_signature": np.asarray(schema_signature),
-        "request_set_sha256": np.asarray(request_set_sha256),
-        "session_attestation_json": np.asarray(
-            _canonical_json(dict(session_attestation)).decode("utf-8")
-        ),
-        "total_rows": np.asarray(len(rows), dtype=np.int64),
-        "rows_json": np.asarray(
-            [_canonical_json(dict(row)).decode("utf-8") for row in rows],
-            dtype=np.str_,
-        ),
+def _normalized_attestations(value: Mapping[str, Any]) -> dict[str, dict[str, str]]:
+    if not isinstance(value, Mapping) or not value:
+        raise CollectionError("grid shard requires session attestations")
+    return {
+        _require_sha(group_id, "session group id"): normalize_session_attestation(value[group_id])
+        for group_id in sorted(value)
     }
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.",
-        suffix=".tmp",
-        dir=destination.parent,
-    )
+
+
+def _request_set_sha256(
+    manifest: Mapping[str, Any], shard: Mapping[str, Any],
+    ranges: Sequence[tuple[int, int]], projection: MetricProjection,
+    session_attestations: Mapping[str, Any],
+) -> str:
+    """Stable resume identity; attempt-specific work-request identity is excluded."""
+    plan = manifest["grid"]["plan"]
+    return _digest({
+        "schema_version": SHARD_RECEIPT_SCHEMA_VERSION,
+        "run_id": manifest["run_id"], "plan_sha256": plan["plan_sha256"],
+        "artifact_sha256": plan["artifact_sha256"],
+        "metric_projection_sha256": projection.projection_sha256,
+        "shard_id": shard["shard_id"], "shard_index": int(shard["shard_index"]),
+        "ranges": [list(item) for item in ranges],
+        "session_attestations": _normalized_attestations(session_attestations),
+    })
+
+
+def _projection(manifest: Mapping[str, Any]) -> MetricProjection:
+    resolved = manifest.get("resolved_spec")
+    raw = resolved.get("metric_projection") if isinstance(resolved, Mapping) else None
+    if not isinstance(raw, Mapping):
+        raise CollectionError("grid manifest has no metric projection")
+    try:
+        return MetricProjection(tuple(raw["fields"]), str(raw.get("projection_id", "grid")),
+                                str(raw.get("projection_sha256", "")))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CollectionError(f"invalid grid metric projection: {exc}") from exc
+
+
+def _grid_identity(manifest: Mapping[str, Any]) -> tuple[str, str, int]:
+    grid = manifest.get("grid")
+    plan = grid.get("plan") if isinstance(grid, Mapping) else None
+    if not isinstance(plan, Mapping):
+        raise CollectionError("grid manifest has no Cartesian plan")
+    run_id = manifest.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        raise CollectionError("grid manifest has no run_id")
+    return run_id, _require_sha(plan.get("plan_sha256"), "grid plan SHA-256"), int(grid["pool_count"])
+
+
+def _ranges(descriptor: Mapping[str, Any], pool_count: int) -> tuple[tuple[int, int], ...]:
+    raw = descriptor.get("ranges")
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)) or not raw:
+        raise CollectionError("grid shard has no ranges")
+    try:
+        ranges = tuple((int(item[0]), int(item[1])) for item in raw)
+    except (IndexError, TypeError, ValueError) as exc:
+        raise CollectionError("grid shard ranges are invalid") from exc
+    previous = -1
+    for start, end in ranges:
+        if start < 0 or start < previous or end <= start or end > pool_count:
+            raise CollectionError("grid shard ranges are not sorted valid half-open ranges")
+        previous = end
+    if sum(end - start for start, end in ranges) > 2048:
+        raise CollectionError("grid shard exceeds the 2,048-point persistence bound")
+    return ranges
+
+
+def _ordinals(ranges: Sequence[tuple[int, int]]) -> tuple[int, ...]:
+    return tuple(ordinal for start, end in ranges for ordinal in range(start, end))
+
+
+def _result_dict(result: Any) -> dict[str, Any]:
+    if hasattr(result, "model_dump"):
+        result = result.model_dump()
+    if not isinstance(result, Mapping):
+        raise CollectionError("grid result must be an object")
+    return dict(result)
+
+
+def _error_columns(errors: Sequence[str | None]) -> tuple[np.ndarray, np.ndarray]:
+    encoded = [(error or "").encode("utf-8") for error in errors]
+    offsets = np.zeros(len(encoded) + 1, dtype="<i8")
+    for index, value in enumerate(encoded):
+        offsets[index + 1] = offsets[index] + len(value)
+    return offsets, np.frombuffer(b"".join(encoded), dtype="u1").copy()
+
+
+def _atomic_npz(path: Path, payload: Mapping[str, Any]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(descriptor, "wb") as stream:
             np.savez_compressed(stream, **payload)
-        os.replace(temporary_name, destination)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_name, path)
     finally:
         Path(temporary_name).unlink(missing_ok=True)
-    return destination
+    return path
 
 
-def load_grid_results_npz(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Load and validate one compressed collected-result artifact."""
+def write_grid_shard_result(
+    npz_path: Path | str, receipt_path: Path | str, *, manifest: Mapping[str, Any],
+    plan: CartesianGridPlan, shard: Mapping[str, Any], blade: str,
+    work_request_sha256: str, session_attestations: Mapping[str, Any],
+    results: Iterable[Any],
+) -> Mapping[str, Any]:
+    """Persist one ordinal-sorted shard NPZ, then its canonical receipt."""
+    destination, receipt_destination = Path(npz_path), Path(receipt_path)
+    if destination.suffix != ".npz":
+        raise CollectionError("grid shard path must end in .npz")
+    shard_id = str(shard.get("shard_id", ""))
+    if (not shard_id or destination.name != f"{shard_id}.npz"
+            or receipt_destination.name != f"{shard_id}.receipt.json"
+            or destination.parent.resolve() != receipt_destination.parent.resolve()
+            or destination.parent.name != "results"):
+        raise CollectionError("grid shard paths do not match its shard id")
+    run_id, plan_sha, pool_count = _grid_identity(manifest)
+    if plan.plan_sha256 != plan_sha or plan.pool_count != pool_count:
+        raise CollectionError("grid shard plan differs from manifest")
+    ranges = _ranges(shard, pool_count)
+    expected = _ordinals(ranges)
+    projection = _projection(manifest)
+    normalized = _normalized_attestations(session_attestations)
+    expected_groups = {point.session_group_id for point in plan.iter_points(ranges)}
+    if set(normalized) != expected_groups:
+        raise CollectionError("grid shard session attestations do not exactly cover its plan groups")
+    by_ordinal: dict[int, dict[str, Any]] = {}
+    for raw in results:
+        row = _result_dict(raw)
+        try:
+            ordinal = int(row["ordinal"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CollectionError("grid result has no valid ordinal") from exc
+        if ordinal in by_ordinal:
+            raise CollectionError(f"duplicate grid result ordinal {ordinal}")
+        if row.get("candidate_id") != plan.candidate_id_at(ordinal):
+            raise CollectionError(f"grid result ordinal {ordinal} has the wrong candidate id")
+        by_ordinal[ordinal] = row
+    if set(by_ordinal) != set(expected):
+        raise CollectionError("grid shard result ordinals do not exactly cover its ranges")
+
+    statuses = np.empty(len(expected), dtype="u1")
+    fingerprints = np.zeros(len(expected), dtype="S64")
+    fingerprint_present = np.zeros(len(expected), dtype=np.bool_)
+    metric_values = np.full((len(expected), len(projection.fields)), np.nan, dtype="<f8")
+    metric_present = np.zeros(metric_values.shape, dtype=np.bool_)
+    errors: list[str | None] = []
+    counts = {name: 0 for name in _STATUS}
+    for index, ordinal in enumerate(expected):
+        row = by_ordinal[ordinal]
+        status = row.get("status", "ok")
+        if status not in _STATUS:
+            raise CollectionError(f"grid result ordinal {ordinal} has invalid status")
+        statuses[index], counts[status] = _STATUS[status], counts[status] + 1
+        error = row.get("error")
+        if error is not None and not isinstance(error, str):
+            raise CollectionError(f"grid result ordinal {ordinal} has invalid error")
+        errors.append(error)
+        fingerprint = row.get("economic_fingerprint")
+        if fingerprint:
+            fingerprints[index], fingerprint_present[index] = _require_sha(fingerprint, "economic fingerprint").encode(), True
+        metrics = row.get("metrics")
+        if not isinstance(metrics, Mapping):
+            raise CollectionError(f"grid result ordinal {ordinal} has invalid metrics")
+        for metric_index, name in enumerate(projection.fields):
+            value = metrics.get(name)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not np.isfinite(float(value)):
+                raise CollectionError(f"grid result ordinal {ordinal} metric {name!r} is not finite")
+            metric_values[index, metric_index], metric_present[index, metric_index] = float(value), True
+        if status == "ok" and (error is not None or not fingerprint_present[index] or not np.all(metric_present[index])):
+            raise CollectionError(f"successful grid result ordinal {ordinal} is incomplete")
+
+    offsets, error_bytes = _error_columns(errors)
+    shard_index = int(shard["shard_index"])
+    payload: dict[str, Any] = {
+        "schema_version": np.asarray(SHARD_NPZ_SCHEMA_VERSION), "run_id": np.asarray(run_id),
+        "shard_id": np.asarray(str(shard["shard_id"])),
+        "plan_sha256": np.asarray(plan_sha.encode(), dtype="S64"),
+        "artifact_sha256": np.asarray(plan.artifact_sha256.encode(), dtype="S64"),
+        "metric_projection_sha256": np.asarray(projection.projection_sha256.encode(), dtype="S64"),
+        "shard_index": np.asarray(shard_index, dtype="<i8"),
+        "row_count": np.asarray(len(expected), dtype="<i8"), "metric_names": np.asarray(projection.fields, dtype=np.str_),
+        "ordinal": np.asarray(expected, dtype="<i8"), "status": statuses,
+        "economic_fingerprint": fingerprints, "economic_fingerprint_present": fingerprint_present,
+        "error_offsets": offsets, "error_utf8": error_bytes,
+        "metric_values": metric_values, "metric_present": metric_present,
+    }
+    _atomic_npz(destination, payload)
+    try:
+        relative_npz = destination.resolve().relative_to(destination.parent.parent.resolve()).as_posix()
+    except ValueError as exc:
+        raise CollectionError("grid shard must stay beneath its run directory") from exc
+    receipt = {
+        "schema_version": SHARD_RECEIPT_SCHEMA_VERSION, "run_id": run_id,
+        "shard_id": str(shard["shard_id"]), "shard_index": shard_index,
+        "plan_sha256": plan_sha, "artifact_sha256": plan.artifact_sha256,
+        "metric_projection_sha256": projection.projection_sha256,
+        "ranges": [list(item) for item in ranges], "blade": str(blade),
+        "work_request_sha256": _require_sha(work_request_sha256, "work request SHA-256"),
+        "request_set_sha256": _request_set_sha256(manifest, shard, ranges, projection, normalized),
+        "session_attestations": normalized, "row_count": len(expected),
+        "result": {"path": relative_npz, "sha256": sha256_path(destination),
+                   "bytes": destination.stat().st_size},
+        "status_counts": counts,
+    }
+    atomic_write_json(receipt_destination, receipt)
+    return receipt
+
+
+def _read_receipt(path: Path | str) -> dict[str, Any]:
     source = Path(path)
     try:
-        with np.load(source, allow_pickle=False) as archive:
-            schema = str(np.asarray(archive["schema_version"]).item())
-            if schema != GRID_RESULTS_SCHEMA_VERSION:
-                raise CollectionError(f"unsupported grid result NPZ schema {schema!r}")
-            rows_raw = archive["rows_json"].astype(str)
-            total_rows = int(np.asarray(archive["total_rows"]).item())
-            if rows_raw.shape != (total_rows,):
-                raise CollectionError("grid result NPZ row count does not match rows_json")
-            rows = [json.loads(value) for value in rows_raw]
-            if not all(isinstance(row, Mapping) for row in rows):
-                raise CollectionError("grid result NPZ rows must decode to objects")
-            metadata = {
-                "schema_version": schema,
-                "run_id": str(np.asarray(archive["run_id"]).item()),
-                "schema_signature": str(np.asarray(archive["schema_signature"]).item()),
-                "request_set_sha256": str(np.asarray(archive["request_set_sha256"]).item()),
-                "session_attestation": json.loads(
-                    str(np.asarray(archive["session_attestation_json"]).item())
-                ),
-                "total_rows": total_rows,
-            }
-    except CollectionError:
-        raise
-    except (KeyError, OSError, ValueError, json.JSONDecodeError) as exc:
-        raise CollectionError(f"invalid grid result NPZ {source}: {exc}") from exc
-    return metadata, [dict(row) for row in rows]
+        value = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CollectionError(f"invalid grid shard receipt {source}: {exc}") from exc
+    expected = {
+        "schema_version", "run_id", "plan_sha256", "artifact_sha256",
+        "metric_projection_sha256", "shard_id", "shard_index", "ranges",
+        "row_count", "blade", "work_request_sha256", "request_set_sha256",
+        "session_attestations", "result", "status_counts",
+    }
+    if (not isinstance(value, Mapping)
+            or value.get("schema_version") != SHARD_RECEIPT_SCHEMA_VERSION
+            or set(value) != expected):
+        raise CollectionError(f"unsupported grid shard receipt {source}")
+    return dict(value)
 
 
-def collect_grid_results(
-    manifest_path: Path,
-    output_file: Path | None = None,
-    *,
-    ssh_config: SSHConfig | None = None,
-    adapter: ProcessAdapter | None = None,
-) -> Path:
-    """Validate and merge all canonical shard results into one NPZ output."""
-    manifest_file = Path(manifest_path).resolve()
-    with manifest_file.open("r", encoding="utf-8") as handle:
-        manifest = json.load(handle)
-
-    run_dir = manifest_file.parent
-    results_dir = run_dir / "results"
-    assignments, _ = _manifest_grid_shards(manifest)
-    scope = manifest.get("scope", "local")
-    if scope == "cluster":
-        missing = [
-            str(desc.get("shard_id", ""))
-            for desc in assignments
-            if not (results_dir / f"{desc.get('shard_id', '')}.json").is_file()
-        ]
-        if missing:
-            fetch_remote_shards(manifest, results_dir, ssh_config=ssh_config, adapter=adapter)
-
-    sorted_records, schema_sig = validate_shards(manifest, results_dir)
-    payloads = [
-        _load_shard_records(results_dir / f"{desc['shard_id']}.json")[0]
-        for desc in assignments
-    ]
-    resolved = manifest.get("resolved_spec")
-    compilation = resolved.get("candidate_compilation") if isinstance(resolved, Mapping) else None
-    grouped = isinstance(compilation, Mapping) and compilation.get("mode") == "schema_grouped_v1"
-    if grouped:
-        request_set_sha256 = hashlib.sha256(
-            _canonical_json([payload["request_set_sha256"] for payload in payloads])
-        ).hexdigest()
-        session_attestation: Mapping[str, Any] = {
-            str(descriptor["session_group_id"]): _session_digest_view(
-                payload["session_attestation"]
-            )
-            for descriptor, payload in zip(assignments, payloads, strict=True)
+def _validate_receipt(manifest: Mapping[str, Any], plan: CartesianGridPlan | None,
+                      descriptor: Mapping[str, Any], receipt_path: Path,
+                      *, verify_npz: bool) -> tuple[dict[str, Any], Path]:
+    receipt = _read_receipt(receipt_path)
+    run_id, plan_sha, pool_count = _grid_identity(manifest)
+    if plan is not None and (plan.plan_sha256 != plan_sha or plan.pool_count != pool_count):
+        raise CollectionError("grid shard plan differs from manifest")
+    projection, ranges = _projection(manifest), _ranges(descriptor, pool_count)
+    expected = {
+        "run_id": run_id, "shard_id": str(descriptor["shard_id"]),
+        "shard_index": int(descriptor["shard_index"]),
+        "plan_sha256": plan_sha, "artifact_sha256": manifest["grid"]["plan"]["artifact_sha256"],
+        "metric_projection_sha256": projection.projection_sha256,
+        "ranges": [list(item) for item in ranges],
+    }
+    if any(receipt.get(key) != value for key, value in expected.items()):
+        raise CollectionError(f"grid shard receipt {receipt_path} differs from its manifest descriptor")
+    if descriptor.get("blade") is not None and receipt.get("blade") != descriptor["blade"]:
+        raise CollectionError(f"grid shard receipt {receipt_path} has the wrong blade")
+    expected_work = descriptor.get("work_request_sha256")
+    if expected_work is not None and receipt.get("work_request_sha256") != expected_work:
+        raise CollectionError(f"grid shard receipt {receipt_path} has the wrong work request")
+    _require_sha(receipt.get("work_request_sha256"), "work request SHA-256")
+    if not isinstance(receipt.get("blade"), str) or not receipt["blade"]:
+        raise CollectionError(f"grid shard receipt {receipt_path} has no blade")
+    normalized = _normalized_attestations(receipt.get("session_attestations", {}))
+    if plan is not None:
+        expected_groups = {
+            point.session_group_id for point in plan.iter_points(ranges)
         }
-    else:
-        request_set_sha256 = str(payloads[0]["request_set_sha256"])
-        session_attestation = _session_digest_view(payloads[0]["session_attestation"])
-    target_output = output_file or (run_dir / "grid_results.npz")
-    write_grid_results_npz(
-        target_output,
-        run_id=str(manifest.get("run_id", "")),
-        schema_signature=schema_sig,
-        request_set_sha256=request_set_sha256,
-        session_attestation=session_attestation,
-        rows=sorted_records,
+        if set(normalized) != expected_groups:
+            raise CollectionError(f"grid shard receipt {receipt_path} has the wrong session groups")
+    if receipt.get("request_set_sha256") != _request_set_sha256(manifest, descriptor, ranges, projection, normalized):
+        raise CollectionError(f"grid shard receipt {receipt_path} has an invalid request set")
+    npz_record = receipt.get("result")
+    expected_path = f"results/{descriptor['shard_id']}.npz"
+    if not isinstance(npz_record, Mapping) or npz_record.get("path") != expected_path:
+        raise CollectionError(f"grid shard receipt {receipt_path} has an invalid NPZ path")
+    npz_path = receipt_path.parent.parent / str(npz_record["path"])
+    if not npz_path.is_file() or npz_path.stat().st_size != npz_record.get("bytes") or (verify_npz and sha256_path(npz_path) != npz_record.get("sha256")):
+        raise CollectionError(f"grid shard receipt {receipt_path} NPZ attestation failed")
+    return receipt, npz_path
+
+
+def load_grid_shard_receipt(
+    receipt_path: Path | str, *, manifest: Mapping[str, Any], plan: CartesianGridPlan,
+    shard: Mapping[str, Any], verify_npz: bool = True,
+) -> Mapping[str, Any]:
+    receipt, npz_path = _validate_receipt(
+        manifest, plan, shard, Path(receipt_path), verify_npz=verify_npz
     )
-    if manifest.get("run_kind") == "grid" and isinstance(manifest.get("resolved_spec"), Mapping):
-        try:
-            from ..grids.runner import collect_grid_run
-
-            collect_grid_run(manifest_file, results_path=target_output)
-        except Exception as exc:  # noqa: BLE001
-            raise CollectionError(f"canonical evaluation table collection failed: {exc}") from exc
-    return target_output
+    if verify_npz:
+        _load_shard(npz_path, manifest, shard, receipt)
+    return receipt
 
 
-__all__ = [
-    "CollectionError",
-    "GRID_REQUEST_SCHEMA_VERSION",
-    "GRID_RESULTS_SCHEMA_VERSION",
-    "SHARD_RESULT_SCHEMA_VERSION",
-    "collect_grid_results",
-    "fetch_remote_shards",
-    "grid_request_set_sha256",
-    "group_request_set_sha256",
-    "is_grouped_shard_complete",
-    "make_shard_result",
-    "normalize_session_attestation",
-    "load_grid_results_npz",
-    "write_grid_results_npz",
-    "validate_shards",
-    "write_shard_result",
-]
+def is_grid_shard_complete(manifest: Mapping[str, Any], plan: CartesianGridPlan,
+                           shard: Mapping[str, Any], receipt_path: Path | str) -> bool:
+    """Return true only after receipt, NPZ identity, digest, and columns validate."""
+    try:
+        load_grid_shard_receipt(receipt_path, manifest=manifest, plan=plan,
+                               shard=shard, verify_npz=True)
+        return True
+    except (CollectionError, KeyError, OSError, TypeError, ValueError):
+        return False
+
+
+def _scalar(archive: Mapping[str, Any], name: str) -> Any:
+    value = np.asarray(archive[name])
+    if value.shape != ():
+        raise CollectionError(f"grid shard field {name!r} must be scalar")
+    item = value.item()
+    return item.decode("ascii") if isinstance(item, bytes) else item
+
+
+def _load_shard(npz_path: Path, manifest: Mapping[str, Any], descriptor: Mapping[str, Any], receipt: Mapping[str, Any]) -> dict[str, np.ndarray]:
+    projection = _projection(manifest)
+    ranges = _ranges(descriptor, int(manifest["grid"]["pool_count"]))
+    expected_ordinals = np.asarray(_ordinals(ranges), dtype="<i8")
+    try:
+        with np.load(npz_path, allow_pickle=False) as archive:
+            scalars = {
+                "schema_version": SHARD_NPZ_SCHEMA_VERSION, "run_id": manifest["run_id"],
+                "shard_id": descriptor["shard_id"], "plan_sha256": manifest["grid"]["plan"]["plan_sha256"],
+                "artifact_sha256": manifest["grid"]["plan"]["artifact_sha256"],
+                "metric_projection_sha256": projection.projection_sha256,
+                "shard_index": int(descriptor["shard_index"]),
+                "row_count": len(expected_ordinals),
+            }
+            if any(_scalar(archive, key) != value for key, value in scalars.items()):
+                raise CollectionError(f"grid shard {npz_path} scalar identity mismatch")
+            expected_fields = {
+                "schema_version", "run_id", "shard_id", "plan_sha256", "artifact_sha256",
+                "metric_projection_sha256", "shard_index", "row_count", "metric_names",
+                "ordinal", "status", "economic_fingerprint", "economic_fingerprint_present",
+                "error_offsets", "error_utf8", "metric_values", "metric_present",
+            }
+            if set(archive.files) != expected_fields:
+                raise CollectionError(f"grid shard {npz_path} fields are invalid")
+            data = {name: np.asarray(archive[name]).copy() for name in (
+                "metric_names", "ordinal", "status", "economic_fingerprint",
+                "economic_fingerprint_present", "error_offsets", "error_utf8",
+                "metric_values", "metric_present")}
+    except (KeyError, OSError, ValueError) as exc:
+        raise CollectionError(f"invalid grid shard NPZ {npz_path}: {exc}") from exc
+    count, metrics = len(expected_ordinals), len(projection.fields)
+    if tuple(data["metric_names"].astype(str)) != projection.fields or not np.array_equal(data["ordinal"], expected_ordinals):
+        raise CollectionError(f"grid shard {npz_path} ordinal or metric identity mismatch")
+    expected_shapes = {"status": (count,), "economic_fingerprint": (count,),
+        "economic_fingerprint_present": (count,), "error_offsets": (count + 1,),
+        "metric_values": (count, metrics), "metric_present": (count, metrics)}
+    if any(data[name].shape != shape for name, shape in expected_shapes.items()):
+        raise CollectionError(f"grid shard {npz_path} column shapes are invalid")
+    if data["ordinal"].dtype != np.dtype("<i8") or data["status"].dtype != np.dtype("u1") or np.any(data["status"] > 2):
+        raise CollectionError(f"grid shard {npz_path} typed columns are invalid")
+    if data["economic_fingerprint"].dtype != np.dtype("S64") or data["metric_values"].dtype != np.dtype("<f8"):
+        raise CollectionError(f"grid shard {npz_path} value dtypes are invalid")
+    if data["economic_fingerprint_present"].dtype != np.dtype(bool) or data["metric_present"].dtype != np.dtype(bool):
+        raise CollectionError(f"grid shard {npz_path} presence dtypes are invalid")
+    offsets = data["error_offsets"]
+    if (offsets.dtype != np.dtype("<i8") or offsets[0] != 0
+            or data["error_utf8"].dtype != np.dtype("u1")
+            or offsets[-1] != len(data["error_utf8"]) or np.any(np.diff(offsets) < 0)):
+        raise CollectionError(f"grid shard {npz_path} error offsets are invalid")
+    try:
+        data["error_utf8"].tobytes().decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise CollectionError(f"grid shard {npz_path} errors are not UTF-8") from exc
+    counts = {name: int(np.count_nonzero(data["status"] == code)) for name, code in _STATUS.items()}
+    if receipt.get("status_counts") != counts or receipt.get("row_count") != count:
+        raise CollectionError(f"grid shard receipt {npz_path} counts are invalid")
+    ok = data["status"] == 0
+    for raw, present in zip(data["economic_fingerprint"], data["economic_fingerprint_present"], strict=True):
+        value = bytes(raw)
+        if (present and not _sha_bytes(value)) or (not present and value):
+            raise CollectionError(f"grid shard {npz_path} fingerprint presence is invalid")
+    if (np.any(ok & ~data["economic_fingerprint_present"])
+            or np.any(ok & (np.diff(offsets) != 0))
+            or np.any(ok[:, None] & ~data["metric_present"])
+            or np.any(data["metric_present"] & ~np.isfinite(data["metric_values"]))
+            or np.any(~data["metric_present"] & ~np.isnan(data["metric_values"]))):
+        raise CollectionError(f"successful rows in {npz_path} are incomplete")
+    return data
+
+
+def collect_grid_results(manifest_path: Path | str, output_path: Path | str | None = None) -> Path:
+    """Stream verified shard columns into the sole evaluation_table.npz authority."""
+    manifest_file = Path(manifest_path).resolve()
+    manifest = load_manifest(manifest_file, expected_kind="grid")
+    run_dir, results_dir = manifest_file.parent, manifest_file.parent / "results"
+    try:
+        from ..evaluation.plans import ScenarioKey
+        from ..evaluation.selected import SelectedEvaluator
+        from ..grids.runner import load_grid_plan
+
+        selected = SelectedEvaluator.load(run_dir / "evaluator_artifact")
+        raw = manifest["grid"]["plan"]["scenario_key"]
+        scenario = ScenarioKey(str(raw["identity_json"]).encode(), str(raw["sha256"])).validated()
+        plan_object = load_grid_plan(manifest, selected_evaluator=selected, scenario=scenario)
+    except Exception as exc:
+        raise CollectionError(f"cannot verify Cartesian grid plan: {exc}") from exc
+    descriptors = manifest["grid"].get("shards")
+    if not isinstance(descriptors, list) or not descriptors:
+        raise CollectionError("grid manifest has no shard descriptors")
+    descriptors = sorted(descriptors, key=lambda item: _ranges(item, manifest["grid"]["pool_count"])[0][0])
+    pool_count, cursor = int(manifest["grid"]["pool_count"]), 0
+    for descriptor in descriptors:
+        values = _ordinals(_ranges(descriptor, pool_count))
+        if values != tuple(range(cursor, cursor + len(values))):
+            raise CollectionError("grid shard descriptors do not exactly partition ordinal order")
+        cursor += len(values)
+    if cursor != pool_count:
+        raise CollectionError("grid shard descriptors do not cover the Cartesian plan")
+    projection = _projection(manifest)
+    target = Path(output_path).resolve() if output_path else run_dir / "evaluation_table.npz"
+    if target.name != "evaluation_table.npz" or target.parent != run_dir:
+        raise CollectionError("grid collection output must be the run evaluation_table.npz")
+
+    with tempfile.TemporaryDirectory(prefix=".grid-collection.", dir=run_dir) as temporary:
+        scratch = Path(temporary)
+        status = np.memmap(scratch / "status", mode="w+", dtype="u1", shape=(pool_count,))
+        fingerprint = np.memmap(scratch / "fingerprint", mode="w+", dtype="S64", shape=(pool_count,))
+        fingerprint_present = np.memmap(scratch / "fingerprint-present", mode="w+", dtype=np.bool_, shape=(pool_count,))
+        offsets = np.memmap(scratch / "error-offsets", mode="w+", dtype="<i8", shape=(pool_count + 1,))
+        metric_values = [np.memmap(scratch / f"metric-{i}-values", mode="w+", dtype="<f8", shape=(pool_count,)) for i in range(len(projection.fields))]
+        metric_present = [np.memmap(scratch / f"metric-{i}-present", mode="w+", dtype=np.bool_, shape=(pool_count,)) for i in range(len(projection.fields))]
+        error_path, error_cursor = scratch / "errors", 0
+        with error_path.open("wb") as error_stream:
+            offsets[0] = 0
+            for descriptor in descriptors:
+                receipt_path = results_dir / f"{descriptor['shard_id']}.receipt.json"
+                receipt, npz_path = _validate_receipt(
+                    manifest, plan_object, descriptor, receipt_path, verify_npz=True
+                )
+                shard = _load_shard(npz_path, manifest, descriptor, receipt)
+                for local, ordinal in enumerate(shard["ordinal"]):
+                    value = int(ordinal)
+                    status[value] = shard["status"][local]
+                    fingerprint[value] = shard["economic_fingerprint"][local]
+                    fingerprint_present[value] = shard["economic_fingerprint_present"][local]
+                    start, end = int(shard["error_offsets"][local]), int(shard["error_offsets"][local + 1])
+                    encoded = shard["error_utf8"][start:end].tobytes()
+                    error_stream.write(encoded); error_cursor += len(encoded); offsets[value + 1] = error_cursor
+                    for metric_index in range(len(projection.fields)):
+                        metric_values[metric_index][value] = shard["metric_values"][local, metric_index]
+                        metric_present[metric_index][value] = shard["metric_present"][local, metric_index]
+            error_stream.flush(); os.fsync(error_stream.fileno())
+        error_bytes = np.memmap(error_path, mode="r", dtype="u1", shape=(error_cursor,)) if error_cursor else np.empty(0, dtype="u1")
+        plan = manifest["grid"]["plan"]
+        payload: dict[str, Any] = {
+            "schema_version": np.asarray(GRID_TABLE_SCHEMA_VERSION),
+            "table_kind": np.asarray("cartesian_grid"), "run_id": np.asarray(manifest["run_id"]),
+            "plan_sha256": np.asarray(plan["plan_sha256"].encode(), dtype="S64"),
+            "artifact_sha256": np.asarray(plan["artifact_sha256"].encode(), dtype="S64"),
+            "metric_projection_sha256": np.asarray(projection.projection_sha256.encode(), dtype="S64"),
+            "row_count": np.asarray(pool_count, dtype="<i8"), "metric_names": np.asarray(projection.fields, dtype=np.str_),
+            "metric_projection_json": np.asarray(canonical_json_bytes(projection.to_dict()).decode()),
+            "metadata_json": np.asarray(canonical_json_bytes({"source_kind": "grid", "run_id": manifest["run_id"],
+                "grid_id": manifest["grid"]["grid_id"], "shape": plan["coordinate_shape"]}).decode()),
+            "status": status, "economic_fingerprint": fingerprint,
+            "economic_fingerprint_present": fingerprint_present,
+            "error_offsets": offsets, "error_utf8": error_bytes,
+        }
+        for index in range(len(projection.fields)):
+            payload[f"metric_{index:03d}_values"] = metric_values[index]
+            payload[f"metric_{index:03d}_present"] = metric_present[index]
+        _atomic_npz(target, payload)
+
+    table_ref = {"path": target.name, "sha256": sha256_path(target), "bytes": target.stat().st_size,
+                 "row_count": pool_count, "metric_projection": projection.to_dict()}
+    manifest["grid"]["table_ref"] = table_ref
+    artifacts = [item for item in manifest.get("artifacts", ()) if item.get("kind") != "evaluation_table"]
+    artifacts.append({"kind": "evaluation_table", "path": target.name,
+                      "sha256": table_ref["sha256"], "bytes": table_ref["bytes"]})
+    manifest["artifacts"] = artifacts
+    write_manifest_atomic(manifest_file, manifest, expected_kind="grid")
+    legacy = run_dir / "grid_results.npz"
+    if legacy.exists():
+        raise CollectionError("legacy grid_results.npz exists; refusing dual result authority")
+    return target
+
+
+__all__ = ["CollectionError", "SHARD_NPZ_SCHEMA_VERSION", "SHARD_RECEIPT_SCHEMA_VERSION",
+           "collect_grid_results", "is_grid_shard_complete", "load_grid_shard_receipt",
+           "normalize_session_attestation", "write_grid_shard_result"]

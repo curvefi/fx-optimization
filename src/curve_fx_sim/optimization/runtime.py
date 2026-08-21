@@ -4,15 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shlex
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
-
-from curve_fx_harness_client.models import CandidateSpec, ObservationSpec
 
 from ..artifacts.attestation import (
     find_attested_artifact,
@@ -22,12 +20,6 @@ from ..artifacts.io import atomic_write_json, canonical_json_bytes, sha256_path
 from ..artifacts.manifest import new_optimization_manifest
 from ..artifacts.store import RunStore
 from ..artifacts.tables import EvaluationRow, EvaluationTable, MetricProjection
-from ..evaluation.client import HarnessClient, ScenarioHarnessClient, SubprocessHarnessClient
-from ..evaluation.identity import (
-    VerifiedEvaluator,
-    validate_evaluator_identity,
-    verified_evaluator_from_payload,
-)
 from ..evaluation.grouping import (
     CompiledEvaluation,
     bind_local_session_group,
@@ -43,19 +35,16 @@ from ..execution.site import SiteProfile, load_site_profile
 from ..execution.shared_nfs import (
     canonical_sha256,
     execution_site_payload,
-    fetch_authoritative_run,
     package_identity_sha256,
     shared_run_lease,
 )
-from ..execution.staging import remote_run_paths, scoped_remote_path
 from ..specs.common import ProjectContext
 from ..specs.optimization import OptimizationSpec, load_optimization_spec
 from ..specs.pair import load_pair_spec
-from ..specs.policy import load_policy_spec
 from ..specs.scenario import load_scenario_spec
 from .nevergrad_adapter import NevergradTwoPointsDEOptimizer
-from .profiles import NamedProfile, create_lattice_spec, profile_from_policy_spec, quantized
-from .requests import compile_named_request, split_request
+from .profiles import NamedProfile
+from .requests import compile_named_request
 from .scoring import (
     SCORE_FX_LP_E15_SLIPPAGE_V1_KEY,
     SCORE_VERSION,
@@ -67,10 +56,14 @@ from .scoring import (
 )
 from .search import SearchLayout, select_search_descriptors
 from .tmrbcd import TmrbcdOptimizer
-from .worker import OptimizationBundleResult, create_work_bundle
 
-OPTIMIZATION_CHECKPOINT_SCHEMA_VERSION = 5
-EVALUATION_JOURNAL_FILENAME = "evaluation_journal.jsonl"
+OPTIMIZATION_CHECKPOINT_SCHEMA_VERSION = 6
+
+
+def _row_prefix_sha256(rows: Sequence[EvaluationRow], step: int) -> str:
+    return hashlib.sha256(
+        canonical_json_bytes([row.to_dict() for row in rows[:step]])
+    ).hexdigest()
 
 
 def _compile_named_batch(
@@ -145,209 +138,6 @@ def _compile_named_batch(
     return compiled, groups
 
 
-def _close_owned_clients(clients: Sequence[HarnessClient]) -> None:
-    errors: list[BaseException] = []
-    for client in clients:
-        try:
-            client.close()
-        except BaseException as exc:
-            errors.append(exc)
-    if len(errors) == 1:
-        raise errors[0]
-    if errors:
-        raise BaseExceptionGroup("failed to close optimization evaluator clients", errors)
-
-
-def _read_evaluation_journal(journal_path: Path) -> list[EvaluationRow]:
-    """Read the plain JSONL evaluation journal; malformed rows fail naturally."""
-    if not journal_path.is_file():
-        return []
-    rows: list[EvaluationRow] = []
-    with journal_path.open("r", encoding="utf-8") as stream:
-        for line_number, line in enumerate(stream, start=1):
-            if not line.strip():
-                continue
-            try:
-                raw_row = json.loads(line)
-                row = EvaluationRow.from_dict(raw_row)
-            except (
-                UnicodeDecodeError,
-                json.JSONDecodeError,
-                TypeError,
-                ValueError,
-                KeyError,
-                AttributeError,
-            ) as exc:
-                raise ValueError(
-                    f"Resume evaluation journal has a malformed row at line {line_number}"
-                ) from exc
-            rows.append(row)
-    return rows
-
-
-def _dispatch_remote_bundle(
-    bundle: Any,
-    *,
-    run_dir: Path,
-    site: SiteProfile,
-    blade: str,
-    expected_ask_ids: frozenset[str],
-) -> OptimizationBundleResult:
-    """Dispatch one immutable optimization bundle, reusing an attested local result."""
-    bundle_dir = run_dir / "bundles"
-    bundle_dir.mkdir(parents=True, exist_ok=True)
-    local_bundle = bundle_dir / f"{bundle.bundle_id}.json"
-    local_result = bundle_dir / f"{bundle.bundle_id}.result.json"
-    bundle.to_json(local_bundle)
-
-    def load_checked() -> OptimizationBundleResult:
-        result = OptimizationBundleResult.from_json(local_result)
-        if (result.bundle_id, result.bundle_sha256, result.island_id) != (
-            bundle.bundle_id,
-            bundle.bundle_sha256,
-            bundle.island_id,
-        ):
-            raise ValueError(f"remote result does not attest bundle {bundle.bundle_id}")
-        ask_ids = [str(item["ask_id"]) for item in result.results]
-        if len(ask_ids) != len(set(ask_ids)) or frozenset(ask_ids) != expected_ask_ids:
-            raise ValueError(f"remote result has non-exact ask_id coverage for {bundle.bundle_id}")
-        return result
-
-    if local_result.is_file():
-        return load_checked()
-    paths = remote_run_paths(bundle.run_id, remote_base=site.cluster.remote_base)
-    shared = site.cluster.transport == "shared_nfs"
-    if shared:
-        try:
-            run_dir.resolve().relative_to(Path(str(site.cluster.remote_run_root)).resolve())
-        except ValueError as exc:
-            raise RuntimeError(
-                "shared-NFS optimization must be launched through the configured coordinator"
-            ) from exc
-        remote_bundle = local_bundle
-        remote_result = local_result
-    else:
-        remote_bundle = scoped_remote_path(
-            bundle.run_id,
-            f"inputs/{local_bundle.name}",
-            remote_base=site.cluster.remote_base,
-        )
-        remote_result = scoped_remote_path(
-            bundle.run_id,
-            f"results/{local_result.name}",
-            remote_base=site.cluster.remote_base,
-        )
-    ssh = SSHProcessAdapter(ssh_config=site.ssh)
-    if not shared:
-        setup = ssh.run_ssh(blade, f"mkdir -p {shlex.quote(str(paths['inputs']))} {shlex.quote(str(paths['results']))}")
-        if not setup.ok:
-            raise RuntimeError(f"failed to prepare remote run on {blade}: {setup.stderr}")
-        uploaded = ssh.rsync_upload(local_bundle, blade, str(remote_bundle))
-        if not uploaded.ok:
-            raise RuntimeError(f"failed to stage optimization bundle {bundle.bundle_id}: {uploaded.stderr}")
-    worker = shlex.quote(site.cluster.worker_command)
-    repository = shlex.quote(str(site.cluster.repository_root))
-    harness = shlex.quote(str(site.harness.remote_binary_path or site.harness.binary_name))
-    command = (
-        f"cd {repository} && "
-        f"{worker} optimize worker {shlex.quote(str(remote_bundle))} "
-        f"--root {repository} "
-        f"--harness {harness} --out {shlex.quote(str(remote_result))}"
-    )
-    executed = ssh.run_ssh(blade, command)
-    if not executed.ok:
-        raise RuntimeError(f"remote optimization worker failed on {blade}: {executed.stderr}")
-    if not shared:
-        downloaded = ssh.rsync_download(blade, str(remote_result), local_result)
-        if not downloaded.ok:
-            raise RuntimeError(f"failed to collect optimization result {bundle.bundle_id}: {downloaded.stderr}")
-    elif not local_result.is_file():
-        raise RuntimeError(
-            f"shared-NFS worker did not publish optimization result {bundle.bundle_id}"
-        )
-    return load_checked()
-
-
-def _run_optimization_via_coordinator(
-    opt_spec: OptimizationSpec,
-    *,
-    run_store: RunStore,
-    root: Path,
-    site: SiteProfile,
-    blades: Sequence[str],
-    run_id: str,
-    resume: bool,
-    budget: int | None,
-    batch_size: int | None,
-    top_k_count: int,
-    execution_closure_sha256: str,
-    lease: Any,
-) -> OptimizationResult:
-    """Launch the control plane on NFS and collect the completed run once."""
-    configured_budget = int(opt_spec.optimizer_config.get("budget", 100))
-    configured_batch = int(opt_spec.optimizer_config.get("batch_size", 4))
-    if (
-        (budget is not None and int(budget) != configured_budget)
-        or (batch_size is not None and int(batch_size) != configured_batch)
-        or top_k_count != 8
-    ):
-        raise ValueError(
-            "shared-NFS coordinator launch requires budget, batch_size, and top_k in the immutable spec"
-        )
-    if opt_spec.source_path is None:
-        raise ValueError("shared-NFS coordinator launch requires a checked-in optimization spec")
-    local_spec = (root / opt_spec.source_path).resolve()
-    remote_spec = site.cluster.repository_root / opt_spec.source_path.as_posix()
-    ssh = SSHProcessAdapter(ssh_config=site.ssh)
-    coordinator = site.cluster.coordinator
-    inspected = ssh.run_ssh(
-        coordinator,
-        f"sha256sum {shlex.quote(str(remote_spec))}",
-    )
-    if not inspected.ok:
-        raise RuntimeError(f"failed to inspect optimization spec on {coordinator}: {inspected.stderr}")
-    remote_digest = inspected.stdout.strip().split(maxsplit=1)[0] if inspected.stdout.strip() else ""
-    if remote_digest != sha256_path(local_spec):
-        raise RuntimeError("remote optimization spec differs from the local checked-in authority")
-    if not resume:
-        remote_run = site.cluster.remote_run_root / run_id
-        absent = ssh.run_ssh(
-            coordinator, f"test ! -e {shlex.quote(str(remote_run))}"
-        )
-        if not absent.ok:
-            raise RuntimeError("non-resume optimization destination already exists")
-    worker = shlex.quote(site.cluster.worker_command)
-    repository = shlex.quote(str(site.cluster.repository_root))
-    command = (
-        f"cd {repository} && "
-        f"env FXSIM_RUN_LEASE_TOKEN={shlex.quote(lease.token)} "
-        f"FXSIM_EXECUTION_CLOSURE_SHA256={shlex.quote(execution_closure_sha256)} "
-        f"{worker} optimize run {shlex.quote(str(remote_spec))} "
-        f"--site {shlex.quote(site.name)} --run-id {shlex.quote(run_id)} "
-        f"--output-root {repository}"
-    )
-    for blade in blades:
-        command += f" --blades {shlex.quote(blade)}"
-    if resume:
-        command += " --resume"
-    executed = ssh.run_ssh(coordinator, command, timeout=site.harness.timeout_seconds)
-    if not executed.ok:
-        try:
-            fetch_authoritative_run(lease, run_store.runs_dir)
-        except Exception as recovery_error:
-            raise RuntimeError(
-                f"shared-NFS optimization failed on {coordinator}: {executed.stderr}; "
-                f"failed to recover its run journal: {recovery_error}"
-            ) from recovery_error
-        raise RuntimeError(f"shared-NFS optimization failed on {coordinator}: {executed.stderr}")
-    fetch_authoritative_run(lease, run_store.runs_dir)
-    result = collect_optimization(run_id, store=run_store, repository=root)
-    manifest = run_store.load_manifest(run_id, expected_kind="optimization")
-    if manifest.get("resolved_spec", {}).get("execution_closure_sha256") != execution_closure_sha256:
-        raise RuntimeError("remote optimization manifest has the wrong execution closure")
-    return result
-
-
 def _inspect_remote_execution_closure(site: SiteProfile) -> dict[str, str]:
     repository = str(site.cluster.repository_root)
     worker = shlex.quote(site.cluster.worker_command)
@@ -369,28 +159,6 @@ def _inspect_remote_execution_closure(site: SiteProfile) -> dict[str, str]:
         "worker_sha256": lines[0].split(maxsplit=1)[0],
         "package_sha256": lines[1],
     }
-
-
-def _inspect_remote_core(site: SiteProfile, blade: str) -> dict[str, Any]:
-    """Read the deployed evaluator through the canonical hello schema."""
-    binary = str(site.harness.remote_binary_path or site.harness.binary_name)
-    result = SSHProcessAdapter(ssh_config=site.ssh).run_ssh(
-        blade,
-        f"{shlex.quote(binary)} --identity-json",
-    )
-    if not result.ok:
-        raise RuntimeError(f"failed to inspect remote evaluator on {blade}: {result.stderr}")
-    try:
-        payload = json.loads(result.stdout)
-        if not isinstance(payload, Mapping):
-            raise TypeError("identity payload is not an object")
-        evaluator = verified_evaluator_from_payload(payload, path=binary)
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"remote evaluator on {blade} returned invalid identity JSON") from exc
-    core = evaluator.to_core_dict(binary_override=binary)
-    core["site"] = site.name
-    core["remote_sha256"] = evaluator.sha256
-    return core
 
 
 @dataclass
@@ -467,36 +235,10 @@ def _execution_context(
     return ProjectContext.from_root(repository)
 
 
-def _resolve_evaluator_client(
-    client: HarnessClient | None,
-    *,
-    scenarios: Sequence[Any] = (),
-) -> HarnessClient:
-    if client is not None:
-        if scenarios and isinstance(client, SubprocessHarnessClient):
-            used_original = False
-
-            def factory(_scenario: Any) -> HarnessClient:
-                nonlocal used_original
-                if not used_original:
-                    used_original = True
-                    return client
-                return client.clone()
-
-            return ScenarioHarnessClient(scenarios, factory)
-        return client
-
-    raise ValueError(
-        "local optimization requires an explicit HarnessClient; "
-        "CLI callers must pass --harness"
-    )
-
-
 def _run_optimization(
     spec_or_path: str | os.PathLike[str] | OptimizationSpec,
     *,
     store: RunStore | None = None,
-    client: HarnessClient | None = None,
     run_id: str | None = None,
     resume: bool = False,
     budget: int | None = None,
@@ -505,21 +247,12 @@ def _run_optimization(
     repository: Path | None = None,
     site: str = "local",
     blades: Sequence[str] = (),
-    selected_evaluator: SelectedEvaluator | None = None,
-    _owned_clients: list[HarnessClient],
+    selected_evaluator: SelectedEvaluator,
 ) -> OptimizationResult:
-    """Execute an optimization run against the harness evaluator."""
     context = _execution_context(repository, store)
     root = context.project_root
     run_store = store if store is not None else RunStore(context)
     distributed = site != "local" or bool(blades)
-    named_mode = selected_evaluator is not None
-    if named_mode and not isinstance(selected_evaluator, SelectedEvaluator):
-        raise TypeError("selected_evaluator must be a SelectedEvaluator")
-    if named_mode and client is not None:
-        raise ValueError("artifact-selected optimization does not accept an external HarnessClient")
-    if distributed and client is not None:
-        raise ValueError("an explicit local HarnessClient cannot be used with distributed optimization")
     site_profile = load_site_profile(site, root=root) if distributed else None
     target_blades = (
         list(blades) or list(site_profile.cluster.blades)
@@ -530,7 +263,7 @@ def _run_optimization(
         raise ValueError(f"site {site_profile.name!r} has no blades configured")
     if site_profile is not None:
         site_profile.validate_blades(target_blades)
-    if named_mode and distributed:
+    if distributed:
         assert site_profile is not None
         if (
             site_profile.cluster.transport != "shared_nfs"
@@ -546,20 +279,10 @@ def _run_optimization(
     if isinstance(spec_or_path, OptimizationSpec):
         opt_spec = spec_or_path
     else:
-        opt_spec = (
-            load_optimization_spec(
-                spec_or_path,
-                repository=root,
-                parameter_space_authority="selected_schema",
-            )
-            if named_mode
-            else load_optimization_spec(spec_or_path, repository=root)
-        )
+        opt_spec = load_optimization_spec(spec_or_path, repository=root)
 
     actual_run_id = run_id or opt_spec.id or f"opt_{uuid.uuid4().hex[:12]}"
 
-    # 1. Resolve the mode's sole policy/evaluator authority.
-    policy_spec = None if named_mode else load_policy_spec(opt_spec.policy_id, repository=root)
     total_budget = int(
         budget if budget is not None else opt_spec.optimizer_config.get("budget", 100)
     )
@@ -586,130 +309,28 @@ def _run_optimization(
 
     run_dir: Path | None = None
     named_scenarios: dict[str, LocalSessionMaterialization] = {}
-    if named_mode:
-        assert selected_evaluator is not None
-        select_search_descriptors(selected_evaluator.compiler.schema, opt_spec.parameter_space)
-        selected_policy = selected_evaluator.policy_identity
-        if opt_spec.policy_id != selected_policy["id"]:
-            raise ValueError(
-                f"optimization policy_id {opt_spec.policy_id!r} does not match "
-                f"selected evaluator policy {selected_policy['id']!r}"
-            )
-        run_dir = (
-            run_store.get_run_dir(actual_run_id)
-            if resume
-            else run_store.allocate_run_dir("optimization", actual_run_id)
-        )
-        selected_evaluator = materialize_selected_evaluator(
-            selected_evaluator, run_dir, resume=resume
-        )
-        for scenario in scenarios:
-            named_scenarios[scenario.id] = LocalSessionMaterialization.from_scenario(
-                scenario,
-                repository=root,
-                manifest_root=run_dir / "session_transport",
-                session_id=f"opt_{actual_run_id}_{scenario.id}",
-            )
-        primary_materialization = named_scenarios[primary_scenario.id]
-        layout = SearchLayout.from_schema(
-            selected_evaluator.compiler.schema,
-            opt_spec.parameter_space,
-            template_json,
-            primary_materialization.baseline_open_session_fields,
-        )
-        profile = NamedProfile(opt_spec.algorithm.lower(), layout)
-        eval_client = None
-    else:
-        assert policy_spec is not None
-        profile = profile_from_policy_spec(
-            policy_spec, opt_spec.parameter_space, template_json=template_json
-        )
-        eval_client = None if distributed else _resolve_evaluator_client(
-            client,
-            scenarios=scenarios,
-        )
-        if isinstance(eval_client, ScenarioHarnessClient):
-            _owned_clients.append(eval_client)
-
-    if named_mode:
-        assert selected_evaluator is not None
-        evaluator_ident = selected_evaluator.verified_evaluator
-        evaluator_ident_dict = selected_evaluator.manifest_core(
-            binary_override="evaluator_artifact/evaluator"
-        )
-    elif distributed:
-        assert site_profile is not None
-        remote_identities = [_inspect_remote_core(site_profile, blade) for blade in target_blades]
-        evaluator_ident_dict = remote_identities[0]
-        for blade, identity in zip(target_blades, remote_identities, strict=True):
-            for key, expected in (
-                ("policy_id", profile.name),
-                ("policy_source_sha256", profile.source_sha256),
-                ("policy_abi", profile.policy_abi),
-                ("policy_parameter_count", profile.n_params()),
-            ):
-                if str(identity.get(key, "")).lower() != str(expected).lower():
-                    raise ValueError(
-                        f"remote evaluator on {blade} reports {key}={identity.get(key)!r}, expected {expected!r}"
-                    )
-            if identity["sha256"] != evaluator_ident_dict["sha256"]:
-                raise ValueError("all selected blades must run the same evaluator binary SHA-256")
-    else:
-        assert eval_client is not None
-        evaluator_ident = eval_client.prepare()
-        if not isinstance(evaluator_ident, VerifiedEvaluator):
-            raise TypeError("HarnessClient.prepare() must return a VerifiedEvaluator")
-        validate_evaluator_identity(
-            evaluator_ident,
-            expected_policy_id=profile.name,
-            expected_policy_source_sha256=profile.source_sha256,
-            expected_policy_abi=profile.policy_abi,
-            expected_policy_parameter_count=profile.n_params(),
-        )
-        evaluator_ident_dict = evaluator_ident.to_dict()
+    select_search_descriptors(selected_evaluator.compiler.schema, opt_spec.parameter_space)
+    selected_policy = selected_evaluator.policy_identity
+    if opt_spec.policy_id != selected_policy["id"]:
+        raise ValueError(f"optimization policy_id {opt_spec.policy_id!r} does not match selected evaluator policy {selected_policy['id']!r}")
+    run_dir = run_store.get_run_dir(actual_run_id) if resume else run_store.allocate_run_dir("optimization", actual_run_id)
+    selected_evaluator = materialize_selected_evaluator(selected_evaluator, run_dir, resume=resume)
+    named_scenarios = {s.id: LocalSessionMaterialization.from_scenario(s, repository=root, manifest_root=run_dir / "session_transport", session_id=f"opt_{actual_run_id}_{s.id}") for s in scenarios}
+    primary_materialization = named_scenarios[primary_scenario.id]
+    layout = SearchLayout.from_schema(selected_evaluator.compiler.schema, opt_spec.parameter_space, template_json, primary_materialization.baseline_open_session_fields)
+    profile = NamedProfile(opt_spec.algorithm.lower(), layout)
+    evaluator_ident_dict = selected_evaluator.manifest_core(binary_override="evaluator_artifact/evaluator")
     evaluator_metric_fields = tuple(str(field) for field in evaluator_ident_dict.get("metric_fields", ()))
     if not evaluator_metric_fields:
         raise ValueError("evaluator identity must attest non-empty metric_fields")
+    evaluator_metric_fields = tuple({*evaluator_metric_fields, "loss", "objective_value", SCORE_FX_LP_E15_SLIPPAGE_V1_KEY, "gate", "mean_e15_penalty", "mean_slippage_penalty", "mean_detach_energy_ungated", "mean_tw_real_slippage_1pct", "n_scenarios", "n_failed", "n_yb_failed", "objective_failures"})
     metric_projection = MetricProjection.from_fields(
         evaluator_metric_fields,
         projection_id="optimization-primary-scenario",
     )
 
-    if named_mode:
-        assert selected_evaluator is not None
-        selected_policy = selected_evaluator.policy_identity
-        policy_header = "artifact:policy_header"
-        verified_policy_sha256 = selected_policy["source_sha256"]
-        policy_abi = selected_policy["abi"]
-        policy_parameter_names = tuple(
-            item.name
-            for item in sorted(
-                (
-                    descriptor
-                    for descriptor in selected_evaluator.compiler.schema.descriptors
-                    if descriptor.order is not None
-                ),
-                key=lambda descriptor: descriptor.order,
-            )
-        )
-        profile_receipt = profile.geometry_receipt
-    else:
-        # Legacy mode retains the checked-in PolicySpec source attestation.
-        policy_header_path = (root / profile.header_file).resolve()
-        if not policy_header_path.is_file():
-            raise FileNotFoundError(f"compiled policy header not found: {policy_header_path}")
-        calculated_sha = sha256_path(policy_header_path)
-        if calculated_sha != profile.source_sha256:
-            raise ValueError(
-                f"Policy closure hash mismatch for {profile.header_file}: "
-                f"expected {profile.source_sha256}, calculated {calculated_sha}"
-            )
-        policy_header = profile.header_file
-        verified_policy_sha256 = calculated_sha
-        policy_abi = profile.policy_abi
-        policy_parameter_names = profile.parameter_names
-        profile_receipt = profile.to_dict()
-
+    policy_header = "artifact:policy_header"; verified_policy_sha256 = selected_policy["source_sha256"]; policy_abi = selected_policy["abi"]
+    policy_parameter_names = tuple(d.name for d in sorted((d for d in selected_evaluator.compiler.schema.descriptors if d.order is not None), key=lambda d: d.order))
     # Resolve scenario templates and hashes
     resolved_scenarios_info: list[dict[str, Any]] = []
     for sc in scenarios:
@@ -776,20 +397,18 @@ def _run_optimization(
 
     # 2. Instantiate the selected optimizer over the resolved exact lattice.
     algorithm = opt_spec.algorithm.lower()
-    lattice = profile.lattice if named_mode else create_lattice_spec(profile)
-    initial_params = profile.initial_vector if named_mode else profile.initial_seed
     seed = int(opt_spec.optimizer_config.get("seed", 42))
     if algorithm == "tmrbcd":
         optimizer = TmrbcdOptimizer(
-            lattice=lattice,
-            initial_params=initial_params,
+            lattice=profile.lattice,
+            initial_params=profile.initial_vector,
             budget=total_budget,
             seed=seed,
         )
     elif algorithm == "nevergrad_two_points_de":
         optimizer = NevergradTwoPointsDEOptimizer(
-            lattice=lattice,
-            initial_params=initial_params,
+            lattice=profile.lattice,
+            initial_params=profile.initial_vector,
             budget=total_budget,
             seed=seed,
             num_workers=eval_batch_size,
@@ -797,29 +416,12 @@ def _run_optimization(
     else:
         raise ValueError(f"unsupported optimization algorithm {algorithm!r}")
 
-    named_runtime_identity = None
-    if named_mode:
-        assert selected_evaluator is not None
-        session_receipts: dict[str, dict[str, str]] = {}
-        for scenario in scenarios:
-            materialization = named_scenarios[scenario.id]
-            session_receipts[scenario.id] = {
-                "scenario_key": materialization.scenario_key.sha256,
-                "baseline_request_sha256": materialization.baseline_request_sha256,
-            }
-        named_runtime_identity = {
-            "selected_evaluator": selected_evaluator.provenance,
-            "search_geometry": profile.geometry_receipt,
-            "scenario_sessions": session_receipts,
-        }
+    session_receipts = {s.id: {"scenario_key": named_scenarios[s.id].scenario_key.sha256, "baseline_request_sha256": named_scenarios[s.id].baseline_request_sha256} for s in scenarios}
+    named_runtime_identity = {"selected_evaluator": selected_evaluator.provenance, "search_geometry": profile.geometry_receipt, "scenario_sessions": session_receipts}
     run_identity = {
         "optimization": opt_spec.to_dict(),
-        "policy": (
-            selected_evaluator.policy_identity
-            if named_mode and selected_evaluator is not None
-            else policy_spec.to_dict()
-        ),
-        "profile": profile_receipt,
+        "policy": selected_evaluator.policy_identity,
+        "profile": profile.geometry_receipt,
         "pair": pair_spec.to_dict(),
         "scenarios": resolved_scenarios_info,
         "evaluator": evaluator_ident_dict,
@@ -838,146 +440,13 @@ def _run_optimization(
                 "run_identity": run_identity,
                 "package_sha256": local_package_sha256,
                 "worker_sha256": remote_execution["worker_sha256"],
-                "site": execution_site_payload(site_profile, target_blades,
-                                               artifact_selected=named_mode),
+                "site": execution_site_payload(site_profile, target_blades),
             }
         )
         expected_closure = os.environ.get("FXSIM_EXECUTION_CLOSURE_SHA256")
         if expected_closure and expected_closure != execution_closure_sha256:
             raise ValueError("remote resolved execution closure differs from coordinator request")
-        if root.as_posix() != str(site_profile.cluster.repository_root):
-            if resume:
-                local_identity = run_identity_sha256
-            with shared_run_lease(site_profile, actual_run_id) as lease:
-                if resume:
-                    fetch_authoritative_run(lease, run_store.runs_dir)
-                    checkpoint = run_store.get_run_dir(actual_run_id) / "checkpoint.json"
-                    try:
-                        remote_checkpoint = json.loads(checkpoint.read_text(encoding="utf-8"))
-                    except (OSError, json.JSONDecodeError) as exc:
-                        raise ValueError("remote resume authority has no valid checkpoint") from exc
-                    if remote_checkpoint.get("run_identity_sha256") != local_identity:
-                        raise ValueError("remote resume authority has a different immutable identity")
-                return _run_optimization_via_coordinator(
-                    opt_spec,
-                    run_store=run_store,
-                    root=root,
-                    site=site_profile,
-                    blades=target_blades,
-                    run_id=actual_run_id,
-                    resume=resume,
-                    budget=budget,
-                    batch_size=batch_size,
-                    top_k_count=top_k_count,
-                    execution_closure_sha256=execution_closure_sha256,
-                    lease=lease,
-                )
-    if run_dir is None:
-        run_dir = (
-            run_store.get_run_dir(actual_run_id)
-            if resume
-            else run_store.allocate_run_dir("optimization", actual_run_id)
-        )
-
-    # 3. Restore the optimizer and the exact committed prefix of the durable row journal.
-    checkpoint_file = run_dir / "checkpoint.json"
-    journal_file = run_dir / EVALUATION_JOURNAL_FILENAME
-    rows: list[EvaluationRow] = []
-    replayed_tail = False
-
-    if resume:
-        if not checkpoint_file.is_file():
-            raise ValueError("Resume checkpoint is missing; start a new immutable run")
-        with checkpoint_file.open("r", encoding="utf-8") as f:
-            cp_data = json.load(f)
-        if cp_data.get("schema_version") != OPTIMIZATION_CHECKPOINT_SCHEMA_VERSION:
-            raise ValueError("Resume checkpoint schema is stale; start a new immutable run")
-
-        # Validate the immutable run identity; cheap and catches real mis-resume.
-        cp_policy_id = cp_data.get("policy_id")
-        if cp_policy_id and cp_policy_id != opt_spec.policy_id:
-            raise ValueError(
-                f"Resume identity mismatch: checkpoint policy_id {cp_policy_id!r} != spec {opt_spec.policy_id!r}"
-            )
-        cp_score_key = cp_data.get("score_key")
-        if cp_score_key and cp_score_key != score_key:
-            raise ValueError(
-                f"Resume identity mismatch: checkpoint score_key {cp_score_key!r} != spec {score_key!r}"
-            )
-        cp_pair_id = cp_data.get("pair_id")
-        if cp_pair_id and cp_pair_id != opt_spec.pair_id:
-            raise ValueError(
-                f"Resume identity mismatch: checkpoint pair_id {cp_pair_id!r} != spec {opt_spec.pair_id!r}"
-            )
-        if cp_data.get("run_identity_sha256") != run_identity_sha256:
-            raise ValueError("Resume identity mismatch: policy, lattice, scenario, or evaluator changed")
-        if cp_data.get("execution_closure_sha256") != execution_closure_sha256:
-            raise ValueError("Resume identity mismatch: execution closure changed")
-
-        # The journal is the plain row log: rows already in it are already
-        # evaluated and are skipped, not re-run.  A crash between a journal
-        # append and the checkpoint save can leave the journal one batch ahead
-        # of the restored optimizer; re-drive the optimizer over that journaled
-        # tail so ask/tell stay aligned without re-evaluation.
-        rows = _read_evaluation_journal(journal_file)
-        opt_state = cp_data.get("optimizer_state")
-        if not isinstance(opt_state, Mapping):
-            raise ValueError("Resume checkpoint optimizer_state must be an object")
-        optimizer.restore(opt_state)
-        if named_mode:
-            checkpoint_lineage = [
-                row.params.get("evaluation_lineage") for row in rows[: optimizer.step]
-            ]
-            if cp_data.get("evaluation_lineage") != checkpoint_lineage:
-                raise ValueError("Resume identity mismatch: committed evaluation lineage changed")
-            assert selected_evaluator is not None
-            recompiled, _ = _compile_named_batch(
-                profile,
-                selected_evaluator,
-                scenarios,
-                named_scenarios,
-                [row.params["vector"] for row in rows],
-                start=0,
-            )
-            if [item["evaluation_lineage"] for item in recompiled] != [
-                row.params.get("evaluation_lineage") for row in rows
-            ]:
-                raise ValueError("Resume identity mismatch: evaluation group lineage changed")
-        if optimizer.step > len(rows):
-            raise ValueError(
-                "Resume checkpoint is ahead of the evaluation journal; start a new immutable run"
-            )
-        for start in range(optimizer.step, len(rows), eval_batch_size):
-            chunk = rows[start : start + eval_batch_size]
-            regenerated = optimizer.ask(len(chunk))
-            if named_mode:
-                reproduced = [
-                    [profile.to_proposal(vector)[item.name] for item in profile.layout.dimensions]
-                    for vector in regenerated
-                ]
-                if reproduced != [row.params["vector"] for row in chunk]:
-                    raise ValueError("Resume identity mismatch: optimizer ask prefix changed")
-            optimizer.tell(
-                [row.params["vector"] for row in chunk],
-                [float(row.metrics["loss"]) for row in chunk],
-                objectives=[float(row.metrics["objective_value"]) for row in chunk],
-                scores=[dict(row.metrics) for row in chunk],
-            )
-            replayed_tail = True
-
-    if (
-        resume
-        and len(rows) >= total_budget
-        and all((run_dir / name).is_file() for name in ("manifest.json", "evaluation_table.npz", "winner.json", "topk.json"))
-    ):
-        return collect_optimization(
-            actual_run_id,
-            store=run_store,
-            repository=root,
-        )
-
-    step = len(rows)
-    # Common evaluation table metadata header
+    # 3. The table is the durable ask-order prefix; the checkpoint only caches optimizer state.
     immutable_table_metadata = {
         "run_id": actual_run_id,
         "optimization_id": opt_spec.id,
@@ -987,7 +456,7 @@ def _run_optimization(
         "policy_source_sha256": verified_policy_sha256,
         "policy_abi": policy_abi,
         "parameter_names": list(policy_parameter_names),
-        "lattice": profile_receipt,
+        "lattice": profile.geometry_receipt,
         "pair_id": opt_spec.pair_id,
         "pair": pair_spec.to_dict(),
         "scenario": primary_scenario.to_dict(),
@@ -995,11 +464,75 @@ def _run_optimization(
         "evaluator_identity": evaluator_ident_dict,
         "yb_settings": yb_settings,
         "score_key": score_key,
+        "score_version": SCORE_VERSION,
         "execution_closure_sha256": execution_closure_sha256,
         "named_runtime": named_runtime_identity,
+        "run_identity_sha256": run_identity_sha256,
     }
+    checkpoint_file = run_dir / "checkpoint.json"
+    table_path = run_dir / "evaluation_table.npz"
+    rows: list[EvaluationRow] = []
+    table: EvaluationTable | None = None
+    checkpoint_step = 0
 
-    # Publish a compact checkpoint after each journal batch is appended.
+    if resume:
+        if table_path.is_file():
+            table = EvaluationTable.from_npz(table_path)
+            rows = table.rows
+            if table.metric_projection != metric_projection:
+                raise ValueError("Resume evaluation table metric projection changed")
+            if table.metadata.get("run_identity_sha256") != run_identity_sha256:
+                raise ValueError("Resume evaluation table identity changed")
+            if table.metadata.get("candidates_evaluated") != len(rows):
+                raise ValueError("Resume evaluation table row count metadata is invalid")
+            if any(left.ordinal >= right.ordinal for left, right in zip(rows, rows[1:])):
+                raise ValueError("Resume evaluation table ordinals must be strictly increasing")
+        if checkpoint_file.is_file():
+            with checkpoint_file.open("r", encoding="utf-8") as f:
+                cp_data = json.load(f)
+            if cp_data.get("schema_version") != OPTIMIZATION_CHECKPOINT_SCHEMA_VERSION:
+                raise ValueError("Resume checkpoint schema is stale; start a new immutable run")
+            if cp_data.get("run_identity_sha256") != run_identity_sha256:
+                raise ValueError("Resume identity mismatch: policy, lattice, scenario, or evaluator changed")
+            if cp_data.get("execution_closure_sha256") != execution_closure_sha256:
+                raise ValueError("Resume identity mismatch: execution closure changed")
+            checkpoint_step = cp_data.get("step")
+            if isinstance(checkpoint_step, bool) or not isinstance(checkpoint_step, int) or checkpoint_step < 0:
+                raise ValueError("Resume checkpoint step must be a non-negative integer")
+            if checkpoint_step > len(rows):
+                raise ValueError("Resume checkpoint is ahead of the evaluation table")
+            if cp_data.get("row_prefix_sha256") != _row_prefix_sha256(rows, checkpoint_step):
+                raise ValueError("Resume checkpoint row prefix changed")
+            opt_state = cp_data.get("optimizer_state")
+            if not isinstance(opt_state, Mapping):
+                raise ValueError("Resume checkpoint optimizer_state must be an object")
+            optimizer.restore(opt_state)
+            if optimizer.step != checkpoint_step:
+                raise ValueError("Resume checkpoint optimizer step is inconsistent")
+        if rows:
+            recompiled, _ = _compile_named_batch(profile, selected_evaluator, scenarios,
+                named_scenarios, [row.params["vector"] for row in rows], start=0)
+            if [item["evaluation_lineage"] for item in recompiled] != [row.params.get("evaluation_lineage") for row in rows]:
+                raise ValueError("Resume identity mismatch: evaluation group lineage changed")
+        for start in range(checkpoint_step, len(rows), eval_batch_size):
+            chunk = rows[start : start + eval_batch_size]
+            regenerated = optimizer.ask(len(chunk))
+            reproduced = [[profile.to_proposal(vector)[item.name]
+                           for item in profile.layout.dimensions] for vector in regenerated]
+            if reproduced != [row.params["vector"] for row in chunk]:
+                raise ValueError("Resume identity mismatch: optimizer ask prefix changed")
+            optimizer.tell([row.params["vector"] for row in chunk],
+                [float(row.metrics["loss"]) for row in chunk],
+                objectives=[float(row.metrics["objective_value"]) for row in chunk],
+                scores=[dict(row.metrics) for row in chunk])
+
+    if (resume and len(rows) >= total_budget and all((run_dir / name).is_file()
+            for name in ("manifest.json", "evaluation_table.npz", "winner.json", "topk.json"))):
+        return collect_optimization(actual_run_id, store=run_store, repository=root)
+
+    step = len(rows)
+
+    # Publish optimizer state only after the matching table prefix is durable.
     def _save_checkpoint() -> None:
         opt_snapshot = optimizer.snapshot()
         cp_payload = {
@@ -1020,16 +553,11 @@ def _run_optimization(
             "named_runtime": named_runtime_identity,
             "step": step,
             "optimizer_state": opt_snapshot,
+            "row_prefix_sha256": _row_prefix_sha256(rows, step),
         }
-        if named_mode:
-            cp_payload["evaluation_lineage"] = [
-                row.params["evaluation_lineage"] for row in rows
-            ]
         atomic_write_json(checkpoint_file, cp_payload)
 
-    if replayed_tail:
-        # A journaled tail can exhaust the budget without the loop running;
-        # persist the caught-up optimizer state before final publication.
+    if checkpoint_step < len(rows):
         _save_checkpoint()
 
     # 4. Optimization Loop
@@ -1042,47 +570,11 @@ def _run_optimization(
         raw_asks = optimizer.ask(min(eval_batch_size, remaining_budget))
         if not raw_asks:
             break
-        named_compiled: list[dict[str, Any]] = []
-        named_groups: tuple[Any, ...] = ()
-        if named_mode:
-            assert selected_evaluator is not None
-            named_compiled, named_groups = _compile_named_batch(
-                profile,
-                selected_evaluator,
-                scenarios,
-                named_scenarios,
-                raw_asks,
-                start=step,
-            )
+        named_compiled, named_groups = _compile_named_batch(profile, selected_evaluator, scenarios,
+                                                             named_scenarios, raw_asks, start=step)
         for cand_idx, raw_params in enumerate(raw_asks):
-            if named_mode:
-                compiled = named_compiled[cand_idx]
-                quant_params = compiled["vector"]
-                plans = compiled["plans"]
-                primary_plan = plans[primary_scenario.id]
-                policy_params = list(primary_plan.policy_params)
-                pool_overrides = primary_plan.pool_overrides
-                named_values = dict(primary_plan.named_values)
-                candidate_sha256 = primary_plan.candidate_sha256
-                evaluations = compiled["evaluations"]
-                evaluation_lineage = compiled["evaluation_lineage"]
-            else:
-                quant_params = quantized(profile, raw_params)
-                policy_params, pool_overrides = split_request(profile, quant_params)
-                plans = {}
-                named_values = dict(
-                    zip(
-                        (
-                            *profile.parameter_names,
-                            *(dim.name for dim in profile.pool_dims),
-                        ),
-                        quant_params,
-                        strict=True,
-                    )
-                )
-                candidate_sha256 = None
-                evaluations = {}
-                evaluation_lineage = []
+            compiled = named_compiled[cand_idx]; quant_params = compiled["vector"]; plans = compiled["plans"]; primary_plan = plans[primary_scenario.id]
+            pool_overrides = primary_plan.pool_overrides; named_values = dict(primary_plan.named_values); candidate_sha256 = primary_plan.candidate_sha256; evaluations = compiled["evaluations"]; evaluation_lineage = compiled["evaluation_lineage"]
             cand_id = f"c_{step + cand_idx:05d}"
             ask_id = f"ask_{step + cand_idx:06d}"
             prepared_candidates.append(
@@ -1092,7 +584,6 @@ def _run_optimization(
                     "ask_id": ask_id,
                     "quant_params": quant_params,
                     "pool_overrides": pool_overrides,
-                    "policy_params": policy_params,
                     "named_values": named_values,
                     "candidate_sha256": candidate_sha256,
                     "plans": plans,
@@ -1114,12 +605,10 @@ def _run_optimization(
                 }
             )
 
-        if named_mode:
-            assert selected_evaluator is not None
-            evaluations = tuple(c["evaluations"][scenario.id]
-                                for c in prepared_candidates for scenario in scenarios)
-            ordered_evaluation_ids = tuple(item.evaluation_id for item in evaluations)
-            if distributed:
+        evaluations = tuple(c["evaluations"][scenario.id]
+                            for c in prepared_candidates for scenario in scenarios)
+        ordered_evaluation_ids = tuple(item.evaluation_id for item in evaluations)
+        if distributed:
                 assert site_profile is not None
                 assignments = {blade: [] for blade in target_blades}
                 for index, candidate in enumerate(prepared_candidates):
@@ -1131,151 +620,36 @@ def _run_optimization(
                     evaluations=evaluations, scenarios=scenarios,
                     evaluation_ids_by_blade=assignments,
                     repository=root, site=site_profile, chunk_size=eval_batch_size,
-                    lane_count=site_profile.runner.worker_concurrency,
+                    evaluator_workers=site_profile.runner.worker_concurrency,
                     request_namespace=f"opt_{step:06d}",
                     ssh=SSHProcessAdapter(ssh_config=site_profile.ssh),
                 )
-            else:
-                materializations = {value.scenario_key.sha256: value
-                                    for value in named_scenarios.values()}
-                execution = execute_local_groups(
-                    selected_evaluator, named_groups,
-                    lambda group: bind_local_session_group(
-                        group, materializations[group.scenario_key.sha256],
-                    ),
-                    ordered_evaluation_ids, work_dir=run_dir,
-                    chunk_size=eval_batch_size, max_workers=eval_batch_size,
-                )
-            for c in prepared_candidates:
-                for scenario in scenarios:
-                    evaluation = c["evaluations"][scenario.id]
-                    assert evaluation.evaluation_id is not None
-                    c["scenario_candidate_ids"][scenario.id] = evaluation.evaluation_id
-                    res = execution.results_by_evaluation_id[evaluation.evaluation_id]
-                    c["evaluation_ok"] = c["evaluation_ok"] and res.status == "ok"
-                    res_metrics = dict(res.metrics)
-                    res_metrics["ok"] = res.status == "ok"
-                    c["scenario_results"].append(res_metrics)
-                    if scenario.id == primary_scenario.id:
-                        c["primary_metrics"] = dict(res.metrics)
-                    if res.economic_fingerprint:
-                        c["scenario_fingerprints"][scenario.id] = res.economic_fingerprint
-        elif distributed:
-            assert site_profile is not None
-            assert target_blades
-            grouped: dict[str, list[dict[str, Any]]] = {
-                blade: [] for blade in target_blades
-            }
-            for index, candidate in enumerate(prepared_candidates):
-                grouped[target_blades[index % len(target_blades)]].append(candidate)
-            jobs: list[tuple[str, list[dict[str, Any]], Any, str, frozenset[str]]] = []
-            for blade, blade_candidates in grouped.items():
-                if not blade_candidates:
-                    continue
-                bundle = create_work_bundle(
-                    run_id=actual_run_id,
-                    optimization_id=opt_spec.id,
-                    island_id=blade,
-                    step=step,
-                    profile=profile,
-                    pair_spec=pair_spec,
-                    scenarios=scenarios,
-                    evaluator_identity=evaluator_ident_dict,
-                    yb_settings=yb_settings,
-                    score_key=score_key,
-                    proposals=[
-                        {
-                            "ordinal": candidate["cand_idx"],
-                            "ask_id": candidate["ask_id"],
-                            "params": candidate["quant_params"],
-                            "pool_overrides": candidate["pool_overrides"],
-                        }
-                        for candidate in blade_candidates
-                    ],
-                    pool_overrides={},
-                )
-                jobs.append(
-                    (
-                        blade,
-                        blade_candidates,
-                        bundle,
-                        blade,
-                        frozenset(str(candidate["ask_id"]) for candidate in blade_candidates),
-                    )
-                )
-
-            def dispatch(job: tuple[str, list[dict[str, Any]], Any, str, frozenset[str]]) -> OptimizationBundleResult:
-                _, _, bundle, blade, ask_ids = job
-                return _dispatch_remote_bundle(
-                    bundle,
-                    run_dir=run_dir,
-                    site=site_profile,
-                    blade=blade,
-                    expected_ask_ids=ask_ids,
-                )
-
-            with ThreadPoolExecutor(max_workers=min(len(target_blades), len(jobs))) as executor:
-                remote_results = list(executor.map(dispatch, jobs))
-            for (_, island_candidates, _, _, _), remote_result in zip(jobs, remote_results, strict=True):
-                by_ask_id = {str(item["ask_id"]): item for item in remote_result.results}
-                for candidate in island_candidates:
-                    result = by_ask_id.get(str(candidate["ask_id"]))
-                    if result is None:
-                        raise ValueError(f"remote bundle omitted candidate ask_id {candidate['ask_id']}")
-                    candidate["loss"] = float(result["loss"])
-                    candidate["objective"] = float(result["objective"])
-                    candidate["score_res"] = dict(result["score_res"])
-                    candidate["evaluation_ok"] = result.get("status") == "ok"
-                    candidate["primary_metrics"] = dict(result.get("primary_metrics", {}))
-                    candidate["scenario_candidate_ids"] = dict(result.get("scenario_candidate_ids", {}))
-                    candidate["scenario_fingerprints"] = dict(result.get("scenario_fingerprints", {}))
         else:
-            # Preserve the legacy client/session protocol unchanged.
-            assert eval_client is not None
-            for scen in scenarios:
-                eval_client.open_session(scen)
-                batch_requests = []
-                for c in prepared_candidates:
-                    scen_cand_id = f"{c['cand_id']}_{scen.id}"
-                    c["scenario_candidate_ids"][scen.id] = scen_cand_id
-                    batch_requests.append(CandidateSpec(
-                        ordinal=c["cand_idx"], candidate_id=scen_cand_id,
-                        policy_params=c["policy_params"], pool_overrides=c["pool_overrides"],
-                    ))
-                batch_resp = eval_client.evaluate_batch(
-                    batch_requests, observation=ObservationSpec(kind="summary")
-                )
-                if batch_resp.status != "complete":
-                    raise RuntimeError(
-                        f"evaluator returned incomplete batch for scenario {scen.id!r}: "
-                        f"{batch_resp.status!r}"
-                    )
-                results_by_ordinal = {r.ordinal: r for r in batch_resp.results}
-                for c in prepared_candidates:
-                    res = results_by_ordinal.get(c["cand_idx"])
-                    if res is None:
-                        c["evaluation_ok"] = False
-                        c["scenario_results"].append({"ok": False})
-                        continue
-                    c["evaluation_ok"] = c["evaluation_ok"] and res.status == "ok"
-                    res_metrics = dict(res.metrics)
-                    res_metrics["ok"] = res.status == "ok"
-                    c["scenario_results"].append(res_metrics)
-                    if scen.id == primary_scenario.id:
-                        c["primary_metrics"] = dict(res.metrics)
-                    if res.economic_fingerprint:
-                        c["scenario_fingerprints"][scen.id] = res.economic_fingerprint
+            materializations = {value.scenario_key.sha256: value
+                                for value in named_scenarios.values()}
+            local_site = load_site_profile("local", root=root)
+            execution = execute_local_groups(selected_evaluator, named_groups,
+                lambda group: bind_local_session_group(group, materializations[group.scenario_key.sha256]),
+                ordered_evaluation_ids, work_dir=run_dir, chunk_size=eval_batch_size,
+                max_workers=local_site.runner.max_workers,
+                evaluator_workers=local_site.runner.worker_concurrency)
+        for c in prepared_candidates:
+            for scenario in scenarios:
+                evaluation = c["evaluations"][scenario.id]; assert evaluation.evaluation_id is not None
+                c["scenario_candidate_ids"][scenario.id] = evaluation.evaluation_id
+                res = execution.results_by_evaluation_id[evaluation.evaluation_id]
+                c["evaluation_ok"] = c["evaluation_ok"] and res.status == "ok"
+                c["scenario_results"].append({**res.metrics, "ok": res.status == "ok"})
+                if scenario.id == primary_scenario.id:
+                    c["primary_metrics"] = dict(res.metrics)
+                if res.economic_fingerprint:
+                    c["scenario_fingerprints"][scenario.id] = res.economic_fingerprint
 
-        if named_mode or not distributed:
-            # Score candidates and build evaluation rows.
-            for c in prepared_candidates:
-                score_res = score_scenarios(c["scenario_results"], require_yb=require_yb)
-                obj_val = score_objective_value(score_res, score_key)
-                score_res["objective_value"] = obj_val
-                score_res["objective_failures"] = objective_failure_count(score_res, score_key)
-                c["loss"] = loss_from_score(score_res)
-                c["objective"] = obj_val
-                c["score_res"] = score_res
+        for c in prepared_candidates:
+            score_res = score_scenarios(c["scenario_results"], require_yb=require_yb)
+            obj_val = score_objective_value(score_res, score_key)
+            score_res.update(objective_value=obj_val, objective_failures=objective_failure_count(score_res, score_key))
+            c.update(loss=loss_from_score(score_res), objective=obj_val, score_res=score_res)
 
         # Build canonical evaluation rows from either local scoring or attested worker results.
         batch_rows: list[EvaluationRow] = []
@@ -1285,21 +659,17 @@ def _run_optimization(
             obj_val = c["objective"]
             primary_fingerprint = c["scenario_fingerprints"].get(primary_scenario.id)
             primary_scen_cand_id = c["scenario_candidate_ids"].get(primary_scenario.id, c["cand_id"])
-            row_metrics = {
-                **c["primary_metrics"],
-                "loss": loss_val,
-                "objective_value": obj_val,
-                "scenario_candidate_ids": c["scenario_candidate_ids"],
-                "scenario_fingerprints": c["scenario_fingerprints"],
-                **score_res,
-            }
+            row_metrics = {name: float(value) for source in (c["primary_metrics"], score_res,
+                {"loss": loss_val, "objective_value": obj_val}) for name, value in source.items()
+                if isinstance(value, (bool, int, float)) and math.isfinite(float(value))}
             row_params = {
                 "vector": c["quant_params"],
                 "named": c["named_values"],
+                "candidate_sha256": c["candidate_sha256"],
+                "evaluation_lineage": c["evaluation_lineage"],
+                "scenario_candidate_ids": c["scenario_candidate_ids"],
+                "scenario_fingerprints": c["scenario_fingerprints"],
             }
-            if named_mode:
-                row_params["candidate_sha256"] = c["candidate_sha256"]
-                row_params["evaluation_lineage"] = c["evaluation_lineage"]
             batch_rows.append(
                 EvaluationRow(
                     candidate_id=primary_scen_cand_id,
@@ -1329,34 +699,17 @@ def _run_optimization(
             scores=[c["score_res"] for c in prepared_candidates],
         )
 
-        # Append the batch to the plain JSONL row log, then checkpoint.
-        # Durability invariant: flush the journal stream (user-space buffer to
-        # OS) before _save_checkpoint(), so the durable JSONL on disk never lags
-        # the checkpoint's step/candidates_evaluated.  fsync is intentionally
-        # omitted: a genuine OS-crash partial write still fails loudly at resume
-        # via the line-numbered malformed-row error in _read_evaluation_journal.
         rows.extend(batch_rows)
-        with journal_file.open("ab") as stream:
-            stream.write(
-                b"".join(canonical_json_bytes(row.to_dict()) + b"\n" for row in batch_rows)
-            )
-            stream.flush()
-        step += len(batch_rows)
+        if any(left.ordinal >= right.ordinal for left, right in zip(rows, rows[1:])):
+            raise ValueError("evaluation table ordinals must be strictly increasing")
+        step = len(rows)
+        table = EvaluationTable(rows=rows, metadata={**immutable_table_metadata,
+            "candidates_evaluated": step}, metric_projection=metric_projection)
+        table_path = run_store.save_evaluation_table(actual_run_id, table)
         _save_checkpoint()
     eval_rows = rows
-    # 5. Build final EvaluationTable with complete immutable metadata & sort canonically
-    final_metadata = {
-        **immutable_table_metadata,
-        "candidates_evaluated": len(eval_rows),
-    }
-
-    table = EvaluationTable(
-        rows=eval_rows,
-        metadata=final_metadata,
-        metric_projection=metric_projection,
-    )
-    table.sort_canonical()
-    table_path = run_store.save_evaluation_table(actual_run_id, table)
+    if table is None:
+        raise RuntimeError("optimizer produced no durable evaluation table")
 
     # 6. Extract Top-K & Winner SelectionRefs with exact replay candidate IDs
     sorted_rows = sorted(
@@ -1412,8 +765,9 @@ def _run_optimization(
         "scenarios": resolved_scenarios_info,
         "lineage": best_row.coordinates,
         "economic_fingerprint": best_row.economic_fingerprint,
-        "scenario_fingerprints": best_row.metrics.get("scenario_fingerprints", {}),
-        "scenario_candidate_ids": best_row.metrics.get("scenario_candidate_ids", {}),
+        "scenario_fingerprints": best_row.params.get("scenario_fingerprints", {}),
+        "scenario_candidate_ids": best_row.params.get("scenario_candidate_ids", {}),
+        "params": best_row.params,
         "metrics": best_row.metrics,
     }
     winner_path = atomic_write_json(run_dir / "winner.json", winner_payload)
@@ -1439,8 +793,6 @@ def _run_optimization(
     winner_bytes = winner_path.stat().st_size
     topk_sha = sha256_path(topk_path)
     topk_bytes = topk_path.stat().st_size
-    journal_sha = sha256_path(journal_file)
-    journal_artifact_bytes = journal_file.stat().st_size
     checkpoint_sha = sha256_path(checkpoint_file) if checkpoint_file.is_file() else None
     checkpoint_bytes = checkpoint_file.stat().st_size if checkpoint_file.is_file() else None
 
@@ -1450,12 +802,6 @@ def _run_optimization(
             "kind": "evaluation_table",
             "sha256": table_sha,
             "bytes": table_bytes,
-        },
-        {
-            "path": "evaluation_journal.jsonl",
-            "kind": "evaluation_journal",
-            "sha256": journal_sha,
-            "bytes": journal_artifact_bytes,
         },
         {
             "path": "winner.json",
@@ -1478,25 +824,11 @@ def _run_optimization(
             "bytes": checkpoint_bytes,
         })
 
-    if named_mode:
-        assert selected_evaluator is not None
-        for path, kind in (
+    artifacts_list.extend({"path": path.relative_to(run_dir).as_posix(), "kind": kind,
+        "sha256": sha256_path(path), "bytes": path.stat().st_size} for path, kind in (
             (selected_evaluator.artifact.receipt_path, "evaluator_artifact_receipt"),
-            (selected_evaluator.binary_path, "evaluator_binary"),
-        ):
-            artifacts_list.append({
-                "path": path.relative_to(run_dir).as_posix(),
-                "kind": kind,
-                "sha256": sha256_path(path),
-                "bytes": path.stat().st_size,
-            })
-        published_core = selected_evaluator.manifest_core(
-            binary_override="evaluator_artifact/evaluator"
-        )
-    elif distributed:
-        published_core = evaluator_ident_dict
-    else:
-        published_core = evaluator_ident.to_core_dict()
+            (selected_evaluator.binary_path, "evaluator_binary")))
+    published_core = selected_evaluator.manifest_core(binary_override="evaluator_artifact/evaluator")
 
     # 7. Write Manifest with complete immutable replay identity & attested artifact hashes
     manifest_payload = new_optimization_manifest(
@@ -1534,8 +866,8 @@ def _run_optimization(
             "objective_value": best_row.metrics.get("objective_value"),
             "lineage": best_row.coordinates,
             "economic_fingerprint": best_row.economic_fingerprint,
-            "scenario_candidate_ids": best_row.metrics.get("scenario_candidate_ids", {}),
-            "scenario_fingerprints": best_row.metrics.get("scenario_fingerprints", {}),
+            "scenario_candidate_ids": best_row.params.get("scenario_candidate_ids", {}),
+            "scenario_fingerprints": best_row.params.get("scenario_fingerprints", {}),
         },
         core=published_core,
         artifacts=artifacts_list,
@@ -1568,7 +900,6 @@ def run_optimization(
     spec_or_path: str | os.PathLike[str] | OptimizationSpec,
     *,
     store: RunStore | None = None,
-    client: HarnessClient | None = None,
     run_id: str | None = None,
     resume: bool = False,
     budget: int | None = None,
@@ -1577,66 +908,34 @@ def run_optimization(
     repository: Path | None = None,
     site: str = "local",
     blades: Sequence[str] = (),
-    selected_evaluator: SelectedEvaluator | None = None,
+    selected_evaluator: SelectedEvaluator,
 ) -> OptimizationResult:
-    """Execute an optimization run and close every internally pooled evaluator."""
-    if selected_evaluator is not None and client is not None:
-        raise ValueError("artifact-selected optimization does not accept an external HarnessClient")
-    owned_clients: list[HarnessClient] = []
-    try:
-        context = _execution_context(repository, store)
-        root = context.project_root
-        distributed = site != "local" or bool(blades)
-        profile = load_site_profile(site, root=root) if distributed else None
-        if profile is not None and profile.cluster.transport == "shared_nfs":
-            spec = (
-                spec_or_path
-                if isinstance(spec_or_path, OptimizationSpec)
-                else load_optimization_spec(spec_or_path, repository=root,
-                    parameter_space_authority="selected_schema" if selected_evaluator else "legacy_registry")
-            )
-            actual_run_id = run_id or spec.id or f"opt_{uuid.uuid4().hex[:12]}"
-            with shared_run_lease(profile, actual_run_id) as lease:
-                previous = os.environ.get("FXSIM_RUN_LEASE_TOKEN")
-                os.environ["FXSIM_RUN_LEASE_TOKEN"] = lease.token
-                try:
-                    return _run_optimization(
-                        spec,
-                        store=store,
-                        client=client,
-                        run_id=actual_run_id,
-                        resume=resume,
-                        budget=budget,
-                        batch_size=batch_size,
-                        top_k_count=top_k_count,
-                        repository=root,
-                        site=site,
-                        blades=blades,
-                        selected_evaluator=selected_evaluator,
-                        _owned_clients=owned_clients,
-                    )
-                finally:
-                    if previous is None:
-                        os.environ.pop("FXSIM_RUN_LEASE_TOKEN", None)
-                    else:
-                        os.environ["FXSIM_RUN_LEASE_TOKEN"] = previous
-        return _run_optimization(
-            spec_or_path,
-            store=store,
-            client=client,
-            run_id=run_id,
-            resume=resume,
-            budget=budget,
-            batch_size=batch_size,
-            top_k_count=top_k_count,
-            repository=repository,
-            site=site,
-            blades=blades,
-            selected_evaluator=selected_evaluator,
-            _owned_clients=owned_clients,
-        )
-    finally:
-        _close_owned_clients(owned_clients)
+    if not isinstance(selected_evaluator, SelectedEvaluator):
+        raise TypeError("selected_evaluator must be a SelectedEvaluator")
+    context = _execution_context(repository, store)
+    root = context.project_root
+    distributed = site != "local" or bool(blades)
+    profile = load_site_profile(site, root=root) if distributed else None
+    if profile is not None and profile.cluster.transport != "shared_nfs":
+        raise ValueError("selected-evaluator optimization requires shared_nfs transport")
+    args = dict(store=store, run_id=run_id, resume=resume, budget=budget, batch_size=batch_size,
+                top_k_count=top_k_count, repository=repository, site=site, blades=blades,
+                selected_evaluator=selected_evaluator)
+    if profile is not None:
+        spec = spec_or_path if isinstance(spec_or_path, OptimizationSpec) else load_optimization_spec(spec_or_path, repository=root)
+        actual_run_id = run_id or spec.id or f"opt_{uuid.uuid4().hex[:12]}"
+        with shared_run_lease(profile, actual_run_id) as lease:
+            previous = os.environ.get("FXSIM_RUN_LEASE_TOKEN")
+            os.environ["FXSIM_RUN_LEASE_TOKEN"] = lease.token
+            try:
+                args.update(run_id=actual_run_id, repository=root)
+                return _run_optimization(spec, **args)
+            finally:
+                if previous is None:
+                    os.environ.pop("FXSIM_RUN_LEASE_TOKEN", None)
+                else:
+                    os.environ["FXSIM_RUN_LEASE_TOKEN"] = previous
+    return _run_optimization(spec_or_path, **args)
 
 
 def status_optimization(

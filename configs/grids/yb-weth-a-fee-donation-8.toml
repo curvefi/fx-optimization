@@ -3,20 +3,23 @@ id = "yb-weth-a-fee-donation-8"
 pair_id = "yb-weth"
 tags = ["production", "native-pool", "yieldbasis", "8x8x8"]
 
+[grid.static_overrides]
+"run.metric_projection" = "summary"
+
 [[grid.axes]]
 name = "A"
-target = { path = "A", scale = 10000, kind = "integer" }
+target = { path = "pool.A", scale = 10000, kind = "integer" }
 range = { start = 1, stop = 10, num = 8, scale = "linear" }
 
 [[grid.axes]]
 name = "fee_bps"
 targets = [
-  { path = "mid_fee", scale = 1000000, kind = "decimal" },
-  { path = "out_fee", scale = 1000000, kind = "decimal" },
+  { path = "pool.mid_fee", display_scale = 10000, kind = "decimal" },
+  { path = "pool.out_fee", display_scale = 10000, kind = "decimal" },
 ]
 range = { start = 10, stop = 300, num = 8, scale = "linear" }
 
 [[grid.axes]]
 name = "donation_apy"
-target = { path = "donation_apy", kind = "decimal" }
+target = { path = "pool.donation_apy", kind = "decimal" }
 range = { start = 0, stop = 0.05, num = 8, scale = "linear" }

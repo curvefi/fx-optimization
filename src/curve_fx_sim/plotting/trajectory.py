@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from ..artifacts.io import atomic_write_json
+from ..shiftclick.archive import ACTION_COLUMNS, TRACE_COLUMNS
 from .theme import DEFAULT_THEME, PlotTheme, apply_theme
 
 
@@ -65,56 +66,72 @@ class Trajectory:
         }
 
 
-def _records_from_payload(payload: Any) -> tuple[Mapping[str, Any], ...]:
-    if isinstance(payload, Mapping):
-        for key in ("records", "trace", "rows", "observations"):
-            if key in payload:
-                payload = payload[key]
-                break
-    if not isinstance(payload, Sequence) or isinstance(payload, (str, bytes)):
-        raise TrajectoryError("trace must contain an array of observation objects")
-    records: list[Mapping[str, Any]] = []
-    for index, raw in enumerate(payload):
-        if not isinstance(raw, Mapping):
-            raise TrajectoryError(f"trace record {index} is not an object")
-        records.append(dict(raw))
-    return tuple(records)
-
-
-def load_trajectory(path: Path | str) -> Trajectory:
-    """Load harness JSON trace or NPZ column trace without directory scanning."""
-    source = Path(path).resolve()
-    if not source.is_file():
-        raise FileNotFoundError(f"trace artifact not found: {source}")
-    if source.suffix == ".npz":
-        try:
-            archive = np.load(source, allow_pickle=False)
-            names = tuple(archive.files)
-            if not names:
-                raise TrajectoryError("NPZ trace has no arrays")
-            count = len(archive[names[0]])
-            records = []
-            for index in range(count):
-                row: dict[str, Any] = {}
-                for name in names:
-                    value = archive[name][index]
-                    if isinstance(value, np.generic):
-                        value = value.item()
-                    if isinstance(value, (str, int, float, bool)):
-                        row[name] = value
-                records.append(row)
-            archive.close()
-            return Trajectory(tuple(records), source)
-        except TrajectoryError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            raise TrajectoryError(f"cannot read NPZ trace {source}: {exc}") from exc
+def load_replay_records(
+    path: Path | str, *, companion_path: Path | str, kind: str = "trace",
+    scenario_index: int = 0,
+) -> tuple[Mapping[str, Any], ...]:
+    """Load one attested matrix from the candidate-wide replay archive."""
+    supplied = Path(path).resolve()
+    companion = Path(companion_path).resolve()
     try:
-        with source.open("r", encoding="utf-8") as stream:
-            payload = json.load(stream)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise TrajectoryError(f"cannot read JSON trace {source}: {exc}") from exc
-    return Trajectory(_records_from_payload(payload), source)
+        payload = json.loads(companion.read_text(encoding="utf-8"))
+        if (set(payload) != {"schema_version", "source_run_id", "candidate_id", "ordinal", "columns", "scenarios", "npz"}
+                or payload.get("schema_version") != "curve_fx_replay_trace_v1"):
+            raise TrajectoryError("unsupported replay trace schema")
+        expected_columns = {"trace": list(TRACE_COLUMNS), **{name: list(value) for name, value in ACTION_COLUMNS.items()}}
+        if payload["columns"] != expected_columns or kind not in expected_columns:
+            raise TrajectoryError("replay columns differ from the fixed schema")
+        npz_ref = payload["npz"]
+        if set(npz_ref) != {"path", "sha256", "bytes"} or npz_ref["path"] != "replay_trace.npz":
+            raise TrajectoryError("replay NPZ descriptor is invalid")
+        archive_path = (companion.parent / npz_ref["path"]).resolve()
+        if archive_path != supplied:
+            raise TrajectoryError("replay NPZ and companion are not paired")
+        from ..artifacts.io import sha256_path
+        if archive_path.stat().st_size != npz_ref["bytes"] or sha256_path(archive_path) != npz_ref["sha256"]:
+            raise TrajectoryError("replay NPZ attestation mismatch")
+        scenarios = payload["scenarios"]
+        expected_keys = {f"{name}_{index:03d}" for index in range(len(scenarios)) for name in expected_columns}
+        with np.load(archive_path, allow_pickle=False) as archive:
+            if set(archive.files) != expected_keys:
+                raise TrajectoryError("replay NPZ has unexpected or missing matrices")
+            for index, scenario in enumerate(scenarios):
+                if (set(scenario) != {"index", "id", "evaluation_id", "economic_fingerprint", "row_counts", "source_sidecars"}
+                        or scenario["index"] != index or set(scenario["row_counts"]) != set(expected_columns)
+                        or any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+                               for value in scenario["row_counts"].values())
+                        or not isinstance(scenario["source_sidecars"], list)
+                        or any(set(item) != {"kind", "sha256", "bytes"}
+                               for item in scenario["source_sidecars"])):
+                    raise TrajectoryError("replay scenario metadata is inconsistent")
+                for matrix_kind, columns in expected_columns.items():
+                    matrix = archive[f"{matrix_kind}_{index:03d}"]
+                    if (matrix.dtype != np.dtype("<f8") or matrix.ndim != 2
+                            or matrix.shape != (scenario["row_counts"][matrix_kind], len(columns))):
+                        raise TrajectoryError(f"replay {matrix_kind} matrix has the wrong shape or dtype")
+            matrix = archive[f"{kind}_{scenario_index:03d}"].copy()
+        columns = expected_columns[kind]
+        records = []
+        for values in matrix:
+            row = {name: float(value) for name, value in zip(columns, values, strict=True)}
+            if kind != "trace":
+                row["type"] = kind
+            records.append(row)
+        return tuple(records)
+    except TrajectoryError:
+        raise
+    except (IndexError, KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise TrajectoryError(f"cannot read replay archive {companion}: {exc}") from exc
+
+
+def load_trajectory(
+    path: Path | str, *, companion_path: Path | str, scenario_index: int = 0
+) -> Trajectory:
+    """Load one scenario trace from a candidate-wide replay archive."""
+    source = Path(path).resolve()
+    return Trajectory(load_replay_records(
+        source, companion_path=companion_path, scenario_index=scenario_index
+    ), source)
 
 
 def _default_fields(trace: Trajectory) -> tuple[str, ...]:
@@ -148,7 +165,7 @@ def _atomic_save(figure: object, path: Path) -> None:
 
 
 def render_trajectory(
-    trace: Trajectory | Path | str,
+    trace: Trajectory,
     output: Path | str,
     *,
     fields: Sequence[str] | None = None,
@@ -156,7 +173,9 @@ def render_trajectory(
     theme: PlotTheme = DEFAULT_THEME,
 ) -> tuple[Path, Path]:
     """Render deterministic state trajectories and an immutable state sidecar."""
-    resolved = trace if isinstance(trace, Trajectory) else load_trajectory(trace)
+    if not isinstance(trace, Trajectory):
+        raise TypeError("render_trajectory requires an explicitly loaded Trajectory")
+    resolved = trace
     chosen = tuple(fields) if fields is not None else _default_fields(resolved)
     if not chosen:
         raise TrajectoryError("trace has no numeric fields to plot")
@@ -190,4 +209,4 @@ def render_trajectory(
     return image_path, state_path
 
 
-__all__ = ["Trajectory", "TrajectoryError", "load_trajectory", "render_trajectory"]
+__all__ = ["Trajectory", "TrajectoryError", "load_replay_records", "load_trajectory", "render_trajectory"]

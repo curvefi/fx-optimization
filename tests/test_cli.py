@@ -5,7 +5,6 @@ from pathlib import Path
 from click.testing import CliRunner
 from curve_fx_sim.cli import main
 
-
 def test_cli_optimize_run_selects_run_root_relative_artifact(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -16,8 +15,7 @@ def test_cli_optimize_run_selects_run_root_relative_artifact(
     spec = type("Spec", (), {"id": "demo"})()
     selected = object()
     calls: dict[str, object] = {}
-    def load_spec(_ref, *, repository, parameter_space_authority):
-        calls["authority"] = parameter_space_authority
+    def load_spec(_ref, *, repository):
         calls["repository"] = repository
         return spec
     monkeypatch.setattr(
@@ -47,27 +45,7 @@ def test_cli_optimize_run_selects_run_root_relative_artifact(
     )
     assert result.exit_code == 0, result.output
     assert calls["artifact_path"] == artifact
-    assert calls["authority"] == "selected_schema"
     assert calls["selected_evaluator"] is selected
-    assert calls["client"] is None
-    harness = tmp_path / "evaluator"
-    harness.write_bytes(b"binary")
-    conflict = CliRunner().invoke(
-        main,
-        [
-            "--project-root",
-            str(tmp_path),
-            "optimize",
-            "run",
-            "demo",
-            "--artifact-dir",
-            str(artifact),
-            "--harness",
-            str(harness),
-        ],
-    )
-    assert conflict.exit_code != 0
-    assert "mutually exclusive" in conflict.output
 
 
 def test_cli_named_grid_generate_then_run_uses_artifact_and_repository(
@@ -109,7 +87,7 @@ def test_cli_named_grid_generate_then_run_uses_artifact_and_repository(
             manifest={"run_id": kwargs["run_id"]},
             manifest_path=run_root / "grid" / "manifest.json",
             run_dir=run_root / "grid",
-            points=(object(),),
+            plan=(object(),),
         )
     import curve_fx_sim.execution  # noqa: F401
     monkeypatch.setattr("curve_fx_sim.grids.runner.compile_grid_run", compile_grid)
@@ -154,3 +132,51 @@ def test_cli_named_grid_generate_then_run_uses_artifact_and_repository(
     )
     assert ran.exit_code == 0, ran.output
     assert backend_calls["run"]["repository"] == project.resolve()
+
+
+def test_cli_grid_collect_passes_output_path(tmp_path: Path, monkeypatch) -> None:
+    project = tmp_path / "project"
+    manifest = project / "runs" / "grid" / "manifest.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("{}", encoding="utf-8")
+    output = project / "runs" / "grid" / "collected.npz"
+    calls: dict[str, object] = {}
+
+    def collect(path: Path, output_path: Path | None = None) -> Path:
+        calls.update(path=path, output_path=output_path)
+        return output
+
+    monkeypatch.setattr("curve_fx_sim.execution.collect_grid_results", collect)
+    result = CliRunner().invoke(
+        main,
+        [
+            "--project-root",
+            str(project),
+            "grid",
+            "collect",
+            str(manifest),
+            "--out",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == {"path": manifest, "output_path": output}
+
+
+def test_cli_shiftclick_preserves_explicit_relative_spelling(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    spec_file = project / "configs" / "demo.toml"
+    spec_file.parent.mkdir(parents=True)
+    spec_file.write_text("", encoding="utf-8")
+    monkeypatch.chdir(project)
+    seen = {}
+    spec = SimpleNamespace(source_spec_path=Path("configs/demo.toml"))
+    monkeypatch.setattr("curve_fx_sim.specs.shiftclick.load_shiftclick_spec",
+                        lambda path, **_: (seen.update(path=path), spec)[1])
+    monkeypatch.setattr("curve_fx_sim.shiftclick.run_shiftclick",
+                        lambda *a, **k: SimpleNamespace(to_dict=lambda: {}))
+    result = CliRunner().invoke(main, ["--project-root", str(project), "replay", "shiftclick",
+                                       "./configs/demo.toml"])
+    assert result.exit_code == 0, result.output
+    assert seen["path"] == "./configs/demo.toml"

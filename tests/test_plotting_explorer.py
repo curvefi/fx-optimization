@@ -5,7 +5,6 @@ from __future__ import annotations
 import itertools
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import matplotlib
 import pytest
@@ -15,10 +14,6 @@ from matplotlib.backend_bases import MouseEvent
 from matplotlib.ticker import FixedLocator, FormatStrFormatter
 
 from curve_fx_sim.artifacts.tables import EvaluationRow, EvaluationTable
-from curve_fx_sim.artifacts.store import RunStore
-from curve_fx_sim.evaluation.selection import SelectionRef
-from curve_fx_sim.shiftclick import runner as shiftclick_runner
-from curve_fx_sim.specs.shiftclick import ShiftclickSpec
 from curve_fx_sim.plotting.explorer import (
     HeatmapExplorer,
     _select_ticks,
@@ -144,7 +139,7 @@ def test_legacy_visual_contract_and_global_clims_survive_dimension_slider() -> N
     finally:
         explorer.close()
 
-def test_plain_and_shift_click_keep_exact_selection_ref(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_plain_and_shift_click_keep_exact_selection_ref() -> None:
     selections = []
     explorer = HeatmapExplorer(
         _table(),
@@ -179,30 +174,16 @@ def test_plain_and_shift_click_keep_exact_selection_ref(tmp_path: Path, monkeypa
         assert right_selection == selection
     finally:
         explorer.close()
-    store = RunStore(tmp_path)
-    source_dir = store.allocate_run_dir("grid", "source")
-    (source_dir / "evaluator_artifact").mkdir()
-    binary = source_dir / "evaluator_artifact" / "evaluator"
-    binary.write_bytes(b"selected")
-    provenance = {"artifact_sha256": "a" * 64}
-    monkeypatch.setattr(store, "load_manifest", lambda *_args, **_kwargs: {"run_kind": "grid", "resolved_spec": {"evaluator_artifact_selection": provenance}})
-    monkeypatch.setattr(shiftclick_runner, "load_attested_evaluation_table", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(shiftclick_runner, "normalize_selection", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(shiftclick_runner.SelectedEvaluator, "load", staticmethod(lambda _path: SimpleNamespace(provenance=provenance, binary_path=binary)))
-    client = SimpleNamespace(binary_path=tmp_path / "external", close=lambda: None)
-    spec = ShiftclickSpec("cleanup", "grid", "source", "candidate_id", "candidate", "pair", "scenario", "policy")
-    with pytest.raises(shiftclick_runner.ShiftclickError, match="external harness"):
-        shiftclick_runner.run_shiftclick(spec, store=store, client=client, selection=SelectionRef("source", "candidate_id", candidate_id="candidate"))
-    assert not (store.runs_dir / "shiftclick_cleanup").exists()
-    artifact_run = tmp_path / "runs" / "grid-run"
-    (artifact_run / "evaluator_artifact").mkdir(parents=True)
-    explorer = HeatmapExplorer(
-        _table(), metrics=["apy_net"], run_id="grid-run", run_dir=artifact_run,
-        manifest={"run_id": "grid-run", "run_kind": "grid"}, harness=tmp_path / "external",
-    )
+def test_source_rows_keep_full_identity_despite_duplicate_candidate_and_ordinal() -> None:
+    rows = [
+        EvaluationRow("same", ordinal=7, coordinates={"x": 1, "y": 1}, metrics={"apy_net": 1}),
+        EvaluationRow("same", ordinal=7, coordinates={"x": 2, "y": 1}, metrics={"apy_net": 2}),
+    ]
+    explorer = HeatmapExplorer(EvaluationTable(rows), metrics=["apy_net"])
     try:
-        with pytest.raises(RuntimeError, match="rejects --harness"):
-            explorer.replay(explorer.dataset.point((0, 0)))
+        assert explorer._source_row is not None
+        assert len(explorer._source_row) == 2
+        assert all(any(value is row for value in explorer._source_row.values()) for row in rows)
     finally:
         explorer.close()
 

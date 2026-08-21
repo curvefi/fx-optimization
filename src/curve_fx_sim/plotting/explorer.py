@@ -35,7 +35,9 @@ from ..artifacts.io import atomic_write_json
 from ..artifacts.manifest import load_manifest
 from ..artifacts.store import RunStore
 from ..artifacts.tables import EvaluationTable
+from ..grids.model import CartesianGridPlan
 from ..evaluation.selection import SelectionRef
+from ..grids.model import coordinate_signature
 from ..specs.shiftclick import ShiftclickSpec
 from .heatmap import (
     HeatmapAxis,
@@ -477,12 +479,24 @@ class HeatmapExplorer:
         run_dir: Path | None = None,
         store: RunStore | None = None,
         manifest: Mapping[str, Any] | None = None,
-        harness: Path | None = None,
         site: str = "local",
         blade: str | None = None,
         on_replay: Callable[[SelectionRef, str], Any] | None = None,
+        plan: CartesianGridPlan | None = None,
     ) -> None:
-        self.dataset = data if isinstance(data, HeatmapDataset) else HeatmapDataset.from_table(data)
+        requested = tuple(metrics) if metrics is not None else None
+        load_metrics = requested
+        if isinstance(data, EvaluationTable) and data.is_columnar_grid and requested is not None:
+            projected = set(data.metric_projection.fields)
+            needed = {MASKED_METRIC_SOURCES.get(name, name) for name in requested}
+            if any(name in MASKED_METRIC_SOURCES for name in requested):
+                needed.update(projected.intersection({
+                    "max_7d_rel_price_diff", "max_rel_price_diff", "max_7d_skew",
+                    "final_rel_price_diff", *SLIPPAGE_APY_MASK_SOURCES.values(),
+                }))
+            load_metrics = tuple(name for name in data.metric_projection.fields if name in needed)
+        self.dataset = data if isinstance(data, HeatmapDataset) else HeatmapDataset.from_table(
+            data, plan=plan, metrics=load_metrics)
         available = tuple(self.dataset.metrics) + tuple(sorted(MASKED_METRIC_SOURCES))
         self.metrics = tuple(metrics) if metrics is not None else tuple(self.dataset.metrics)
         missing = [name for name in self.metrics if name not in available]
@@ -496,16 +510,21 @@ class HeatmapExplorer:
         self.run_dir = run_dir.resolve() if run_dir is not None else None
         self.store = store
         self.manifest = manifest
-        self.harness = harness
         self.site = site
         self.blade = blade
         self.on_replay = on_replay
+        self.plan = plan or self.dataset.plan
         self._updating_radios = False
         self._replay_running = False
         self.last_selection: HeatmapSelection | None = None
         self._source_row = None
-        if isinstance(data, EvaluationTable):
-            self._source_row = {row.ordinal: row for row in data.rows}
+        self._source_table = data if isinstance(data, EvaluationTable) else None
+        if isinstance(data, EvaluationTable) and not data.is_columnar_grid:
+            keys = [(row.candidate_id, row.ordinal, coordinate_signature(row.coordinates or {}))
+                    for row in data.rows]
+            if len(keys) != len(set(keys)):
+                raise ValueError("evaluation table duplicates an exact source-row identity")
+            self._source_row = dict(zip(keys, data.rows, strict=True))
         mask = MaskSpec(
             max_price_diff_bps=max_pricethr,
             max_skew_percent=skewthr,
@@ -918,10 +937,8 @@ class HeatmapExplorer:
             return None
         artifact_path = self.run_dir / "evaluator_artifact"
         artifact_selected = artifact_path.is_dir()
-        if self.site == "local" and artifact_selected and self.harness is not None:
-            raise RuntimeError("artifact-selected replay rejects --harness")
-        if self.site == "local" and not artifact_selected and self.harness is None:
-            raise RuntimeError("legacy exact replay requires --harness")
+        if not artifact_selected:
+            raise RuntimeError("exact replay requires the source evaluator artifact")
         self._replay_running = True
         try:
             resolved = self.manifest.get("resolved_spec", {})
@@ -951,17 +968,9 @@ class HeatmapExplorer:
                 raise RuntimeError("exact replay requires an explicit project RunStore")
             store = self.store
             if self.site == "local":
-                from ..evaluation.client import SubprocessHarnessClient
-                from ..evaluation.selected import SelectedEvaluator
                 from ..shiftclick import run_shiftclick
 
-                binary = SelectedEvaluator.load(artifact_path).binary_path if artifact_selected else self.harness
-                client = SubprocessHarnessClient(
-                    binary,
-                    repository=store.root_dir,
-                    work_dir=store.runs_dir,
-                )
-                result = run_shiftclick(spec, store=store, client=client, selection=selection_ref)
+                result = run_shiftclick(spec, store=store, selection=selection_ref)
             else:
                 from ..execution.site import load_site_profile
                 from ..shiftclick import run_remote_shiftclick
@@ -994,18 +1003,23 @@ class HeatmapExplorer:
 
         run_dir = Path(result.run_dir)
         manifest = load_manifest(run_dir / "manifest.json", expected_kind="shiftclick")
-        trace = find_attested_artifact(manifest, run_dir=run_dir, kind="trace")
-        try:
-            actions = find_attested_artifact(manifest, run_dir=run_dir, kind="actions")
-        except Exception:
-            actions = None
-        source_row = self._source_row.get(selection.ordinal) if self._source_row else None
+        trace = find_attested_artifact(
+            manifest, run_dir=run_dir, kind="replay_trace_npz", verify_digest=True)
+        companion = find_attested_artifact(
+            manifest, run_dir=run_dir, kind="replay_trace_companion", verify_digest=True)
+        key = (selection.candidate_id, selection.ordinal,
+               coordinate_signature(selection.coordinates))
+        source_row = self._source_row.get(key) if self._source_row else None
+        if source_row is None and self._source_table is not None and self.plan is not None:
+            source_row = self._source_table.row_at(selection.ordinal, self.plan)
         cadence = resolve_donation_frequency(
             manifest,
             source_row=source_row,
             project_root=self.store.root_dir if self.store is not None else None,
         )
-        figure = render_shiftclick_figure(trace, actions, title=run_dir.name, fee_source="both", donation_frequency=cadence)
+        figure = render_shiftclick_figure(
+            trace, companion_path=companion, title=run_dir.name,
+            fee_source="both", donation_frequency=cadence)
         _window_title(figure, "Shiftclick")
         figure.canvas.draw_idle()
 
@@ -1046,7 +1060,18 @@ def open_explorer(run_dir: Path, **kwargs: Any) -> HeatmapExplorer:
     from ..artifacts.attestation import load_attested_evaluation_table
 
     table, table_path = load_attested_evaluation_table(manifest, run_dir=run_dir, verify_digest=True)
-    explorer = HeatmapExplorer(table, run_id=str(manifest["run_id"]), run_dir=run_dir, manifest=manifest, **kwargs)
+    plan = None
+    if table.is_columnar_grid:
+        from ..evaluation.plans import ScenarioKey
+        from ..evaluation.selected import SelectedEvaluator
+        from ..grids.runner import load_grid_plan
+
+        selected = SelectedEvaluator.load(run_dir / "evaluator_artifact")
+        raw = manifest["grid"]["plan"]["scenario_key"]
+        scenario = ScenarioKey(str(raw["identity_json"]).encode(), str(raw["sha256"])).validated()
+        plan = load_grid_plan(manifest, selected_evaluator=selected, scenario=scenario)
+    explorer = HeatmapExplorer(table, plan=plan, run_id=str(manifest["run_id"]),
+                               run_dir=run_dir, manifest=manifest, **kwargs)
     explorer.state.source = table_path.name
     return explorer
 

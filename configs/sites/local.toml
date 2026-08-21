@@ -11,9 +11,7 @@ description = "Local workstation execution using subprocess workers"
 [runner]
 type = "subprocess"
 max_workers = 1
-worker_concurrency = 1
+worker_concurrency = 10
 
 [harness]
-binary_name = "arb_evaluator_ld"
-default_real = "longdouble"
 timeout_seconds = 3600

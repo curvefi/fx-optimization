@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 from pathlib import Path
 
@@ -12,6 +11,8 @@ from curve_fx_sim.plotting.shiftclick_view import (
     _donation_growth,
     render_shiftclick_figure,
 )
+from curve_fx_sim.artifacts.io import atomic_write_json, sha256_path
+from curve_fx_sim.shiftclick.archive import ACTION_COLUMNS, TRACE_COLUMNS
 
 
 def _synthetic_trace(n: int = 500, *, with_yb: bool = False) -> list[dict[str, object]]:
@@ -46,27 +47,28 @@ def _synthetic_trace(n: int = 500, *, with_yb: bool = False) -> list[dict[str, o
     return records
 
 
-def _write_sidecars(tmp_path: Path, records: list[dict[str, object]]) -> tuple[Path, Path]:
-    trace = tmp_path / "trace.json"
-    trace.write_text(json.dumps(records), encoding="utf-8")
-    actions = tmp_path / "actions.json"
-    actions.write_text(
-        json.dumps(
-            [
-                {"type": "exchange", "ts": records[0]["t"] + 1, "dy_after_fee": 90.0, "fee_tokens": 0.009},
-                {"type": "donation", "ts": records[0]["t"] + 2},
-                {"type": "exchange", "ts": records[1]["t"] + 1, "dy_after_fee": 50.0, "fee_tokens": 0.005},
-            ]
-        ),
-        encoding="utf-8",
-    )
-    return trace, actions
+def _write_archive(tmp_path: Path, records: list[dict[str, object]]) -> Path:
+    arrays = {"trace_000": np.asarray([[row.get(name, np.nan) for name in TRACE_COLUMNS] for row in records], dtype="<f8")}
+    for kind, columns in ACTION_COLUMNS.items():
+        arrays[f"{kind}_000"] = np.empty((0, len(columns)), dtype="<f8")
+    archive = tmp_path / "replay_trace.npz"
+    np.savez_compressed(archive, **arrays)
+    atomic_write_json(tmp_path / "replay_trace.json", {
+        "schema_version": "curve_fx_replay_trace_v1",
+        "source_run_id": "source", "candidate_id": "candidate", "ordinal": 0,
+        "columns": {"trace": list(TRACE_COLUMNS), **{kind: list(columns) for kind, columns in ACTION_COLUMNS.items()}},
+        "scenarios": [{"index": 0, "id": "scenario", "evaluation_id": "evaluation",
+                       "economic_fingerprint": "fingerprint", "source_sidecars": [],
+                       "row_counts": {"trace": len(records), **{kind: 0 for kind in ACTION_COLUMNS}}}],
+        "npz": {"path": archive.name, "sha256": sha256_path(archive), "bytes": archive.stat().st_size},
+    })
+    return archive
 def test_render_active_2l_uses_attested_donation_frequency(tmp_path: Path) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
     records = _synthetic_trace(300, with_yb=True)
-    trace, actions = _write_sidecars(tmp_path, records)
+    trace = _write_archive(tmp_path, records)
     fields = (
         "yb_initialized", "yb_growth", "yb_fee", "yb_releverage_trades",
         "yb_stable_balance", "yb_debt", "yb_collateral_lp", "yb_lp_oracle", "yb_lp_fair",
@@ -80,7 +82,8 @@ def test_render_active_2l_uses_attested_donation_frequency(tmp_path: Path) -> No
         [record["lp_xcp_profit"] for record in records], dtype=float
     ) / expected_growth
     fig = render_shiftclick_figure(
-        trace, actions, title="active-2l", donation_frequency=frequency
+        trace, companion_path=trace.with_name("replay_trace.json"),
+        title="active-2l", donation_frequency=frequency
     )
     growth_axis = next(
         axis for axis in fig.axes
@@ -92,5 +95,6 @@ def test_render_non_yb_panels(tmp_path: Path) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
-    trace, actions = _write_sidecars(tmp_path, _synthetic_trace(200))
-    render_shiftclick_figure(trace, actions, title="test")
+    trace = _write_archive(tmp_path, _synthetic_trace(200))
+    render_shiftclick_figure(
+        trace, companion_path=trace.with_name("replay_trace.json"), title="test")

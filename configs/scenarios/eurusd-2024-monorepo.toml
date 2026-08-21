@@ -1,0 +1,26 @@
+[scenario]
+id = "eurusd-2024-monorepo"
+pair_id = "eurusd"
+name = "EUR/USD legacy monorepo scan"
+description = "Reproduction inputs for the 2024 EUR/USD monorepo grid; all candles after the legacy start time."
+start_time = 1704146400
+end_time = 0
+n_candles = 0
+candle_filter = 99.0
+min_swap = 0.000001
+max_swap = 1.0
+dustswap_freq_s = 3600
+user_swap_freq_s = 3600
+user_swap_size_frac = 0.01
+user_swap_thresh = 0.05
+disable_slippage_probes = false
+yb_mode = "off"
+yb_releverage = false
+template_path = "configs/templates/eurusd-2024-monorepo.json"
+template_sha256 = "a8425b748c766a32a577324b545f47e4fc7ebdeb1f4ec45cd69aabbee4c0ddbc"
+tags = ["legacy", "monorepo", "fx", "eurusd"]
+
+[[scenario.market_files]]
+path = "data/market/eurusd/candles.json"
+kind = "market"
+sha256 = "a5303d5db500a9a1f43dd86a659c6f4f598185bc90d8ffd1af41fecf2fd8b930"

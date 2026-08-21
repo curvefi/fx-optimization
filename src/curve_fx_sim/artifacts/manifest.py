@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import re
@@ -10,10 +11,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from ..specs.common import canonical_primitive
+from ..specs.common import canonical_json_bytes, canonical_primitive
 from .io import atomic_write_json
 
-SCHEMA_VERSION = "fxsim_manifest_v1"
+SCHEMA_VERSION = "fxsim_manifest_v2"
 CORE_IDENTITY_SCHEMA_VERSION = "curve_fx_sim_identity_v2"
 _MANIFEST_KINDS = frozenset({"grid", "optimization", "shiftclick"})
 _REQUIRED_COMMON = ("schema_version", "run_kind", "run_id", "created_at", "updated_at", "resolved_spec", "core", "attempt_history", "artifacts")
@@ -161,15 +162,36 @@ def _validate_grid_branch(manifest: Mapping[str, Any]) -> None:
     grid = manifest.get("grid")
     if not isinstance(grid, Mapping):
         raise ManifestError("grid run manifest requires a 'grid' section")
+    if set(grid) != {"grid_id", "pool_count", "plan", "shards", "table_ref"}:
+        raise ManifestError("grid section fields do not match fxsim_manifest_v2")
     _required_string(grid, "grid_id")
     pool_count = grid.get("pool_count")
     if not isinstance(pool_count, int) or pool_count <= 0:
         raise ManifestError("grid.pool_count must be a positive integer")
-    pools = grid.get("pools")
-    if not isinstance(pools, Sequence) or isinstance(pools, (str, bytes)) or len(pools) != pool_count:
-        raise ManifestError("grid.pools must contain exactly grid.pool_count records")
-    if not isinstance(grid.get("resolved_axes"), Sequence):
-        raise ManifestError("grid.resolved_axes is required")
+    plan = grid.get("plan")
+    if not isinstance(plan, Mapping):
+        raise ManifestError("grid.plan must be an object")
+    if plan.get("schema_version") != "fxsim_cartesian_grid_v1":
+        raise ManifestError("grid.plan has an unsupported schema_version")
+    _validate_sha256(plan.get("plan_sha256"), "grid.plan.plan_sha256")
+    authority = {key: value for key, value in plan.items() if key != "plan_sha256"}
+    if hashlib.sha256(canonical_json_bytes(authority)).hexdigest() != plan["plan_sha256"]:
+        raise ManifestError("grid.plan.plan_sha256 does not match its canonical authority")
+    if plan.get("grid_id") != grid.get("grid_id") or plan.get("pool_count") != pool_count:
+        raise ManifestError("grid.plan identity or pool count differs from its grid section")
+    shape = plan.get("coordinate_shape")
+    if (
+        not isinstance(shape, Sequence)
+        or isinstance(shape, (str, bytes))
+        or not shape
+        or any(isinstance(size, bool) or not isinstance(size, int) or size <= 0 for size in shape)
+    ):
+        raise ManifestError("grid.plan.coordinate_shape must contain positive integers")
+    product = 1
+    for size in shape:
+        product *= size
+    if product != pool_count:
+        raise ManifestError("grid.plan.coordinate_shape does not match grid.pool_count")
     if not isinstance(grid.get("shards"), Sequence):
         raise ManifestError("grid.shards must be an array")
     _validate_table_ref(grid.get("table_ref"), "grid.table_ref")
@@ -287,9 +309,9 @@ def _build_core_dict(core: Mapping[str, Any] | None) -> dict[str, Any]:
     return dict(core)
 
 
-def new_grid_manifest(*, run_id: str, grid_id: str, pool_count: int, resolved_spec: Mapping[str, Any], resolved_axes: Sequence[Mapping[str, Any]], pools: Sequence[Mapping[str, Any]] = (), shards: Sequence[Mapping[str, Any]] = (), core: Mapping[str, Any] | None = None, attempt_history: Sequence[Mapping[str, Any]] = (), artifacts: Sequence[Mapping[str, Any]] = (), table_ref: Mapping[str, Any] | None = None, created_at: str | None = None, updated_at: str | None = None) -> dict[str, Any]:
+def new_grid_manifest(*, run_id: str, grid_id: str, pool_count: int, resolved_spec: Mapping[str, Any], plan: Mapping[str, Any], shards: Sequence[Mapping[str, Any]] = (), core: Mapping[str, Any] | None = None, attempt_history: Sequence[Mapping[str, Any]] = (), artifacts: Sequence[Mapping[str, Any]] = (), table_ref: Mapping[str, Any] | None = None, created_at: str | None = None, updated_at: str | None = None) -> dict[str, Any]:
     now_ts = _now()
-    manifest = {"schema_version": SCHEMA_VERSION, "run_kind": "grid", "run_id": run_id, "created_at": created_at or now_ts, "updated_at": updated_at or now_ts, "resolved_spec": canonical_primitive(resolved_spec), "core": _build_core_dict(core), "attempt_history": [canonical_primitive(a) for a in attempt_history], "artifacts": [canonical_primitive(a) for a in artifacts], "grid": {"grid_id": grid_id, "pool_count": pool_count, "resolved_axes": [canonical_primitive(ax) for ax in resolved_axes], "pools": [canonical_primitive(pool) for pool in pools], "shards": [canonical_primitive(s) for s in shards], "table_ref": canonical_primitive(table_ref) if table_ref else None}}
+    manifest = {"schema_version": SCHEMA_VERSION, "run_kind": "grid", "run_id": run_id, "created_at": created_at or now_ts, "updated_at": updated_at or now_ts, "resolved_spec": canonical_primitive(resolved_spec), "core": _build_core_dict(core), "attempt_history": [canonical_primitive(a) for a in attempt_history], "artifacts": [canonical_primitive(a) for a in artifacts], "grid": {"grid_id": grid_id, "pool_count": pool_count, "plan": canonical_primitive(plan), "shards": [canonical_primitive(s) for s in shards], "table_ref": canonical_primitive(table_ref) if table_ref else None}}
     return _validate_manifest(manifest, "grid")
 
 

@@ -670,18 +670,9 @@ class CandidateCompiler:
         proposal: Mapping[str, object],
         *,
         open_session: Mapping[str, object],
-        scenario: ScenarioClosure | ScenarioKey | None = None,
-        scenario_identity: Mapping[str, object] | None = None,
+        scenario: ScenarioClosure | ScenarioKey,
     ) -> CandidatePlan:
-        """Compile against a verified scenario; raw identity is legacy-only."""
-        if scenario_identity is not None:
-            if scenario is not None:
-                raise CandidatePlanError("pass scenario or scenario_identity, not both")
-            return self.compile_legacy(
-                proposal,
-                open_session=open_session,
-                scenario_identity=scenario_identity,
-            )
+        """Compile against a verified scenario closure or key."""
         if isinstance(scenario, ScenarioClosure):
             scenario_key = ScenarioKey.from_closure(scenario)
         elif isinstance(scenario, ScenarioKey):
@@ -689,28 +680,6 @@ class CandidateCompiler:
         else:
             raise CandidatePlanError("scenario must be a ScenarioClosure or validated ScenarioKey")
         return self._compile(proposal, open_session=open_session, scenario_key=scenario_key)
-
-    def compile_legacy(
-        self,
-        proposal: Mapping[str, object],
-        *,
-        open_session: Mapping[str, object],
-        scenario_identity: Mapping[str, object],
-    ) -> CandidatePlan:
-        """Compatibility path for pre-closure callers with caller-owned identity."""
-        if not isinstance(scenario_identity, Mapping):
-            raise CandidatePlanError("scenario_identity must be a mapping")
-        scenario_json = canonical_json_bytes(
-            _json_value(scenario_identity, label="scenario_identity")
-        )
-        return self._compile(
-            proposal,
-            open_session=open_session,
-            scenario_key=ScenarioKey(
-                identity_json=scenario_json,
-                sha256=hashlib.sha256(scenario_json).hexdigest(),
-            ),
-        )
 
     def compile_observation(
         self, values: Mapping[str, object] | None = None

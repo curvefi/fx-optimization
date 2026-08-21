@@ -2,29 +2,34 @@
 id = "chfusd-perf-16"
 pair_id = "chfusd"
 tags = ["test", "perf"]
-fee_equalize = true
+
+[grid.static_overrides]
+"run.metric_projection" = "summary"
 
 [[grid.axes]]
 name = "A"
-target = { path = "A", kind = "integer", scale = 10000 }
+target = { path = "pool.A", kind = "integer", scale = 10000 }
 values = [10, 26.2837, 69.0835, 200]
 
 [[grid.axes]]
 name = "donation_apy"
-target = { path = "donation_apy", kind = "decimal" }
+target = { path = "pool.donation_apy", kind = "decimal" }
 values = [0.0, 0.1]
 
 [[grid.axes]]
 name = "mid_fee_bps"
-target = { path = "mid_fee", kind = "decimal", scale = 1000000 }
+targets = [
+  { path = "pool.mid_fee", display_scale = 10000, kind = "decimal" },
+  { path = "pool.out_fee", display_scale = 10000, kind = "decimal" },
+]
 values = [1, 10]
 
 [[grid.axes]]
 name = "reserved_profit_fraction"
-target = { path = "reserved_profit_fraction", kind = "decimal" }
-values = [100000000]
+target = { path = "pool.reserved_profit_fraction", kind = "decimal" }
+values = [0.01]
 
 [[grid.axes]]
 name = "user_swap_size_frac"
-target = { path = "user_swap_size_frac", kind = "decimal" }
+target = { path = "pool.user_swap_size_frac", kind = "decimal" }
 values = [0.0]

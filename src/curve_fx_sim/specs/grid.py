@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import math
 import os
 import tomllib
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -131,10 +130,6 @@ class GridSpec:
     static_overrides: dict[str, Any] = field(default_factory=dict)
     tags: tuple[str, ...] = ()
     source_path: Path | None = None
-    # Legacy grid builder semantics: when true, every cell's out_fee follows
-    # its mid_fee (out_fee = mid_fee), mirroring generate_pools_nd.py
-    # fee_equalize handling.
-    fee_equalize: bool = False
 
     def __post_init__(self) -> None:
         if not self.id:
@@ -165,7 +160,6 @@ class GridSpec:
             "axes": [a.to_dict() for a in self.axes],
             "static_overrides": serializable(self.static_overrides),
             "tags": list(self.tags),
-            "fee_equalize": self.fee_equalize,
             "source_path": self.source_path.as_posix() if self.source_path else None,
             "pool_count": self.pool_count,
             "coordinate_shape": list(self.coordinate_shape),
@@ -205,20 +199,12 @@ def _generate_range_values(rng: Mapping[str, Any], axis_name: str) -> list[Decim
     elif scale_type in ("log", "logarithmic"):
         if start <= 0 or stop <= 0:
             raise SpecError(f"axis {axis_name} log range requires strictly positive start and stop")
-        log_start = math.log10(float(start))
-        log_stop = math.log10(float(stop))
-        step = (log_stop - log_start) / (num - 1)
-        values: list[Decimal] = []
-        for i in range(num):
-            if i == 0:
-                values.append(start)
-            elif i == num - 1:
-                values.append(stop)
-            else:
-                raw_val = 10 ** (log_start + step * i)
-                # Form canonical Decimal with up to 10 decimal digits
-                values.append(Decimal(f"{raw_val:.10g}"))
-        return values
+        with localcontext() as context:
+            context.prec = max(80, len(start.as_tuple().digits) + 20, len(stop.as_tuple().digits) + 20)
+            log_start = start.log10()
+            step = (stop.log10() - log_start) / Decimal(num - 1)
+            interior = [Decimal(10) ** (log_start + step * i) for i in range(1, num - 1)]
+        return [start, *interior, stop]
     else:
         raise SpecError(f"unsupported range scale: {scale_type!r}")
 
@@ -282,6 +268,14 @@ def load_grid_spec(
 
     grid_data = raw_data.get("grid", raw_data)
 
+    known_fields = {
+        "id", "pair_id", "pair", "policy_id", "policy", "axes",
+        "static_overrides", "tags",
+    }
+    unknown = sorted(set(grid_data) - known_fields)
+    if unknown:
+        raise SpecError("unsupported grid fields: " + ", ".join(unknown))
+
     grid_id = grid_data.get("id") or candidate.stem
     pair_id = grid_data.get("pair_id") or grid_data.get("pair", "")
     policy_id = grid_data.get("policy_id") or grid_data.get("policy")
@@ -294,7 +288,6 @@ def load_grid_spec(
 
     static_overrides = dict(grid_data.get("static_overrides", {}))
     tags = tuple(grid_data.get("tags", []))
-    fee_equalize = bool(grid_data.get("fee_equalize", False))
     source_path = repository_relative(candidate, root)
 
     return GridSpec(
@@ -304,7 +297,6 @@ def load_grid_spec(
         axes=tuple(axes),
         static_overrides=static_overrides,
         tags=tags,
-        fee_equalize=fee_equalize,
         source_path=source_path,
     )
 

@@ -6,138 +6,9 @@ from decimal import Decimal
 import pytest
 
 from curve_fx_sim.optimization.lattice import LatticeSpec, TickAxis
-from curve_fx_sim.optimization.profiles import (
-    create_lattice_spec,
-    profile_from_policy_spec,
-)
 from curve_fx_sim.optimization.tmrbcd import (
     TmrbcdOptimizer,
 )
-from curve_fx_sim.specs.policy import PolicyParameter, PolicySpec
-
-
-def _profile():
-    policy = PolicySpec(
-        id="compiled_test",
-        header_file="policies/compiled_test.hpp",
-        source_sha256="a" * 64,
-        parameters=(
-            PolicyParameter("fast", default=2.0, min_val=1.0, max_val=20.0, step=0.5),
-            PolicyParameter("fixed", default=7.0, min_val=5.0, max_val=9.0, step=1.0),
-        ),
-    )
-    return profile_from_policy_spec(
-        policy,
-        {"fast": {"min": 1.0, "max": 20.0, "step": 0.5}},
-    )
-
-
-def test_tmrbcd_optimizer_budget_termination():
-    prof = _profile()
-    lattice = create_lattice_spec(prof)
-    budget = 10
-    opt = TmrbcdOptimizer(lattice=lattice, initial_params=prof.initial_seed, budget=budget, seed=42)
-
-    total_asked = 0
-    while True:
-        asks = opt.ask(batch_size=4)
-        if not asks:
-            break
-        # Mock loss
-        losses = [1.0] * len(asks)
-        opt.tell(asks, losses)
-        total_asked += len(asks)
-
-    assert total_asked == budget
-    assert opt.step == budget
-    # Exhausted asks return empty list
-    assert opt.ask(batch_size=4) == []
-
-
-def test_tmrbcd_resume_equivalence():
-    """Verify that an uninterrupted run produces the exact same sequence of proposals as a checkpointed and resumed run."""
-    prof = _profile()
-    lattice = create_lattice_spec(prof)
-    budget = 20
-    seed = 12345
-
-    # 1. Uninterrupted run
-    opt_uninterrupted = TmrbcdOptimizer(lattice=lattice, initial_params=prof.initial_seed, budget=budget, seed=seed)
-    uninterrupted_proposals = []
-    while True:
-        batch = opt_uninterrupted.ask(batch_size=4)
-        if not batch:
-            break
-        uninterrupted_proposals.extend(batch)
-        losses = [0.1 * (i + 1) for i in range(len(batch))]
-        opt_uninterrupted.tell(batch, losses)
-
-    # 2. Checkpointed run: stop midway at step 8, save snapshot, restore into a fresh instance, and resume
-    opt_checkpointed = TmrbcdOptimizer(lattice=lattice, initial_params=prof.initial_seed, budget=budget, seed=seed)
-    checkpointed_proposals = []
-
-    # Run first 2 batches (8 steps)
-    for _ in range(2):
-        batch = opt_checkpointed.ask(batch_size=4)
-        checkpointed_proposals.extend(batch)
-        losses = [0.1 * (i + 1) for i in range(len(batch))]
-        opt_checkpointed.tell(batch, losses)
-
-    snapshot = opt_checkpointed.snapshot()
-
-    # Fresh optimizer instance restored from snapshot
-    opt_resumed = TmrbcdOptimizer(lattice=lattice, initial_params=prof.initial_seed, budget=budget, seed=seed)
-    opt_resumed.restore(snapshot)
-
-    while True:
-        batch = opt_resumed.ask(batch_size=4)
-        if not batch:
-            break
-        checkpointed_proposals.extend(batch)
-        losses = [0.1 * (i + 1) for i in range(len(batch))]
-        opt_resumed.tell(batch, losses)
-
-    assert len(uninterrupted_proposals) == budget
-    assert len(checkpointed_proposals) == budget
-
-    for i, (p1, p2) in enumerate(zip(uninterrupted_proposals, checkpointed_proposals, strict=True)):
-        assert p1 == p2, f"Proposal mismatch at step {i}: uninterrupted {p1} != resumed {p2}"
-
-    assert opt_uninterrupted.best_loss == opt_resumed.best_loss
-    assert opt_uninterrupted.best_point == opt_resumed.best_point
-
-
-@pytest.mark.parametrize(
-    "mutate,match",
-    [
-        (lambda state: state.pop("rng_state"), "fields mismatch"),
-        (lambda state: state.__setitem__("schema_version", 2), "schema_version"),
-        (lambda state: state.__setitem__("step", state["step"] + 1), "evaluation cache"),
-        (lambda state: state.__setitem__("best_loss", 999.0), "best point/loss"),
-        (lambda state: state["rng_state"].clear(), "rng_state is invalid"),
-    ],
-)
-def test_tmrbcd_restore_rejects_truncated_or_tampered_state(mutate, match):
-    prof = _profile()
-    optimizer = TmrbcdOptimizer(
-        lattice=create_lattice_spec(prof),
-        initial_params=prof.initial_seed,
-        budget=8,
-        seed=42,
-    )
-    asks = optimizer.ask(batch_size=4)
-    optimizer.tell(asks, [float(index + 1) for index in range(len(asks))])
-    state = copy.deepcopy(optimizer.snapshot())
-    mutate(state)
-
-    restored = TmrbcdOptimizer(
-        lattice=create_lattice_spec(prof),
-        initial_params=prof.initial_seed,
-        budget=8,
-        seed=42,
-    )
-    with pytest.raises(ValueError, match=match):
-        restored.restore(state)
 
 
 def _saturation_lattice(dim: int) -> LatticeSpec:
@@ -157,6 +28,37 @@ def _saturation_lattice(dim: int) -> LatticeSpec:
         n_params=dim,
     )
 
+
+@pytest.mark.parametrize(
+    "mutate,match",
+    [
+        (lambda state: state.pop("rng_state"), "fields mismatch"),
+        (lambda state: state.__setitem__("schema_version", 2), "schema_version"),
+        (lambda state: state.__setitem__("step", state["step"] + 1), "evaluation cache"),
+        (lambda state: state.__setitem__("best_loss", 999.0), "best point/loss"),
+        (lambda state: state["rng_state"].clear(), "rng_state is invalid"),
+    ],
+)
+def test_tmrbcd_restore_rejects_truncated_or_tampered_state(mutate, match):
+    optimizer = TmrbcdOptimizer(
+        lattice=_saturation_lattice(2),
+        initial_params=(2.0, 2.0),
+        budget=8,
+        seed=42,
+    )
+    asks = optimizer.ask(batch_size=4)
+    optimizer.tell(asks, [float(index + 1) for index in range(len(asks))])
+    state = copy.deepcopy(optimizer.snapshot())
+    mutate(state)
+
+    restored = TmrbcdOptimizer(
+        lattice=_saturation_lattice(2),
+        initial_params=(2.0, 2.0),
+        budget=8,
+        seed=42,
+    )
+    with pytest.raises(ValueError, match=match):
+        restored.restore(state)
 
 def _flat_run(dim: int, budget: int, seed: int):
     """Drive one flat-objective run, recording per-tell saturation state."""

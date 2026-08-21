@@ -1,30 +1,34 @@
-"""Finite grid expansion and canonical evaluator request construction."""
+"""Canonical lazy Cartesian grid planning."""
 
 from __future__ import annotations
 
-import itertools
+import hashlib
 import json
-from dataclasses import dataclass, replace
-from decimal import Decimal, InvalidOperation
-from typing import TYPE_CHECKING, Any, Mapping, Sequence
+import warnings
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN, localcontext
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, MutableMapping
 
+from ..specs.common import canonical_json_bytes
 from ..specs.grid import AxisSpec, AxisTarget, GridSpec
-from ..specs.policy import PolicySpec
-from ..specs.parameters import ParameterDim
 
 if TYPE_CHECKING:
     from ..evaluation.grouping import CompiledEvaluation
-    from ..evaluation.plans import CandidateCompiler, ScenarioKey
+    from ..evaluation.plans import CandidateCompiler, ObservationKey, ScenarioKey, SessionKey
     from ..specs.scenario import ScenarioClosure
 
 
+GRID_PLAN_SCHEMA_VERSION = "fxsim_cartesian_grid_v1"
+_AxisOption = tuple[tuple[tuple[str, Any], ...], tuple[tuple[str, Any], ...]]
+
 
 class GridValidationError(ValueError):
-    """Raised when a grid does not define one exact finite Cartesian product."""
+    """A grid does not define one exact finite Cartesian product."""
 
 
 def _exact_value(value: Any) -> Any:
-    """Return a stable, JSON-safe coordinate value without float coercion."""
     if isinstance(value, Decimal):
         return int(value) if value == value.to_integral_value() else format(value, "f")
     if isinstance(value, Mapping):
@@ -35,11 +39,7 @@ def _exact_value(value: Any) -> Any:
 
 
 def coordinate_signature(coordinate: Mapping[str, Any]) -> str:
-    """Canonical equality key used for exact coordinate lookup.
-
-    Numeric spellings such as ``1``, ``1.0`` and ``"1.00"`` intentionally
-    compare equal.  No tolerance or nearest-coordinate behavior is used.
-    """
+    """Canonical exact-coordinate equality key."""
 
     def normalize(value: Any) -> Any:
         if isinstance(value, bool) or value is None:
@@ -48,15 +48,11 @@ def coordinate_signature(coordinate: Mapping[str, Any]) -> str:
             try:
                 number = Decimal(str(value))
                 if number.is_finite():
-                    normalized = "0" if number == 0 else str(number.normalize())
-                    return ["decimal", normalized]
+                    return ["decimal", "0" if number == 0 else str(number.normalize())]
             except (InvalidOperation, ValueError):
                 pass
         if isinstance(value, Mapping):
-            return [
-                "mapping",
-                [[str(key), normalize(item)] for key, item in sorted(value.items())],
-            ]
+            return ["mapping", [[str(key), normalize(item)] for key, item in sorted(value.items())]]
         if isinstance(value, (tuple, list)):
             return ["sequence", [normalize(item) for item in value]]
         return ["value", str(value)]
@@ -68,614 +64,639 @@ def coordinate_signature(coordinate: Mapping[str, Any]) -> str:
     )
 
 
-def _protocol_number(value: Any, *, label: str) -> int | float:
-    if isinstance(value, bool):
-        raise GridValidationError(f"{label} must be numeric, not boolean")
-    try:
-        number = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError) as exc:
-        raise GridValidationError(f"{label} must be numeric, got {value!r}") from exc
-    if not number.is_finite():
-        raise GridValidationError(f"{label} must be finite, got {value!r}")
-    return int(number) if number == number.to_integral_value() else float(number)
-
-
-def _policy_vector(
-    raw: Any,
-    *,
-    parameter_names: Sequence[str] | None = None,
-) -> tuple[int | float, ...]:
-    if raw is None:
-        return ()
-    if isinstance(raw, Mapping):
-        if not raw:
-            return ()
-        if parameter_names is not None:
-            names = tuple(parameter_names)
-            unknown = sorted(set(str(key) for key in raw) - set(names))
-            missing = [name for name in names if name not in raw]
-            if unknown or missing:
-                raise GridValidationError(
-                    "policy_params must exactly match PolicySpec names; "
-                    f"unknown={unknown}, missing={missing}"
-                )
-            raw = [raw[name] for name in names]
-        else:
-            try:
-                indexed = {int(key): value for key, value in raw.items()}
-            except (TypeError, ValueError) as exc:
-                raise GridValidationError(
-                    "policy_params must be an array or a dense mapping keyed by integer indices"
-                ) from exc
-            if set(indexed) != set(range(len(indexed))):
-                raise GridValidationError("policy_params indices must form the dense range [0, n)")
-            raw = [indexed[index] for index in range(len(indexed))]
-    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
-        raise GridValidationError("policy_params grid override must be an array")
-    return tuple(
-        _protocol_number(value, label=f"policy_params[{index}]")
-        for index, value in enumerate(raw)
-    )
-
-def _detach(value: Any) -> Any:
-    """Detach mutable containers without invoking recursive ``deepcopy``."""
+def _freeze(value: Any) -> Any:
     if isinstance(value, Mapping):
-        return {key: _detach(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_detach(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_detach(item) for item in value)
-    if isinstance(value, set):
-        return {_detach(item) for item in value}
-    return value
-
-
-def _split_request_overrides(
-    overrides: Mapping[str, Any],
-    *,
-    parameter_names: Sequence[str] | None = None,
-) -> tuple[tuple[int | float, ...], dict[str, Any]]:
-    """Split protocol policy-vector parameters from pool overrides."""
-    raw_policy = overrides.get("policy_params", ())
-    raw_pool = overrides.get("pool_overrides", {})
-    if raw_pool is None:
-        raw_pool = {}
-    if not isinstance(raw_pool, Mapping):
-        raise GridValidationError("pool_overrides grid override must be a mapping")
-    pool = dict(raw_pool)
-    for key, value in overrides.items():
-        if key in {"policy_params", "pool_overrides"}:
-            continue
-        if key in pool:
-            raise GridValidationError(f"duplicate pool override namespace {key!r}")
-        pool[key] = value
-    return _policy_vector(raw_policy, parameter_names=parameter_names), _detach(pool)
-
-
-@dataclass(frozen=True)
-class GridPoint:
-    """One canonical point in declaration-order Cartesian expansion."""
-
-    ordinal: int
-    candidate_id: str
-    coordinate_indices: tuple[int, ...]
-    coordinates: Mapping[str, Any]
-    legacy_policy_params: tuple[int | float, ...]
-    legacy_pool_overrides: Mapping[str, Any]
-    coordinate_signature: str = ""
-    proposal: tuple[tuple[str, Any], ...] = ()
-    session_group_id: str = ""
-    evaluation: CompiledEvaluation | None = None
-
-    @property
-    def policy_params(self) -> tuple[object, ...]:
-        return (
-            self.evaluation.candidate.policy_params
-            if self.evaluation is not None
-            else self.legacy_policy_params
-        )
-
-    @property
-    def pool_overrides(self) -> Mapping[str, Any]:
-        return (
-            json.loads(self.evaluation.candidate.pool_overrides_json)
-            if self.evaluation is not None
-            else self.legacy_pool_overrides
-        )
-
-    @property
-    def proposal_dict(self) -> dict[str, Any]:
-        """Return named values; loaded manifest values are audit evidence only."""
-        return {name: _thaw_proposal_value(value) for name, value in self.proposal}
-
-    def to_dict(self) -> dict[str, Any]:
-        result = {
-            "ordinal": self.ordinal,
-            "candidate_id": self.candidate_id,
-            "coordinate_indices": list(self.coordinate_indices),
-            "coordinates": _exact_value(self.coordinates),
-            "coordinate_signature": self.coordinate_signature,
-        }
-        if self.evaluation is not None:
-            evaluation = self.evaluation
-            result.update(
-                proposal_evidence=_exact_value(self.proposal_dict),
-                candidate_sha256=evaluation.candidate.candidate_sha256,
-                candidate_json=evaluation.candidate.candidate_json.decode("utf-8"),
-                evaluation_id=evaluation.evaluation_id,
-                session_group_id=self.session_group_id,
-                observation_id=evaluation.observation_key.sha256,
-            )
-        else:
-            result.update(
-                policy_params=_exact_value(self.legacy_policy_params),
-                pool_overrides=_exact_value(self.legacy_pool_overrides),
-            )
-        return result
-
-
-def _freeze_proposal_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return tuple(
-            (str(key), _freeze_proposal_value(item))
-            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-        )
+        return tuple((str(key), _freeze(item)) for key, item in sorted(value.items()))
     if isinstance(value, (list, tuple)):
-        return tuple(_freeze_proposal_value(item) for item in value)
+        return tuple(_freeze(item) for item in value)
     return value
 
 
-def _thaw_proposal_value(value: Any) -> Any:
+def _thaw(value: Any) -> Any:
     if isinstance(value, tuple):
         if all(
             isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str)
             for item in value
         ):
-            return {key: _thaw_proposal_value(item) for key, item in value}
-        return [_thaw_proposal_value(item) for item in value]
+            return {key: _thaw(item) for key, item in value}
+        return [_thaw(item) for item in value]
     return value
 
 
-def _set_nested(target: dict[str, Any], path: Sequence[str], value: Any) -> None:
-    if not path:
-        return
-    current = target
-    for part in path[:-1]:
-        existing = current.get(part)
-        if existing is None:
-            existing = {}
-            current[part] = existing
-        if not isinstance(existing, dict):
-            raise GridValidationError(
-                f"grid target {'.'.join(path)!r} crosses scalar namespace {part!r}"
-            )
-        current = existing
-    current[path[-1]] = value
+def _immutable(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({str(key): _immutable(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_immutable(item) for item in value)
+    return value
 
 
-def _axis_options(axis: AxisSpec) -> tuple[dict[str, Any], ...]:
-    options: list[dict[str, Any]] = []
-    if axis.is_coupled:
-        if axis.targets and len(axis.targets) != len(axis.names):
-            raise GridValidationError(
-                f"coupled axis {axis.name!r} must declare one target per coordinate name"
-            )
-        for index, row in enumerate(axis.rows):
-            display = {
-                name: _exact_value(value)
-                for name, value in zip(axis.names, row, strict=True)
-            }
-            overrides: dict[str, Any] = {}
-            for column, value in enumerate(row):
-                if column >= len(axis.targets):
-                    continue
-                target = axis.targets[column]
-                transformed = target.transform_value(value)
-                if target.kind in {"decimal", "integer", "bps"}:
-                    transformed = _protocol_number(
-                        transformed,
-                        label=f"axis {axis.name} target {'.'.join(target.path)}",
-                    )
-                _set_nested(overrides, target.path, transformed)
-            options.append({"index": index, "display": display, "overrides": overrides})
-    else:
-        for index, value in enumerate(axis.values):
-            overrides = {}
-            for target in axis.targets:
-                transformed = target.transform_value(value)
-                if target.kind in {"decimal", "integer", "bps"}:
-                    transformed = _protocol_number(
-                        transformed,
-                        label=f"axis {axis.name} target {'.'.join(target.path)}",
-                    )
-                _set_nested(overrides, target.path, transformed)
-            options.append(
-                {
-                    "index": index,
-                    "display": {axis.name: _exact_value(value)},
-                    "overrides": overrides,
-                }
-            )
-    return tuple(options)
+def _key_record(key: Any) -> dict[str, str]:
+    return {"sha256": key.sha256, "identity_json": key.identity_json.decode("utf-8")}
 
 
-def _merge_axis_overrides(
-    base: Mapping[str, Any],
-    axis_updates: Sequence[Mapping[str, Any]],
-) -> dict[str, Any]:
-    """Merge axis writes with copy-on-write nested branches.
+def _load_key(value: Any, key_type: type[Any], label: str) -> Any:
+    if not isinstance(value, Mapping) or set(value) != {"sha256", "identity_json"}:
+        raise GridValidationError(f"grid plan {label} identity is incomplete")
+    digest, identity = value["sha256"], value["identity_json"]
+    if not isinstance(digest, str) or not isinstance(identity, str):
+        raise GridValidationError(f"grid plan {label} identity is invalid")
+    if hashlib.sha256(identity.encode()).hexdigest() != digest:
+        raise GridValidationError(f"grid plan {label} identity hash mismatch")
+    return key_type(identity.encode(), digest)
 
-    The static base is treated as immutable.  Each point receives a fresh
-    top-level mapping, while only mappings on paths written by an axis are
-    copied.  This keeps unrelated static branches shared without allowing an
-    axis write to mutate the base or a sibling point.
+
+def _semantic_wire_value(descriptor: Any, value: Any) -> Any:
+    if descriptor.wire_representation == "binary64_fraction_or_1e10":
+        return Decimal(str(value)).scaleb(-10)
+    if descriptor.wire_representation == "binary64_from_wad_1e18":
+        if descriptor.value_type == "real_pair":
+            return tuple(Decimal(str(item)).scaleb(-18) for item in value)
+        return Decimal(str(value)).scaleb(-18)
+    return value
+
+
+def _baseline_open_session(compiler: CandidateCompiler, key: SessionKey) -> dict[str, Any]:
+    """Provide compiler-only placeholders; execution must bind fresh local materialization."""
+    identity_values = key.open_session_values
+    request: dict[str, Any] = {}
+    for descriptor in compiler.schema.descriptors:
+        prefix = "open_session."
+        if not descriptor.lowering_path.startswith(prefix):
+            continue
+        field = descriptor.lowering_path.removeprefix(prefix)
+        if descriptor.name in identity_values:
+            request[field] = _semantic_wire_value(descriptor, identity_values[descriptor.name])
+        elif field == "session_id":
+            request[field] = "cartesian_grid_plan"
+        elif descriptor.unit == "path":
+            request[field] = "cartesian_grid_plan"
+        elif descriptor.unit == "sha256":
+            request[field] = "0" * 64
+        elif descriptor.unit == "legacy_alias":
+            request[field] = False
+        elif descriptor.has_default:
+            request[field] = descriptor.default
+        else:
+            raise GridValidationError(f"cannot reconstruct baseline field {field!r}")
+    return request
+
+
+def _split_proposal(
+    compiler: CandidateCompiler, proposal: Mapping[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    observation: dict[str, Any] = {}
+    candidate: dict[str, Any] = {}
+    for name, value in proposal.items():
+        descriptor = compiler.schema.descriptor(name)
+        target = observation if (
+            descriptor.classification == "observation"
+            and descriptor.lowering_path.startswith("evaluate_batch.")
+        ) else candidate
+        target[name] = value
+    return candidate, observation
+
+
+@dataclass(frozen=True, slots=True)
+class GridPoint:
+    """One portable point reconstructed from a CartesianGridPlan ordinal."""
+
+    ordinal: int
+    candidate_id: str
+    coordinate_indices: tuple[int, ...]
+    coordinates: Mapping[str, Any]
+    evaluation: CompiledEvaluation
+    coordinate_signature: str
+    proposal: tuple[tuple[str, Any], ...]
+    session_group_id: str
+
+    @property
+    def policy_params(self) -> tuple[object, ...]:
+        return self.evaluation.candidate.policy_params
+
+    @property
+    def pool_overrides(self) -> Mapping[str, Any]:
+        return json.loads(self.evaluation.candidate.pool_overrides_json)
+
+    @property
+    def proposal_dict(self) -> dict[str, Any]:
+        return {name: _thaw(value) for name, value in self.proposal}
+
+
+@dataclass(frozen=True, slots=True)
+class CartesianGridPlan:
+    """Axes-only authority that compiles a portable ordinal on demand.
+
+    Points deliberately contain no runnable session request. Execution must
+    bind their session groups against a fresh LocalSessionMaterialization.
     """
-    merged = dict(base)
-    copied_paths: set[tuple[str, ...]] = set()
-    written_paths: set[tuple[str, ...]] = set()
 
-    def merge(target: dict[str, Any], updates: Mapping[str, Any], prefix: tuple[str, ...]) -> None:
-        for key, value in updates.items():
-            path = (*prefix, str(key))
-            if isinstance(value, Mapping):
-                existing = target.get(key)
-                if existing is None:
-                    existing = {}
-                elif not isinstance(existing, Mapping):
-                    raise GridValidationError(
-                        f"grid override {'.'.join(path)!r} crosses a scalar value"
-                    )
-                if path not in copied_paths:
-                    existing = dict(existing)
-                    copied_paths.add(path)
-                    target[key] = existing
-                merge(existing, value, path)
-            else:
-                if path in written_paths:
-                    raise GridValidationError(
-                        f"multiple grid axes write evaluator override {'.'.join(path)!r}"
-                    )
-                written_paths.add(path)
-                target[key] = value
+    grid_id: str
+    axis_options: tuple[tuple[_AxisOption, ...], ...]
+    static_proposal: tuple[tuple[str, Any], ...]
+    artifact_sha256: str
+    parameter_schema_sha256: str
+    scenario_key: ScenarioKey
+    baseline_session_key: SessionKey
+    baseline_observation_key: ObservationKey
+    coordinate_shape: tuple[int, ...]
+    pool_count: int
+    plan_sha256: str
+    compiler: CandidateCompiler
 
-    for updates in axis_updates:
-        merge(merged, updates, ())
-    return merged
+    def __len__(self) -> int:
+        return self.pool_count
 
+    def __getitem__(self, index: int | slice) -> GridPoint:
+        if isinstance(index, slice):
+            raise TypeError("CartesianGridPlan does not support materializing slices")
+        if index < 0:
+            index += self.pool_count
+        return self.point_at(index)
 
-def _named_axis_options(
-    axis: AxisSpec,
-    compiler: CandidateCompiler,
-) -> tuple[dict[str, Any], ...]:
-    """Build display coordinates and flat canonical proposal updates."""
-    from ..evaluation.plans import CandidatePlanError
+    def __iter__(self) -> Iterator[GridPoint]:
+        return (self.point_at(ordinal) for ordinal in range(self.pool_count))
 
-    values = axis.rows if axis.is_coupled else tuple((value,) for value in axis.values)
-    names = axis.names if axis.is_coupled else (axis.name,)
-    targets = axis.targets or tuple(
-        AxisTarget(path=tuple(name.split(".")))
-        for name in names
-    )
-    if len(targets) != len(names):
-        raise GridValidationError(
-            f"axis {axis.name!r} must declare one canonical target per coordinate value"
-        )
-    canonical_names: list[str] = []
-    for target in targets:
-        name = target.proposal_name
-        if not name:
-            raise GridValidationError(f"axis {axis.name!r} has an empty canonical target")
-        try:
-            compiler.schema.descriptor(name)
-        except CandidatePlanError as exc:
-            raise GridValidationError(
-                f"axis {axis.name!r} target {name!r} is not a canonical schema name"
-            ) from exc
-        canonical_names.append(name)
+    def candidate_id_at(self, ordinal: int) -> str:
+        self.coordinate_indices_at(ordinal)
+        return f"grid_{self.grid_id}_p{ordinal:06d}"
 
-    options: list[dict[str, Any]] = []
-    for index, row in enumerate(values):
-        display = {
-            name: _exact_value(value)
-            for name, value in zip(names, row, strict=True)
-        }
-        proposal = {
-            name: target.transform_proposal_value(value)
-            for name, target, value in zip(canonical_names, targets, row, strict=True)
-        }
-        options.append({"index": index, "display": display, "proposal": proposal})
-    return tuple(options)
+    def coordinate_indices_at(self, ordinal: int) -> tuple[int, ...]:
+        if isinstance(ordinal, bool) or not isinstance(ordinal, int):
+            raise TypeError("grid ordinal must be an integer")
+        if ordinal < 0 or ordinal >= self.pool_count:
+            raise IndexError(f"grid ordinal {ordinal} outside [0, {self.pool_count})")
+        remainder = ordinal
+        indices = [0] * len(self.coordinate_shape)
+        for axis_index in range(len(indices) - 1, -1, -1):
+            indices[axis_index] = remainder % self.coordinate_shape[axis_index]
+            remainder //= self.coordinate_shape[axis_index]
+        return tuple(indices)
 
-
-def compile_grid_points(
-    grid_spec: GridSpec,
-    *,
-    compiler: CandidateCompiler,
-    artifact_sha256: str,
-    open_session: Mapping[str, object],
-    scenario: ScenarioClosure | ScenarioKey,
-) -> tuple[GridPoint, ...]:
-    """Compile a canonical named grid through the evaluator's verified schema.
-
-    Axis transforms stop at semantic proposal values.  ``CandidateCompiler``
-    remains the sole authority for defaults, wire units, nesting, policy order,
-    candidate bytes, and scenario/session identity.
-    """
-    from ..evaluation.grouping import CompiledEvaluation, group_evaluations
-    from ..evaluation.plans import CandidatePlanError
-
-    if grid_spec.fee_equalize:
-        raise GridValidationError(
-            "fee_equalize is legacy-only; couple pool.mid_fee and pool.out_fee explicitly"
-        )
-    if not isinstance(grid_spec.static_overrides, Mapping) or any(
-        not isinstance(name, str) for name in grid_spec.static_overrides
-    ):
-        raise GridValidationError("schema-backed static_overrides must use canonical string names")
-    base_proposal = dict(grid_spec.static_overrides)
-    for name in base_proposal:
-        try:
-            compiler.schema.descriptor(name)
-        except CandidatePlanError as exc:
-            raise GridValidationError(
-                f"static override {name!r} is not a canonical schema name"
-            ) from exc
-
-    coordinate_names: set[str] = set()
-    controlled_names: set[str] = set()
-    axis_options: list[tuple[dict[str, Any], ...]] = []
-    for axis in grid_spec.axes:
-        names = axis.names if axis.is_coupled else (axis.name,)
-        duplicates = coordinate_names.intersection(names)
-        if duplicates:
-            raise GridValidationError(
-                "grid coordinate names are declared twice: " + ", ".join(sorted(duplicates))
-            )
-        coordinate_names.update(names)
-        options = _named_axis_options(axis, compiler)
-        if not options:
-            raise GridValidationError(f"axis {axis.name!r} has no finite values")
-        option_names = set(options[0]["proposal"])
-        duplicates = controlled_names.intersection(option_names)
-        if duplicates:
-            raise GridValidationError(
-                "canonical proposal names are controlled by multiple axes: "
-                + ", ".join(sorted(duplicates))
-            )
-        controlled_names.update(option_names)
-        axis_options.append(options)
-
-    points: list[GridPoint] = []
-    coordinate_keys: set[str] = set()
-    for ordinal, combination in enumerate(itertools.product(*axis_options)):
+    def coordinates_at(self, ordinal: int) -> dict[str, Any]:
         coordinates: dict[str, Any] = {}
-        proposal = dict(base_proposal)
+        for axis_index, option_index in enumerate(self.coordinate_indices_at(ordinal)):
+            display, _ = self.axis_options[axis_index][option_index]
+            coordinates.update(_thaw(display))
+        return coordinates
+
+    def ordinal_at(self, coordinates: Mapping[str, Any]) -> int:
+        """Return the exact canonical ordinal; no nearest or tolerance lookup."""
+        if not isinstance(coordinates, Mapping):
+            raise TypeError("grid coordinates must be a mapping")
+        remaining = dict(coordinates)
         indices: list[int] = []
-        for option in combination:
-            coordinates.update(option["display"])
-            proposal.update(option["proposal"])
-            indices.append(int(option["index"]))
-        signature = coordinate_signature(coordinates)
-        if signature in coordinate_keys:
-            raise GridValidationError(f"duplicate exact display coordinate at ordinal {ordinal}")
-        coordinate_keys.add(signature)
-        candidate_id = f"grid_{grid_spec.id}_p{ordinal:06d}"
-        observation_proposal = {
-            name: value
-            for name, value in proposal.items()
-            if compiler.schema.descriptor(name).lowering_path.startswith("evaluate_batch.")
-        }
-        candidate_proposal = {
-            name: value
-            for name, value in proposal.items()
-            if not compiler.schema.descriptor(name).lowering_path.startswith("evaluate_batch.")
-        }
+        for options in self.axis_options:
+            names = tuple(name for name, _ in options[0][0])
+            if any(name not in remaining for name in names):
+                raise GridValidationError("coordinate does not contain every grid axis")
+            partial = {name: remaining.pop(name) for name in names}
+            signature = coordinate_signature(partial)
+            matches = [
+                index
+                for index, (display, _) in enumerate(options)
+                if coordinate_signature(_thaw(display)) == signature
+            ]
+            if len(matches) != 1:
+                raise GridValidationError("coordinate is not an exact grid point")
+            indices.append(matches[0])
+        if remaining:
+            raise GridValidationError("coordinate contains fields outside the grid axes")
+        ordinal = 0
+        for index, size in zip(indices, self.coordinate_shape, strict=True):
+            ordinal = ordinal * size + index
+        return ordinal
+
+    def iter_points(self, ranges: Sequence[tuple[int, int]]) -> Iterator[GridPoint]:
+        """Compile sorted, non-overlapping half-open ordinal ranges lazily."""
+        previous_end = 0
+        for start, end in ranges:
+            if (
+                isinstance(start, bool)
+                or isinstance(end, bool)
+                or not isinstance(start, int)
+                or not isinstance(end, int)
+                or start < previous_end
+                or start < 0
+                or end <= start
+                or end > self.pool_count
+            ):
+                raise GridValidationError("grid ranges must be sorted valid half-open ranges")
+            yield from (self.point_at(ordinal) for ordinal in range(start, end))
+            previous_end = end
+
+    def point_at(self, ordinal: int) -> GridPoint:
+        """Compile one mixed-radix ordinal; the final axis changes fastest."""
+        from ..evaluation.grouping import CompiledEvaluation, SessionGroupKey
+        from ..evaluation.plans import CandidatePlanError
+
+        if isinstance(ordinal, bool) or not isinstance(ordinal, int):
+            raise TypeError("grid ordinal must be an integer")
+        if ordinal < 0 or ordinal >= self.pool_count:
+            raise IndexError(f"grid ordinal {ordinal} outside [0, {self.pool_count})")
+        indices = self.coordinate_indices_at(ordinal)
+
+        coordinates: dict[str, Any] = {}
+        proposal = {name: _thaw(value) for name, value in self.static_proposal}
+        for axis_index, option_index in enumerate(indices):
+            display, update = self.axis_options[axis_index][option_index]
+            coordinates.update(_thaw(display))
+            proposal.update(_thaw(update))
+        candidate_proposal, observation_proposal = _split_proposal(self.compiler, proposal)
+        candidate_id = self.candidate_id_at(ordinal)
         try:
-            plan = compiler.compile(
+            candidate = self.compiler.compile(
                 candidate_proposal,
-                open_session=open_session,
-                scenario=scenario,
+                open_session=_baseline_open_session(self.compiler, self.baseline_session_key),
+                scenario=self.scenario_key,
             )
             evaluation = CompiledEvaluation.from_plan(
-                plan,
-                compiler=compiler,
-                artifact_sha256=artifact_sha256,
+                candidate,
+                compiler=self.compiler,
+                artifact_sha256=self.artifact_sha256,
                 observation=observation_proposal,
                 ordinal=ordinal,
                 evaluation_id=candidate_id,
             )
         except CandidatePlanError as exc:
             raise GridValidationError(f"grid point {candidate_id} is invalid: {exc}") from exc
-        points.append(
-            GridPoint(
-                ordinal=ordinal,
-                candidate_id=candidate_id,
-                coordinate_indices=tuple(indices),
-                coordinates=_detach(coordinates),
-                legacy_policy_params=(),
-                legacy_pool_overrides={},
-                coordinate_signature=signature,
-                proposal=tuple(
-                    (name, _freeze_proposal_value(value))
-                    for name, value in sorted(proposal.items())
-                ),
-                evaluation=evaluation,
+        group_id = SessionGroupKey.create(
+            self.artifact_sha256,
+            self.compiler.schema,
+            evaluation.candidate.scenario_key,
+            evaluation.candidate.session_key,
+        ).validated().sha256
+        return GridPoint(
+            ordinal=ordinal,
+            candidate_id=candidate_id,
+            coordinate_indices=indices,
+            coordinates=_immutable(coordinates),
+            evaluation=evaluation,
+            coordinate_signature=coordinate_signature(coordinates),
+            proposal=tuple((name, _freeze(value)) for name, value in sorted(proposal.items())),
+            session_group_id=group_id,
+        )
+
+    def authority_dict(self) -> dict[str, Any]:
+        axes = []
+        for options in self.axis_options:
+            axes.append([
+                {"display": _exact_value(_thaw(display)), "proposal": _exact_value(_thaw(proposal))}
+                for display, proposal in options
+            ])
+        return {
+            "schema_version": GRID_PLAN_SCHEMA_VERSION,
+            "grid_id": self.grid_id,
+            "axes": axes,
+            "static_proposal": _exact_value(_thaw(self.static_proposal)),
+            "artifact_sha256": self.artifact_sha256,
+            "parameter_schema_sha256": self.parameter_schema_sha256,
+            "scenario_key": _key_record(self.scenario_key),
+            "baseline_session_key": _key_record(self.baseline_session_key),
+            "baseline_observation_key": _key_record(self.baseline_observation_key),
+            "coordinate_shape": list(self.coordinate_shape),
+            "pool_count": self.pool_count,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.authority_dict() | {"plan_sha256": self.plan_sha256}
+
+    @classmethod
+    def from_dict(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        compiler: CandidateCompiler,
+        artifact_sha256: str,
+        scenario: ScenarioClosure | ScenarioKey,
+    ) -> CartesianGridPlan:
+        from ..evaluation.plans import ObservationKey, ScenarioKey, SessionKey
+
+        expected = {
+            "schema_version", "grid_id", "axes", "static_proposal", "artifact_sha256",
+            "parameter_schema_sha256", "scenario_key", "baseline_session_key",
+            "baseline_observation_key", "coordinate_shape", "pool_count", "plan_sha256",
+        }
+        if not isinstance(value, Mapping) or set(value) != expected:
+            raise GridValidationError("grid plan fields do not match fxsim_cartesian_grid_v1")
+        authority = {key: value[key] for key in value if key != "plan_sha256"}
+        digest = hashlib.sha256(canonical_json_bytes(authority)).hexdigest()
+        if value["plan_sha256"] != digest:
+            raise GridValidationError("grid plan SHA-256 mismatch")
+        if value["schema_version"] != GRID_PLAN_SCHEMA_VERSION:
+            raise GridValidationError(f"unsupported grid plan schema {value['schema_version']!r}")
+        if value["artifact_sha256"] != artifact_sha256:
+            raise GridValidationError("grid plan evaluator artifact mismatch")
+        if value["parameter_schema_sha256"] != compiler.schema.sha256:
+            raise GridValidationError("grid plan parameter schema mismatch")
+        scenario_key = _load_key(value["scenario_key"], ScenarioKey, "scenario")
+        supplied_scenario = (
+            ScenarioKey.from_closure(scenario) if not isinstance(scenario, ScenarioKey) else scenario
+        ).validated()
+        if scenario_key.validated() != supplied_scenario:
+            raise GridValidationError("grid plan scenario mismatch")
+        session_key = _load_key(value["baseline_session_key"], SessionKey, "session")
+        session_key.validated(compiler.schema)
+        observation_key = _load_key(value["baseline_observation_key"], ObservationKey, "observation")
+        observation_key.validated(compiler.schema)
+
+        raw_axes = value["axes"]
+        if not isinstance(raw_axes, list) or not raw_axes:
+            raise GridValidationError("grid plan axes must be a non-empty array")
+        axes: list[tuple[_AxisOption, ...]] = []
+        coordinate_names: set[str] = set()
+        controlled_names: set[str] = set()
+        for raw_options in raw_axes:
+            if not isinstance(raw_options, list) or not raw_options:
+                raise GridValidationError("grid plan axis options must be non-empty arrays")
+            options: list[_AxisOption] = []
+            axis_coordinates: set[str] | None = None
+            axis_proposals: set[str] | None = None
+            display_signatures: set[str] = set()
+            for raw in raw_options:
+                if not isinstance(raw, Mapping) or set(raw) != {"display", "proposal"}:
+                    raise GridValidationError("grid plan axis option is invalid")
+                if not isinstance(raw["display"], Mapping) or not isinstance(raw["proposal"], Mapping):
+                    raise GridValidationError("grid plan display and proposal must be objects")
+                proposal = _typed_proposal(compiler, raw["proposal"])
+                option_coordinates = set(raw["display"])
+                option_proposals = set(proposal)
+                if not option_coordinates or not option_proposals:
+                    raise GridValidationError("grid plan axis options cannot be empty")
+                if axis_coordinates is None:
+                    axis_coordinates, axis_proposals = option_coordinates, option_proposals
+                    if coordinate_names.intersection(axis_coordinates):
+                        raise GridValidationError("grid plan axes reuse coordinate names")
+                    if controlled_names.intersection(axis_proposals):
+                        raise GridValidationError("grid plan axes reuse proposal descriptors")
+                    coordinate_names.update(axis_coordinates)
+                    controlled_names.update(axis_proposals)
+                elif option_coordinates != axis_coordinates or option_proposals != axis_proposals:
+                    raise GridValidationError("grid plan axis option ownership is inconsistent")
+                signature = coordinate_signature(raw["display"])
+                if signature in display_signatures:
+                    raise GridValidationError("grid plan axis has duplicate display coordinates")
+                display_signatures.add(signature)
+                options.append((_freeze(raw["display"]), _freeze(proposal)))
+            axes.append(tuple(options))
+        shape = tuple(int(item) for item in value["coordinate_shape"])
+        if shape != tuple(len(options) for options in axes):
+            raise GridValidationError("grid plan coordinate_shape does not match its axes")
+        count = 1
+        for size in shape:
+            count *= size
+        if value["pool_count"] != count:
+            raise GridValidationError("grid plan pool_count does not match coordinate_shape")
+        static = _typed_proposal(compiler, value["static_proposal"])
+        if controlled_names.intersection(static):
+            raise GridValidationError("grid plan static proposal overlaps an axis")
+        plan = cls(
+            grid_id=str(value["grid_id"]),
+            axis_options=tuple(axes),
+            static_proposal=tuple((name, _freeze(item)) for name, item in sorted(static.items())),
+            artifact_sha256=artifact_sha256,
+            parameter_schema_sha256=compiler.schema.sha256,
+            scenario_key=scenario_key,
+            baseline_session_key=session_key,
+            baseline_observation_key=observation_key,
+            coordinate_shape=shape,
+            pool_count=count,
+            plan_sha256=digest,
+            compiler=compiler,
+        )
+        candidate, observation = _split_proposal(compiler, static)
+        baseline = compiler.compile(
+            candidate,
+            open_session=_baseline_open_session(compiler, session_key),
+            scenario=scenario_key,
+        )
+        if baseline.session_key != session_key:
+            raise GridValidationError("grid plan static proposal does not match baseline session")
+        if compiler.compile_observation(observation)[0] != observation_key:
+            raise GridValidationError("grid plan static proposal does not match baseline observation")
+        if plan.to_dict() != dict(value):
+            raise GridValidationError("grid plan is not canonically encoded")
+        return plan
+
+
+def _typed_proposal(compiler: CandidateCompiler, value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or any(not isinstance(name, str) for name in value):
+        raise GridValidationError("grid plan proposal must be an object")
+    result: dict[str, Any] = {}
+    for name, item in value.items():
+        descriptor = compiler.schema.descriptor(name)
+        if descriptor.value_type == "integer":
+            item = int(item)
+        elif descriptor.value_type == "real" and isinstance(item, str):
+            item = Decimal(str(item))
+        elif descriptor.value_type == "real_pair":
+            item = tuple(
+                Decimal(str(part)) if isinstance(part, str) else part for part in item
             )
-        )
-    if len(points) != grid_spec.pool_count:
-        raise GridValidationError(
-            f"expanded {len(points)} points, expected {grid_spec.pool_count}"
-        )
-    groups = group_evaluations(
-        tuple(point.evaluation for point in points if point.evaluation is not None),
-        artifact_sha256=artifact_sha256,
-        parameter_schema=compiler.schema,
-    )
-    group_by_evaluation = {
-        evaluation.evaluation_id: group.key.sha256
-        for group in groups
-        for evaluation in group.evaluations
-    }
-    return tuple(
-        replace(
-            point,
-            session_group_id=group_by_evaluation[point.evaluation.evaluation_id],
-        )
-        for point in points
-    )
+        result[name] = item
+    return result
 
 
-def expand_grid(
+def _named_axis_options(
+    axis: AxisSpec,
+    compiler: CandidateCompiler,
+    snapped: dict[str, int],
+    collapsed: dict[str, int],
+) -> tuple[_AxisOption, ...]:
+    from ..evaluation.plans import CandidatePlanError
+
+    values = axis.rows if axis.is_coupled else tuple((value,) for value in axis.values)
+    names = axis.names if axis.is_coupled else (axis.name,)
+    targets = axis.targets or tuple(AxisTarget(path=tuple(name.split("."))) for name in names)
+    if axis.is_coupled and len(targets) != len(names):
+        raise GridValidationError(f"axis {axis.name!r} must declare one target per coordinate")
+    if not targets:
+        raise GridValidationError(f"axis {axis.name!r} has no canonical targets")
+    try:
+        descriptors = tuple(compiler.schema.descriptor(target.proposal_name) for target in targets)
+    except CandidatePlanError as exc:
+        raise GridValidationError(f"axis {axis.name!r} has an unknown canonical target") from exc
+    if len({item.name for item in descriptors}) != len(descriptors):
+        raise GridValidationError(f"axis {axis.name!r} declares a canonical target twice")
+
+    options: list[_AxisOption] = []
+    requested_keys: set[str] = set()
+    executed_keys: set[str] = set()
+    for row in values:
+        requested = coordinate_signature(dict(zip(names, row, strict=True)))
+        if requested in requested_keys:
+            raise GridValidationError(f"axis {axis.name!r} has a duplicate display coordinate")
+        requested_keys.add(requested)
+        display: dict[str, Any] = {}
+        proposal: dict[str, Any] = {}
+        bindings = (
+            tuple(zip(names, targets, descriptors, row, strict=True))
+            if axis.is_coupled
+            else tuple((axis.name, target, descriptor, row[0]) for target, descriptor in zip(targets, descriptors, strict=True))
+        )
+        inverse_display: list[Any] = []
+        for coordinate_name, target, descriptor, value in bindings:
+            executed = target.transform_proposal_value(value)
+            displayed = value
+            if descriptor.value_type in {"integer", "real"}:
+                try:
+                    quantum = Decimal(str(descriptor.quantum))
+                except InvalidOperation:
+                    quantum = {
+                        "binary64_fraction_or_1e10": Decimal("1e-10"),
+                        "binary64_from_wad_1e18": Decimal("1e-18"),
+                    }.get(descriptor.wire_representation, Decimal(0))
+                try:
+                    minimum = Decimal(str(descriptor.minimum))
+                except InvalidOperation:
+                    minimum = Decimal(0)
+                try:
+                    semantic = (
+                        value * target.scale / target.display_scale
+                        if target.kind in {"decimal", "integer", "bps"}
+                        else executed
+                    )
+                    number = Decimal(str(semantic))
+                except (ArithmeticError, TypeError, ValueError) as exc:
+                    raise GridValidationError(f"axis {axis.name!r} cannot invert {descriptor.name!r}") from exc
+                if quantum > 0:
+                    with localcontext() as context:
+                        context.prec = 80
+                        tick = ((number - minimum) / quantum).to_integral_value(rounding=ROUND_HALF_EVEN)
+                        executed = minimum + tick * quantum
+                if Decimal(str(executed)) != number:
+                    snapped[descriptor.name] = snapped.get(descriptor.name, 0) + 1
+                displayed = Decimal(str(executed)) * target.display_scale / target.scale
+            inverse_display.append(displayed)
+            if axis.is_coupled:
+                display[coordinate_name] = _exact_value(displayed)
+            proposal[descriptor.name] = int(executed) if descriptor.value_type == "integer" else executed
+        if not axis.is_coupled:
+            canonical_display = inverse_display[0]
+            if any(item != canonical_display for item in inverse_display[1:]):
+                raise GridValidationError(f"axis {axis.name!r} targets do not share one snapped coordinate")
+            display[axis.name] = _exact_value(canonical_display)
+        signature = coordinate_signature(display)
+        if signature in executed_keys:
+            collapsed[axis.name] = collapsed.get(axis.name, 0) + 1
+            continue
+        executed_keys.add(signature)
+        options.append((_freeze(display), _freeze(proposal)))
+    return tuple(options)
+
+
+def compile_grid_plan(
     grid_spec: GridSpec,
     *,
-    policy_spec: PolicySpec | None = None,
-    registry: Mapping[str, ParameterDim] | None = None,
-) -> tuple[GridPoint, ...]:
-    """Legacy raw/path-authoritative Cartesian expansion.
+    compiler: CandidateCompiler,
+    artifact_sha256: str,
+    open_session: Mapping[str, object],
+    scenario: ScenarioClosure | ScenarioKey,
+    snap_receipt: MutableMapping[str, Any] | None = None,
+) -> CartesianGridPlan:
+    """Resolve only axes and immutable identities; never enumerate grid points."""
+    from ..evaluation.plans import CandidatePlanError, ScenarioKey
 
-    When a compiled policy is supplied, its named defaults are the sole source
-    of the dense request vector. Grid axes may overwrite declared policy
-    names; the resulting request is emitted in PolicySpec declaration order.
+    if not isinstance(grid_spec.static_overrides, Mapping) or any(
+        not isinstance(name, str) for name in grid_spec.static_overrides
+    ):
+        raise GridValidationError("static_overrides must use canonical string names")
+    base = dict(grid_spec.static_overrides)
+    try:
+        for name in base:
+            compiler.schema.descriptor(name)
+    except CandidatePlanError as exc:
+        raise GridValidationError(f"static override {name!r} is not canonical") from exc
 
-    With a ``registry`` (``build_parameter_registry`` output), axis targets
-    may additionally name registered pool parameters (their override paths are
-    validated against the registry) alongside policy targets; unknown paths
-    remain allowed.  Without a registry the compiled-policy grid contract is
-    strictly policy_params-only, exactly as before.
-    """
-    parameter_names: tuple[str, ...] | None = None
-    base_overrides = dict(grid_spec.static_overrides)
-    if policy_spec is not None:
-        parameter_names = tuple(parameter.name for parameter in policy_spec.parameters)
-        if not parameter_names:
-            raise GridValidationError(f"policy {policy_spec.id!r} declares no parameters")
-        unexpected_static = sorted(set(base_overrides) - {"policy_params"})
-        if unexpected_static:
-            raise GridValidationError(
-                "compiled-policy grids accept only policy_params; pool overrides are out of scope: "
-                + ", ".join(unexpected_static)
-            )
-        configured = base_overrides.get("policy_params", {})
-        if not isinstance(configured, Mapping):
-            raise GridValidationError("static_overrides.policy_params must be a named mapping")
-        unknown = sorted(set(str(key) for key in configured) - set(parameter_names))
-        if unknown:
-            raise GridValidationError(
-                "static policy_params are not declared by PolicySpec: " + ", ".join(unknown)
-            )
-        defaults: dict[str, Any] = {}
-        for parameter in policy_spec.parameters:
-            if parameter.default is None:
-                raise GridValidationError(
-                    f"policy parameter {parameter.name!r} has no default for grid expansion"
-                )
-            defaults[parameter.name] = parameter.validate_value(parameter.default)
-        defaults.update(dict(configured))
-        base_overrides = {"policy_params": defaults}
-
-    coordinate_names: list[str] = []
-    target_paths: list[tuple[str, ...]] = []
-    axis_options: list[tuple[dict[str, Any], ...]] = []
+    coordinate_names: set[str] = set()
+    controlled_names: set[str] = set()
+    axes: list[tuple[_AxisOption, ...]] = []
+    snapped: dict[str, int] = {}
+    collapsed: dict[str, int] = {}
+    collapsed_axes: list[str] = []
     for axis in grid_spec.axes:
-        names = list(axis.names) if axis.is_coupled else [axis.name]
-        for name in names:
-            if name in coordinate_names:
-                raise GridValidationError(f"grid coordinate name {name!r} is declared twice")
-            coordinate_names.append(name)
-        for target in axis.targets:
-            if policy_spec is not None:
-                if registry is not None:
-                    if target.path and target.path[0] == "policy_params":
-                        if (
-                            len(target.path) != 2
-                            or target.path[1] not in registry
-                            or registry[target.path[1]].kind != "policy"
-                        ):
-                            raise GridValidationError(
-                                f"compiled-policy grid target {'.'.join(target.path)!r} must be "
-                                "policy_params.<registered policy parameter>"
-                            )
-                elif (
-                    len(target.path) != 2
-                    or target.path[0] != "policy_params"
-                    or target.path[1] not in parameter_names
-                ):
-                    raise GridValidationError(
-                        f"compiled-policy grid target {'.'.join(target.path)!r} must be "
-                        "policy_params.<PolicySpec parameter name>"
-                    )
-            if target.path and target.path in target_paths:
-                raise GridValidationError(
-                    f"evaluator target {'.'.join(target.path)!r} is controlled by multiple axes"
-                )
-            target_paths.append(target.path)
-        # Registered coordinate names must write exactly their canonical
-        # registry path; names absent from the registry stay free-form.
-        if registry is not None:
-            for index, name in enumerate(names):
-                spec = registry.get(name)
-                if spec is None:
-                    continue
-                expected = (
-                    ("policy_params", name)
-                    if spec.kind == "policy"
-                    else spec.target_path
-                )
-                target = (
-                    axis.targets[index]
-                    if axis.is_coupled and axis.targets and index < len(axis.targets)
-                    else axis.targets[0] if axis.targets else None
-                )
-                if target is not None and target.path != expected:
-                    raise GridValidationError(
-                        f"grid coordinate {name!r} must target "
-                        f"{'.'.join(expected)}, got {'.'.join(target.path)}"
-                    )
-        options = _axis_options(axis)
+        names = axis.names if axis.is_coupled else (axis.name,)
+        duplicates = coordinate_names.intersection(names)
+        if duplicates:
+            raise GridValidationError("duplicate coordinate names: " + ", ".join(sorted(duplicates)))
+        coordinate_names.update(names)
+        options = _named_axis_options(axis, compiler, snapped, collapsed)
         if not options:
             raise GridValidationError(f"axis {axis.name!r} has no finite values")
-        axis_options.append(options)
+        if axis.size > 1 and len(options) < 2:
+            collapsed_axes.append(axis.name)
+        option_names = {name for name, _ in options[0][1]}
+        duplicates = controlled_names.intersection(option_names)
+        if duplicates:
+            raise GridValidationError("proposal names controlled by multiple axes: " + ", ".join(sorted(duplicates)))
+        controlled_names.update(option_names)
+        axes.append(options)
+    if controlled_names.intersection(base):
+        raise GridValidationError("static proposal names cannot also be controlled by axes")
+    if snapped:
+        details = ", ".join(f"{name}={count}" for name, count in sorted(snapped.items()))
+        warnings.warn(
+            f"grid {grid_spec.id!r} snapped axis values (adjusted={sum(snapped.values())}, "
+            f"collapsed={sum(collapsed.values())}; {details})",
+            UserWarning,
+            stacklevel=2,
+        )
+    if snap_receipt is not None:
+        snap_receipt.clear()
+        snap_receipt.update(
+            adjusted_count=sum(snapped.values()),
+            collapsed_count=sum(collapsed.values()),
+            adjusted_by_descriptor=dict(sorted(snapped.items())),
+        )
+    if collapsed_axes:
+        raise GridValidationError("axes collapsed after schema snapping: " + ", ".join(collapsed_axes))
 
-    points: list[GridPoint] = []
-    coordinate_keys: set[str] = set()
-    for ordinal, combination in enumerate(itertools.product(*axis_options)):
-        coordinates: dict[str, Any] = {}
-        indices: list[int] = []
-        updates: list[Mapping[str, Any]] = []
-        for option in combination:
-            coordinates.update(option["display"])
-            indices.append(int(option["index"]))
-            updates.append(option["overrides"])
-        signature = coordinate_signature(coordinates)
-        if signature in coordinate_keys:
-            raise GridValidationError(f"duplicate exact display coordinate at ordinal {ordinal}")
-        coordinate_keys.add(signature)
-        policy_params, pool_overrides = _split_request_overrides(
-            _merge_axis_overrides(base_overrides, updates),
-            parameter_names=parameter_names,
-        )
-        if grid_spec.fee_equalize and "mid_fee" in pool_overrides:
-            # Legacy fee_equalize semantics: out_fee mirrors mid_fee for
-            # every cell (generate_pools_nd.py: out_fee = mid if fee_equalize).
-            if "out_fee" in pool_overrides and pool_overrides["out_fee"] != pool_overrides["mid_fee"]:
-                raise GridValidationError(
-                    "fee_equalize grid may not override out_fee independently of mid_fee"
-                )
-            pool_overrides = dict(pool_overrides)
-            pool_overrides["out_fee"] = pool_overrides["mid_fee"]
-        points.append(
-            GridPoint(
-                ordinal=ordinal,
-                candidate_id=f"grid_{grid_spec.id}_p{ordinal:06d}",
-                coordinate_indices=tuple(indices),
-                coordinates=_detach(coordinates),
-                legacy_policy_params=policy_params,
-                legacy_pool_overrides=pool_overrides,
-                coordinate_signature=signature,
-            )
-        )
-    if len(points) != grid_spec.pool_count:
-        raise GridValidationError(
-            f"expanded {len(points)} points, expected {grid_spec.pool_count}"
-        )
-    return tuple(points)
+    candidate, observation = _split_proposal(compiler, base)
+    baseline = compiler.compile(candidate, open_session=open_session, scenario=scenario)
+    observation_key = compiler.compile_observation(observation)[0]
+    scenario_key = (
+        ScenarioKey.from_closure(scenario) if not isinstance(scenario, ScenarioKey) else scenario
+    ).validated()
+    shape = tuple(len(options) for options in axes)
+    count = 1
+    for size in shape:
+        count *= size
+    provisional = CartesianGridPlan(
+        grid_id=grid_spec.id,
+        axis_options=tuple(axes),
+        static_proposal=tuple((name, _freeze(value)) for name, value in sorted(base.items())),
+        artifact_sha256=artifact_sha256,
+        parameter_schema_sha256=compiler.schema.sha256,
+        scenario_key=scenario_key,
+        baseline_session_key=baseline.session_key,
+        baseline_observation_key=observation_key,
+        coordinate_shape=shape,
+        pool_count=count,
+        plan_sha256="",
+        compiler=compiler,
+    )
+    digest = hashlib.sha256(canonical_json_bytes(provisional.authority_dict())).hexdigest()
+    return CartesianGridPlan(
+        grid_id=provisional.grid_id,
+        axis_options=provisional.axis_options,
+        static_proposal=provisional.static_proposal,
+        artifact_sha256=provisional.artifact_sha256,
+        parameter_schema_sha256=provisional.parameter_schema_sha256,
+        scenario_key=provisional.scenario_key,
+        baseline_session_key=provisional.baseline_session_key,
+        baseline_observation_key=provisional.baseline_observation_key,
+        coordinate_shape=provisional.coordinate_shape,
+        pool_count=provisional.pool_count,
+        plan_sha256=digest,
+        compiler=compiler,
+    )
+
+
+__all__ = [
+    "GRID_PLAN_SCHEMA_VERSION",
+    "CartesianGridPlan",
+    "GridPoint",
+    "GridValidationError",
+    "compile_grid_plan",
+    "coordinate_signature",
+]

@@ -1,0 +1,38 @@
+{
+  "pools": [
+    {
+      "tag": "eurusd_native_fx",
+      "pool": {
+        "initial_liquidity": [
+          "499999999999999991611392",
+          "452779614050656993673216"
+        ],
+        "A": "500000",
+        "gamma": "100000000000000",
+        "mid_fee": "0",
+        "out_fee": "0",
+        "fee_gamma": "100000000000000000",
+        "adjustment_step_min": "0",
+        "adjustment_step_max": "5000000000000000",
+        "ma_time": "5194",
+        "reserved_profit_fraction": "1000000000",
+        "admin_fee": "0",
+        "policy": {
+          "kind": "none"
+        },
+        "initial_price": "1104290000000000000",
+        "start_timestamp": "1704146400",
+        "donation_apy": "0.01",
+        "donation_frequency": "3600",
+        "donation_duration": "604800",
+        "donation_coins_ratio": "0.5"
+      },
+      "costs": {
+        "arb_fee_bps": 10,
+        "gas_coin0": 0.0,
+        "use_volume_cap": false,
+        "volume_cap_mult": 1
+      }
+    }
+  ]
+}

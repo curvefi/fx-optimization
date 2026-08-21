@@ -3,7 +3,6 @@ from __future__ import annotations
 from decimal import Decimal
 from pathlib import Path
 import pytest
-from curve_fx_sim.grids.model import expand_grid
 from curve_fx_sim.specs.common import (
     SpecError,
     canonical_decimal,
@@ -11,9 +10,10 @@ from curve_fx_sim.specs.common import (
     canonical_primitive,
     format_exact_decimal,
 )
-from curve_fx_sim.specs.grid import AxisSpec, AxisTarget, GridSpec
+from curve_fx_sim.specs.grid import AxisSpec, AxisTarget, _generate_range_values
 from curve_fx_sim.specs.pair import load_pair_spec
 from curve_fx_sim.specs.policy import PolicyParameter, PolicySpec
+from curve_fx_sim.specs.registry import SpecRegistry
 from curve_fx_sim.specs.scenario import ScenarioSpec, load_scenario_spec
 
 
@@ -31,6 +31,23 @@ def test_canonical_values_and_json_bytes() -> None:
     primitive = canonical_primitive(data)
     assert primitive == {"a": 10, "b": "0.0001", "c": ["1.5", 2]}
     assert canonical_json_bytes({"z": 1, "a": 2}) == b'{"a":2,"z":1}'
+
+
+def test_log_ranges_and_spec_resolution_are_decimal_and_syntax_driven(repo_root: Path) -> None:
+    values = _generate_range_values(
+        {"start": "1e-500", "stop": "1e-100", "num": 3, "scale": "log"}, "x"
+    )
+    assert values == [Decimal("1e-500"), Decimal("1e-300"), Decimal("1e-100")]
+
+    configured = repo_root / "configs" / "pairs" / "same.toml"
+    configured.write_text("configured", encoding="utf-8")
+    explicit = repo_root / "same.toml"
+    explicit.write_text("explicit", encoding="utf-8")
+    registry = SpecRegistry.from_root(repo_root)
+    assert registry.resolve("pair", "same.toml") == configured.resolve()
+    assert registry.resolve("pair", "./same.toml") == explicit.resolve()
+    with pytest.raises(ValueError, match="explicit specification path required"):
+        registry.resolve("pair", "same.toml", explicit_only=True)
 
 
 def test_pair_and_scenario_spec_loaders(repo_root: Path) -> None:
@@ -105,18 +122,5 @@ def test_spec_validation_table() -> None:
         ScenarioSpec.from_dict({**base, "start_time": 10, "end_time": 9})
     with pytest.raises(SpecError, match="yb_cash_multiplier must be positive"):
         ScenarioSpec.from_dict({**base, "yb_cash_multiplier": 0})
-    grid = GridSpec(
-        id="demo_grid",
-        pair_id="chfusd",
-        axes=(
-            AxisSpec(name="A", values=(Decimal("100"), Decimal("200")), targets=(AxisTarget(path=("A",), kind="integer"),)),
-            AxisSpec(name="fee_bps", values=(Decimal("5"), Decimal("10"), Decimal("20")), targets=(AxisTarget(path=("mid_fee",), display_scale=Decimal("10000"), kind="decimal"),)),
-        ),
-        static_overrides={"gamma": 0.0001},
-    )
-    points = expand_grid(grid)
-    assert grid.pool_count == len(points) == 6
-    assert points[0].coordinates == {"A": 100, "fee_bps": 5}
-    assert points[0].pool_overrides == {"A": 100, "mid_fee": 0.0005, "gamma": 0.0001}
     with pytest.raises(SpecError, match="targets but 2 names"):
         AxisSpec(name="coupled", names=("col1", "col2"), targets=(AxisTarget(path=("p1",)),), rows=((Decimal("1"), Decimal("2")),))

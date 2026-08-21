@@ -1,4 +1,4 @@
-"""Evaluator identity, harness client adapter, and selection normalization."""
+"""Evaluator artifacts, identity, and selection normalization."""
 
 from .builder import (
     BuildSpec,
@@ -8,7 +8,6 @@ from .builder import (
     build_receipt,
     load_evaluator_artifact,
 )
-from .client import HarnessClient, ScenarioHarnessClient, SubprocessHarnessClient
 from .identity import VerifiedEvaluator, inspect_binary_identity, validate_evaluator_identity
 from .grouping import (
     CompiledEvaluation,
@@ -48,9 +47,6 @@ __all__ = [
     "validate_evaluator_identity",
     "SelectedEvaluator",
     "materialize_selected_evaluator",
-    "HarnessClient",
-    "ScenarioHarnessClient",
-    "SubprocessHarnessClient",
     "LocalSessionMaterialization",
     "LocalSessionTransportReceipt",
     "SessionMaterializationError",

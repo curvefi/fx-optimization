@@ -26,9 +26,9 @@ uv run --frozen --no-sync fxsim optimize run \
   --run-id opt_example_pool_dims
 ```
 
-`example-pool-dims.toml` uses Nevergrad TwoPointsDE with three canonical dimensions. The optimize command accepts the spec, `--run-id`, `--resume`, and `--output-root`; transport options do not change candidate translation. Grouped blade artifact mode must be launched/build-selected on the configured Linux coordinator; no live blade proof is claimed here.
+`example-pool-dims.toml` uses Nevergrad TwoPointsDE with three canonical dimensions. The optimize command accepts the spec, `--run-id`, and `--resume`; transport options do not change candidate translation. Grouped blade artifact mode must be launched/build-selected on the configured Linux coordinator; no live blade proof is claimed here.
 
-`--resume` reopens `checkpoint.json` only when immutable identity (pair, policy, score key, lattice/spec closure, evaluator identity, and scenario inputs) matches. Do not edit a run in place:
+`--resume` reconciles the incremental NPZ table with `checkpoint.json` when immutable identity (pair, policy, score key, lattice/spec closure, evaluator identity, and scenario inputs) matches; if the table is ahead, it can replay that table-ahead prefix before continuing. Do not edit a run in place:
 
 ```sh
 uv run --frozen --no-sync fxsim optimize run \
@@ -43,7 +43,7 @@ A run is immutable below `runs/opt_chfusd_local/` (or the explicit run ID suppli
 
 - `manifest.json`: `fxsim_manifest_v1` identity, resolved spec, execution history, and artifact hashes;
 - `checkpoint.json`: incremental optimizer state, deterministic restart state, evaluated rows, and complete resume identity;
-- `evaluation_table.json`: canonical raw results and the exact `MetricProjection`;
+- `evaluation_table.npz`: canonical numeric raw results and the exact `MetricProjection`;
 - `winner.json`: one `SelectionRef` with `kind = "optimizer_winner"` and policy/scenario lineage;
 - `topk.json`: ranked `SelectionRef` records with the same lineage.
 
@@ -56,7 +56,3 @@ Each optimization row keeps the primary scenario's raw evaluator metrics plus th
 Nevergrad TwoPointsDE searches the exact schema lattice in batches. A run's manifest records algorithm state, schema/lattice, evaluator identity, scenario/template/input hashes, candidate requests, score key, gate settings, and protocol version. Resume rejects any change in that identity. Blade names are execution metadata, not economic inputs.
 
 TMRBCD remains available for existing specifications, but is not the representative artifact-selected path.
-
-## Compatibility-only legacy mode
-
-Direct `--harness` execution and site `remote_binary_path` are compatibility-only binary-selected paths. They do not provide the selected artifact schema authority and are not equivalent to grouped execution.

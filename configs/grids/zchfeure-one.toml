@@ -1,0 +1,14 @@
+[grid]
+id = "zchfeure-one"
+pair_id = "zchfeure"
+tags = ["production", "native-pool", "fx", "gnosis", "single"]
+
+[grid.static_overrides]
+"run.metric_projection" = "summary"
+
+# Single candidate at deployed A=1_000_000 (100 * 10000). Template already encodes deployed pool economics;
+# this axis pins the candidate to exactly one point without searching user flow.
+[[grid.axes]]
+name = "A"
+target = { path = "pool.A", scale = 10000, kind = "integer" }
+values = [100]

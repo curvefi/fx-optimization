@@ -3,14 +3,11 @@
 Renders the exact legacy look: stacked shared-x panels for prices, rolling
 90d annualized LP net APY with GM floor shading, YB releverage APY + balance
 sheet, pool skew with binned pool fee, and 1% TVL slippage, over a datetime
-axis. Inputs are the curve_fx_eval_v1 full-trace sidecars (trace.json
-records + actions.json) written by the harness, which carry the same fields
-the legacy detailed-output used.
+axis. Input is the attested candidate-wide replay NPZ produced by Shift-click.
 """
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -18,6 +15,8 @@ from typing import Any, Mapping, Sequence
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
+
+from .trajectory import load_replay_records
 
 SEC_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
 ROLLING_APY_WINDOW_DAYS = 90
@@ -268,11 +267,8 @@ def _load_embedded_yb_balance_path(detailed: Mapping[str, np.ndarray], max_point
     return result
 
 
-def _load_executed_fee_actions(path: Path | None) -> dict[str, np.ndarray] | None:
-    if path is None or not path.is_file():
-        return None
-    payload = json.loads(path.read_text())
-    actions = payload if isinstance(payload, list) else payload.get("actions") or []
+def _load_executed_fee_actions(path: Path, companion: Path, scenario_index: int) -> dict[str, np.ndarray] | None:
+    actions = load_replay_records(path, companion_path=companion, kind="exchange", scenario_index=scenario_index)
     rows = []
     for action in actions:
         if not isinstance(action, dict) or action.get("type") != "exchange":
@@ -297,19 +293,12 @@ def _load_executed_fee_actions(path: Path | None) -> dict[str, np.ndarray] | Non
     }
 
 
-def _infer_donation_frequency(path: Path | None) -> float:
+def _infer_donation_frequency(path: Path, companion: Path, scenario_index: int) -> float:
     """Infer cadence only when donation action metadata is unambiguous."""
-    if path is None or not path.is_file():
-        return 0.0
     try:
-        payload = json.loads(path.read_text())
+        donations = load_replay_records(path, companion_path=companion, kind="donation", scenario_index=scenario_index)
     except (OSError, TypeError, ValueError):
         return 0.0
-    actions = payload if isinstance(payload, list) else payload.get("actions") or []
-    donations = [
-        action for action in actions
-        if isinstance(action, dict) and action.get("type") == "donation"
-    ]
     if len(donations) < 2:
         return 0.0
 
@@ -573,8 +562,9 @@ def _plot_pool_skew_axis(ax, dates, pool_skew):
 
 def render_shiftclick_figure(
     trace_path: Path,
-    actions_path: Path | None = None,
     *,
+    companion_path: Path,
+    scenario_index: int = 0,
     title: str | None = None,
     fee_source: str = "sampled",
     bin_hours: float = 6.0,
@@ -582,9 +572,8 @@ def render_shiftclick_figure(
     max_points: int = DEFAULT_MAX_POINTS,
     donation_frequency: float | None = None,
 ):
-    """Build the legacy multi-panel shiftclick figure from trace sidecars."""
-    payload = json.loads(Path(trace_path).read_text())
-    records = payload if isinstance(payload, list) else payload.get("records", payload.get("trace", []))
+    """Build the legacy multi-panel view from one replay-archive scenario."""
+    records = load_replay_records(trace_path, companion_path=companion_path, scenario_index=scenario_index)
     detailed = _trace_to_detailed(records)
     timestamps = detailed["timestamps"]
     price_scale = detailed["price_scale"]
@@ -602,7 +591,7 @@ def render_shiftclick_figure(
     lp_xcp_profit = detailed["lp_xcp_profit"]
     donation_apy = detailed["donation_apy"]
     if donation_frequency is None:
-        donation_frequency = _infer_donation_frequency(actions_path)
+        donation_frequency = _infer_donation_frequency(trace_path, companion_path, scenario_index)
     else:
         try:
             donation_frequency = float(donation_frequency)
@@ -646,8 +635,8 @@ def render_shiftclick_figure(
     yb_path = _load_embedded_yb_path(detailed, max_points)
     yb_balance_path = _load_embedded_yb_balance_path(detailed, max_points)
     executed_fee = (
-        _load_executed_fee_actions(actions_path)
-        if actions_path is not None and fee_source in ("executed", "both")
+        _load_executed_fee_actions(trace_path, companion_path, scenario_index)
+        if fee_source in ("executed", "both")
         else None
     )
 

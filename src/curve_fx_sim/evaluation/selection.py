@@ -10,7 +10,7 @@ from typing import Any, Literal, Mapping
 from ..artifacts.attestation import (
     load_attested_evaluation_table as load_verified_evaluation_table,
 )
-from ..grids.model import coordinate_signature
+from ..grids.model import CartesianGridPlan, coordinate_signature
 from ..artifacts.store import RunStore
 from ..artifacts.tables import EvaluationRow, EvaluationTable
 from ..specs.common import (
@@ -127,10 +127,37 @@ def _matches_coordinate(row_coord: Mapping[str, Any] | None, target_coord: Mappi
     )
 
 
-def _select_exact_row(table: EvaluationTable, selection: SelectionRef) -> EvaluationRow:
+def _select_exact_row(
+    table: EvaluationTable, selection: SelectionRef,
+    plan: CartesianGridPlan | None = None,
+) -> EvaluationRow:
     """Select exactly one row, checking every selector supplied by the caller."""
     if selection.index is None and selection.coordinate is None and selection.candidate_id is None:
         raise SpecError("selection requires an index, coordinate, or candidate_id")
+
+    if table.is_columnar_grid:
+        if plan is None:
+            raise SpecError("columnar grid selection requires its Cartesian plan")
+        ordinals: list[int] = []
+        if selection.index is not None:
+            ordinals.append(selection.index)
+        if selection.coordinate is not None:
+            try:
+                ordinals.append(plan.ordinal_at(selection.coordinate))
+            except (TypeError, ValueError) as exc:
+                raise KeyError(f"grid point coordinate {selection.coordinate!r} not found") from exc
+        if selection.candidate_id is not None:
+            prefix = f"grid_{plan.grid_id}_p"
+            suffix = selection.candidate_id.removeprefix(prefix)
+            if not selection.candidate_id.startswith(prefix) or not suffix.isdecimal():
+                raise KeyError(f"grid point candidate_id {selection.candidate_id!r} not found")
+            ordinal = int(suffix)
+            if ordinal >= plan.pool_count or plan.candidate_id_at(ordinal) != selection.candidate_id:
+                raise KeyError(f"grid point candidate_id {selection.candidate_id!r} not found")
+            ordinals.append(ordinal)
+        if len(set(ordinals)) != 1:
+            raise KeyError("grid point selectors do not identify the same exact ordinal")
+        return table.row_at(ordinals[0], plan)
 
     matches: list[EvaluationRow] = []
     for row in table.rows:
@@ -186,46 +213,39 @@ def load_attested_evaluation_table(
     return table
 
 
-def _verify_grid_row(manifest: Mapping[str, Any], row: EvaluationRow) -> None:
+def _verify_grid_row(row: EvaluationRow, plan: CartesianGridPlan) -> None:
     """Bind a selected table row to the canonical compiled grid candidate."""
-    grid = manifest.get("grid")
-    pools = grid.get("pools") if isinstance(grid, Mapping) else None
-    if not isinstance(pools, list):
-        raise SpecError("grid manifest has no canonical pool candidates")
-
-    matches = [
-        pool
-        for pool in pools
-        if isinstance(pool, Mapping) and pool.get("id") == row.candidate_id
-    ]
-    if len(matches) != 1:
-        raise SpecError(
-            f"grid row {row.candidate_id!r} does not identify exactly one canonical pool"
-        )
-    pool = matches[0]
-    if "proposal_evidence" in pool:
-        import json
-
-        try:
-            candidate = json.loads(str(pool["candidate_json"]))
-            expected_params = {"vector": candidate["policy_params"]}
-            expected_overrides = candidate["pool_overrides"]
-        except (KeyError, TypeError, ValueError) as exc:
-            raise SpecError("compiled grid candidate evidence is invalid") from exc
-    else:
-        expected_params = {"vector": list(pool.get("policy_params", ()))}
-        expected_overrides = pool.get("pool_overrides", {})
+    try:
+        point = plan.point_at(row.ordinal)
+    except (IndexError, TypeError, ValueError) as exc:
+        raise SpecError("grid table ordinal is outside its Cartesian plan") from exc
     checks = (
-        ("ordinal", row.ordinal, pool.get("ordinal")),
-        ("coordinates", row.coordinates, pool.get("coordinates")),
-        ("policy vector", row.params, expected_params),
-        ("pool overrides", row.pool_overrides, expected_overrides),
+        ("candidate id", row.candidate_id, point.candidate_id),
+        ("coordinates", row.coordinates, dict(point.coordinates)),
+        ("policy vector", row.params, {"vector": list(point.policy_params)}),
+        ("pool overrides", row.pool_overrides, dict(point.pool_overrides)),
     )
     for label, actual, expected in checks:
         if actual != expected:
             raise SpecError(
-                f"grid row {row.candidate_id!r} {label} does not match canonical manifest pool"
+                f"grid row {row.candidate_id!r} {label} does not match its Cartesian plan"
             )
+
+
+def _load_grid_plan(
+    manifest: Mapping[str, Any], store: RunStore, run_id: str,
+) -> CartesianGridPlan:
+    from ..evaluation.plans import ScenarioKey
+    from ..evaluation.selected import SelectedEvaluator
+    from ..grids.runner import load_grid_plan
+
+    try:
+        selected = SelectedEvaluator.load(store.get_run_dir(run_id) / "evaluator_artifact")
+        raw = manifest["grid"]["plan"]["scenario_key"]
+        scenario = ScenarioKey(str(raw["identity_json"]).encode(), str(raw["sha256"])).validated()
+        return load_grid_plan(manifest, selected_evaluator=selected, scenario=scenario)
+    except Exception as exc:
+        raise SpecError(f"cannot load Cartesian grid plan: {exc}") from exc
 
 
 def normalize_selection(
@@ -301,6 +321,10 @@ def normalize_selection(
     extracted_overrides: dict[str, Any] = {}
     economic_fingerprint: str | None = None
     source_row: EvaluationRow | None = None
+    grid_plan = (
+        _load_grid_plan(manifest, store, selection.run_id)
+        if manifest.get("run_kind") == "grid" else None
+    )
     if selection.kind == "grid_point":
         if (
             selection.index is None
@@ -313,11 +337,12 @@ def normalize_selection(
             table = load_attested_evaluation_table(
                 manifest, store=store, run_id=selection.run_id
             )
-        found_row = _select_exact_row(table, selection)
+        found_row = _select_exact_row(table, selection, grid_plan)
         source_row = found_row
         if manifest.get("run_kind") != "grid":
             raise SpecError("grid_point selection requires a grid run")
-        _verify_grid_row(manifest, found_row)
+        assert grid_plan is not None
+        _verify_grid_row(found_row, grid_plan)
         economic_fingerprint = _copy_row_values(
             found_row, extracted_params, extracted_overrides
         )
@@ -330,10 +355,11 @@ def normalize_selection(
             table = load_attested_evaluation_table(
                 manifest, store=store, run_id=selection.run_id
             )
-        found_row = _select_exact_row(table, selection)
+        found_row = _select_exact_row(table, selection, grid_plan)
         source_row = found_row
         if manifest.get("run_kind") == "grid":
-            _verify_grid_row(manifest, found_row)
+            assert grid_plan is not None
+            _verify_grid_row(found_row, grid_plan)
         economic_fingerprint = _copy_row_values(
             found_row, extracted_params, extracted_overrides
         )
@@ -439,20 +465,23 @@ def compile_selected_replay(
     selected_evaluator: Any,
     materialization: LocalSessionMaterialization,
     yb_off: bool = False,
+    evaluation_id: str | None = None,
 ) -> ReplayPlan:
     """Recompile one selected row through its run-local evaluator evidence."""
     compiler = selected_evaluator.compiler
     row = plan.source_row
     if manifest.get("run_kind") == "grid":
-        from ..grids.runner import load_grouped_grid
+        from ..grids.runner import load_grid_plan
+        from .plans import ScenarioKey
 
-        points, _ = load_grouped_grid(
-            manifest, parameter_schema=compiler.schema,
-            artifact_sha256=selected_evaluator.artifact_sha256)
-        matches = [point for point in points if point.ordinal == row.ordinal and point.candidate_id == row.candidate_id]
-        if len(matches) != 1 or matches[0].evaluation is None:
+        raw = manifest["grid"]["plan"]["scenario_key"]
+        scenario = ScenarioKey(str(raw["identity_json"]).encode(), str(raw["sha256"])).validated()
+        grid_plan = load_grid_plan(
+            manifest, selected_evaluator=selected_evaluator, scenario=scenario
+        )
+        point = grid_plan.point_at(row.ordinal)
+        if point.candidate_id != row.candidate_id:
             raise SpecError("selected grid row has no exact compiled candidate evidence")
-        point = matches[0]
         proposal = point.proposal_dict
         expected_candidate_sha = point.evaluation.candidate.candidate_sha256
         expected_group = point.session_group_id
@@ -463,7 +492,8 @@ def compile_selected_replay(
         lineage = row.params.get("evaluation_lineage")
         if not isinstance(named, Mapping) or not isinstance(lineage, list):
             raise SpecError("selected optimizer row has no named proposal or evaluation lineage")
-        matches = [item for item in lineage if isinstance(item, Mapping) and item.get("evaluation_id") == row.candidate_id]
+        target_id = evaluation_id or row.candidate_id
+        matches = [item for item in lineage if isinstance(item, Mapping) and item.get("evaluation_id") == target_id]
         if len(matches) != 1:
             raise SpecError("selected optimizer row has no exact primary evaluation lineage")
         evidence = matches[0]

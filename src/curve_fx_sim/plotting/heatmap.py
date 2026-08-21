@@ -21,6 +21,7 @@ from matplotlib.widgets import RadioButtons, Slider
 from ..artifacts.io import atomic_write_json
 from ..artifacts.tables import EvaluationTable
 from ..evaluation.selection import SelectionRef
+from ..grids.model import CartesianGridPlan
 from .masked_metrics import (
     MASKED_METRIC_SOURCES,
     SKEW_MASKED_METRICS,
@@ -334,11 +335,12 @@ class HeatmapSelection:
 class HeatmapDataset:
     axes: tuple[HeatmapAxis, ...]
     metrics: Mapping[str, np.ndarray]
-    candidate_ids: np.ndarray
-    ordinals: np.ndarray
-    coordinates: np.ndarray
+    candidate_ids: np.ndarray | None
+    ordinals: np.ndarray | None
+    coordinates: np.ndarray | None
     valid: np.ndarray
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    plan: CartesianGridPlan | None = None
 
     def __post_init__(self) -> None:
         if len(self.axes) < 2:
@@ -352,14 +354,14 @@ class HeatmapDataset:
                 raise HeatmapValidationError(
                     f"metric {name!r} has shape {values.shape}, expected {shape}"
                 )
-        for name, raw in (
-            ("candidate_ids", self.candidate_ids),
-            ("ordinals", self.ordinals),
-            ("coordinates", self.coordinates),
-            ("valid", self.valid),
-        ):
+        for name, raw in (("candidate_ids", self.candidate_ids),
+                          ("ordinals", self.ordinals), ("coordinates", self.coordinates)):
+            if self.plan is not None and raw is None:
+                continue
             if np.asarray(raw).shape != shape:
                 raise HeatmapValidationError(f"{name} does not match heatmap shape {shape}")
+        if np.asarray(self.valid).shape != shape:
+            raise HeatmapValidationError(f"valid does not match heatmap shape {shape}")
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -377,34 +379,6 @@ class HeatmapDataset:
 
     def axis_index(self, key: str) -> int:
         return self.axis_keys.index(self.axis(key).key)
-
-    def _mask(self, spec: MaskSpec) -> np.ndarray:
-        mask = np.asarray(self.valid, dtype=bool).copy()
-        if spec.max_price_diff_bps is not None:
-            source = next(
-                (name for name in ("max_7d_rel_price_diff", "max_rel_price_diff") if name in self.metrics),
-                None,
-            )
-            if source is None:
-                raise HeatmapValidationError("price-difference mask metric is unavailable")
-            mask &= np.abs(self.metrics[source]) <= spec.max_price_diff_bps / 10_000.0
-        if spec.max_skew_percent is not None:
-            if "max_7d_skew" not in self.metrics:
-                raise HeatmapValidationError("skew mask metric is unavailable")
-            mask &= np.abs(self.metrics["max_7d_skew"]) <= spec.max_skew_percent / 100.0
-        if spec.max_final_price_diff_bps is not None:
-            if "final_rel_price_diff" not in self.metrics:
-                raise HeatmapValidationError("final price-difference mask metric is unavailable")
-            mask &= np.abs(self.metrics["final_rel_price_diff"]) <= spec.max_final_price_diff_bps / 10_000.0
-        if spec.slippage_thr_bps is not None or spec.slippage_thr_max_bps is not None:
-            if "tw_real_slippage_1pct" not in self.metrics:
-                raise HeatmapValidationError("slippage mask metric is unavailable")
-            slippage = np.asarray(self.metrics["tw_real_slippage_1pct"], dtype=float)
-            if spec.slippage_thr_bps is not None:
-                mask &= slippage >= spec.slippage_thr_bps / 10_000.0
-            if spec.slippage_thr_max_bps is not None:
-                mask &= slippage <= spec.slippage_thr_max_bps / 10_000.0
-        return mask
 
     def _masked_metric_array(self, name: str, mask: MaskSpec) -> np.ndarray:
         """Apply conditional legacy filters to a masked metric.
@@ -502,7 +476,13 @@ class HeatmapDataset:
             if index < 0 or index >= len(axis.values):
                 raise HeatmapValidationError(f"point index is outside axis {axis.key!r}")
             coordinate.update(axis.coordinate(index))
-        candidate_id = str(self.candidate_ids[location])
+        if self.plan is not None:
+            ordinal = self.plan.ordinal_at(coordinate)
+            candidate_id = self.plan.candidate_id_at(ordinal)
+        else:
+            assert self.candidate_ids is not None and self.ordinals is not None
+            candidate_id = str(self.candidate_ids[location])
+            ordinal = int(self.ordinals[location])
         if not candidate_id:
             raise HeatmapValidationError("selected heatmap cell has no exact candidate")
         if not bool(self.valid[location]):
@@ -513,14 +493,17 @@ class HeatmapDataset:
             metrics[name] = value if math.isfinite(value) else None
         return HeatmapSelection(
             candidate_id=candidate_id,
-            ordinal=int(self.ordinals[location]),
+            ordinal=ordinal,
             coordinates=coordinate,
             metrics=metrics,
             grid_indices=location,
         )
 
     @classmethod
-    def from_table(cls, table: EvaluationTable) -> "HeatmapDataset":
+    def from_table(
+        cls, table: EvaluationTable, *, plan: CartesianGridPlan | None = None,
+        metrics: Sequence[str] | None = None,
+    ) -> "HeatmapDataset":
         """Build the exact dense grid from declared metadata or row coordinates.
 
         Tables with ``metadata["axes"]`` use the declared axes and exact
@@ -528,6 +511,32 @@ class HeatmapDataset:
         fall back to inferring the exact dense axes from the per-row
         coordinates (coordinates_json) via ``grids.analysis``.
         """
+        if table.is_columnar_grid:
+            if plan is None:
+                raise HeatmapValidationError("a columnar Cartesian table requires its grid plan")
+            if plan.pool_count != table.row_count or plan.plan_sha256 != table.plan_sha256:
+                raise HeatmapValidationError("grid plan identity differs from evaluation table")
+            axes = []
+            for options in plan.resolved_axes:
+                names = tuple(options[0])
+                values = tuple(
+                    tuple(option[name] for name in names) if len(names) > 1 else option[names[0]]
+                    for option in options
+                )
+                axes.append(HeatmapAxis(names, values,
+                    "categorical" if len(names) > 1 else _inferred_scale(values)))
+            names = tuple(metrics) if metrics is not None else table.metric_projection.fields
+            unknown = set(names) - set(table.metric_projection.fields)
+            if unknown:
+                raise HeatmapValidationError(f"unknown heatmap metrics: {sorted(unknown)!r}")
+            shape = plan.coordinate_shape
+            metric_arrays = {name: table.metric_array(name).reshape(shape) for name in names}
+            valid = np.fromiter(
+                (table.status_at(ordinal) == "ok" for ordinal in range(table.row_count)),
+                dtype=np.bool_, count=table.row_count,
+            ).reshape(shape)
+            return cls(tuple(axes), metric_arrays, None, None, None, valid,
+                       dict(table.metadata), plan)
         axes_raw = table.metadata.get("axes")
         if axes_raw is None or axes_raw == []:
             return cls._from_coordinates(table)

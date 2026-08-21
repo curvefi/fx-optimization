@@ -6,7 +6,7 @@ import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Sequence
 
 from curve_fx_harness_client import EvaluatorClient
@@ -39,7 +39,9 @@ class GroupedExecutionResult:
     workers: int
 
 
-def _default_client(selected: SelectedEvaluator, work_dir: Path) -> EvaluatorClient:
+def _default_client(
+    selected: SelectedEvaluator, work_dir: Path, evaluator_workers: int
+) -> EvaluatorClient:
     identity = selected.verified_evaluator.identity
     return EvaluatorClient(
         selected.binary_path,
@@ -48,6 +50,12 @@ def _default_client(selected: SelectedEvaluator, work_dir: Path) -> EvaluatorCli
         expected_policy_source_sha256=identity.policy_source_sha256,
         expected_policy_abi=identity.policy_abi,
         expected_policy_parameter_count=identity.policy_parameter_count,
+        launch_argv=[
+            selected.binary_path,
+            "serve",
+            "--workers",
+            str(evaluator_workers),
+        ],
     )
 
 
@@ -60,7 +68,9 @@ def execute_local_groups(
     work_dir: Path,
     chunk_size: int,
     max_workers: int,
-    client_factory: Callable[[SelectedEvaluator, Path], Any] = _default_client,
+    evaluator_workers: int = 1,
+    artifact_dir: str | None = None,
+    client_factory: Callable[[SelectedEvaluator, Path], Any] | None = None,
 ) -> GroupedExecutionResult:
     """Evaluate homogeneous chunks through persistent group-owned client lanes."""
     values = tuple(groups)
@@ -74,9 +84,13 @@ def execute_local_groups(
 
     ordered = tuple(evaluation_ids)
     by_id = {row.evaluation_id: row for row in evaluations}
+    artifact_path = PurePosixPath(artifact_dir) if artifact_dir is not None else None
     if (
         chunk_size < 1
         or max_workers < 1
+        or evaluator_workers < 1
+        or artifact_path is not None
+        and (not artifact_dir or artifact_path.is_absolute() or ".." in artifact_path.parts or str(artifact_path) != artifact_dir)
         or len(ordered) != len(set(ordered))
         or any(not value or value not in by_id for value in ordered)
     ):
@@ -128,7 +142,11 @@ def execute_local_groups(
         ):
             raise GroupedExecutionError("binding session request hash mismatch")
         request = json.loads(binding.session_request_json)
-        client = client_factory(selected, Path(work_dir))
+        client = (
+            client_factory(selected, Path(work_dir))
+            if client_factory is not None
+            else _default_client(selected, Path(work_dir), evaluator_workers)
+        )
         primary = None
         cleanup = []
         opened = False
@@ -150,6 +168,10 @@ def execute_local_groups(
             for observation, rows in chunks:
                 fragment = observation.key.request_fragment(selected.compiler.schema)
                 observation_spec = ObservationSpec.model_validate(fragment.pop("observation", {}))
+                if artifact_dir is not None:
+                    observation_spec = observation_spec.model_copy(
+                        update={"artifact_dir": artifact_dir}
+                    )
                 projection = fragment.pop("metric_projection", "summary")
                 if fragment:
                     raise GroupedExecutionError("unsupported evaluate_batch observation fields")

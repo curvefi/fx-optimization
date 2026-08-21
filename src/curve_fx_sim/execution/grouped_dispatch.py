@@ -32,7 +32,7 @@ def dispatch_grouped_evaluations(
     run_root: Path, run_id: str, selected: SelectedEvaluator,
     evaluations: Sequence[CompiledEvaluation], scenarios: Sequence[ScenarioSpec],
     evaluation_ids_by_blade: Mapping[str, Sequence[str]], repository: Path,
-    site: SiteProfile, chunk_size: int, lane_count: int,
+    site: SiteProfile, chunk_size: int, evaluator_workers: int,
     request_namespace: str, ssh: SSHProcessAdapter,
 ) -> GroupedDispatch:
     """Dispatch exact grouped evaluation coverage across remote blades."""
@@ -81,7 +81,7 @@ def dispatch_grouped_evaluations(
         request_id = f"{request_namespace}_{blade}"
         request = GroupedWorkRequest(
             run_id, request_id, request_values, tuple(scenarios),
-            canonical_json_bytes(selected.provenance), chunk_size, lane_count, package_sha,
+            canonical_json_bytes(selected.provenance), chunk_size, evaluator_workers, package_sha,
         ).validated()
         request_path = run_root / "grouped_requests" / f"{request_id}.json"
         receipt_path = run_root / "grouped_receipts" / f"{request_id}.json"

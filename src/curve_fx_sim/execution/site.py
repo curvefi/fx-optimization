@@ -208,35 +208,20 @@ class ClusterConfig:
 
 @dataclass(frozen=True)
 class HarnessConfig:
-    """Harness executable settings."""
+    """Evaluator request batching and timeout settings."""
 
-    binary_name: str = "arb_evaluator_ld"
-    remote_binary_path: PurePosixPath | None = None
-    default_real: str = "longdouble"
     timeout_seconds: int = 3600
-    persistent_evaluator: bool = True
     chunk_size: int = 2048
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> HarnessConfig:
         _reject_unknown(
             data,
-            {
-                "binary_name", "remote_binary_path", "default_real",
-                "timeout_seconds", "persistent_evaluator", "chunk_size",
-            },
+            {"timeout_seconds", "chunk_size"},
             "harness",
         )
         return cls(
-            binary_name=str(data.get("binary_name", "arb_evaluator_ld")),
-            remote_binary_path=(
-                PurePosixPath(str(data["remote_binary_path"]))
-                if data.get("remote_binary_path")
-                else None
-            ),
-            default_real=str(data.get("default_real", "longdouble")),
             timeout_seconds=int(data.get("timeout_seconds", 3600)),
-            persistent_evaluator=bool(data.get("persistent_evaluator", True)),
             chunk_size=int(data.get("chunk_size", 2048)),
         )
 
@@ -318,11 +303,6 @@ class SiteProfile:
             ):
                 validate_remote_path(value, f"cluster.{label}")
             validate_remote_path(self.cluster.worker_command, "cluster.worker_command")
-            if self.harness.remote_binary_path is not None:
-                validate_remote_path(
-                    self.harness.remote_binary_path,
-                    "harness.remote_binary_path",
-                )
             if self.cluster.transport == "shared_nfs":
                 expected = self.cluster.remote_base / "runs"
                 if self.cluster.remote_run_root != expected:
@@ -390,7 +370,10 @@ def load_site_profile(
         try:
             profile_path = find_site_profile_path("local", root)
         except SiteProfileError:
-            return SiteProfile(name="local", site_type="local", description="Default local profile")
+            return SiteProfile(
+                name="local", site_type="local", description="Default local profile",
+                runner=RunnerConfig(max_workers=1, worker_concurrency=10),
+            )
     else:
         profile_path = find_site_profile_path(name_or_path, root)
 

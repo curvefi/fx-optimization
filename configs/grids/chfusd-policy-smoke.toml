@@ -4,17 +4,18 @@ pair_id = "chfusd"
 policy_id = "native_policy_dual_ema_stale_cap_v1"
 tags = ["smoke", "compiled-policy"]
 
+[grid.static_overrides]
+"run.metric_projection" = "summary"
+
 # Dense defaults and declaration order come from the PolicySpec. Axes use
 # parameter names and compile to one exact dense vector at the harness boundary.
 
 [[grid.axes]]
 name = "fast_half_life_s"
-target = "policy_params.fast_half_life_s"
-kind = "integer"
+target = { path = "policy.fast_half_life_s", kind = "integer" }
 values = [1800, 3600]
 
 [[grid.axes]]
 name = "kappa"
-target = "policy_params.kappa"
-kind = "decimal"
+target = { path = "policy.kappa", kind = "decimal" }
 values = [0.5, 1.0]

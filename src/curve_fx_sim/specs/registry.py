@@ -38,15 +38,13 @@ class SpecRegistry:
         *,
         explicit_only: bool = False,
     ) -> Path:
+        spelling = os.fspath(path_or_id)
         raw = Path(path_or_id)
         root = self.context.project_root
-        rooted_candidate = raw if raw.is_absolute() else root / raw
-        is_identifier = (
-            not explicit_only
-            and not raw.is_absolute()
-            and raw.parent == Path(".")
-            and not rooted_candidate.is_file()
-        )
+        is_bare = not raw.is_absolute() and raw.parent == Path(".") and not spelling.startswith("./")
+        if explicit_only and is_bare:
+            raise ValueError(f"explicit specification path required, got bare name: {path_or_id}")
+        is_identifier = is_bare
 
         if is_identifier:
             try:
@@ -56,7 +54,7 @@ class SpecRegistry:
             filename = raw.name if raw.suffix == ".toml" else f"{raw.name}.toml"
             candidate = self.context.config_root / config_dir / filename
         else:
-            candidate = rooted_candidate
+            candidate = raw if raw.is_absolute() else root / raw
 
         resolved = assert_contained_path(candidate, root, allow_symlinks=True)
         if not resolved.is_file():

@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import os
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from .common import (
     SpecError,
@@ -15,10 +14,7 @@ from .common import (
     repository_relative,
     serializable,
 )
-from .parameters import build_parameter_registry, validate_parameter_space_names
-from .policy import load_policy_spec
 from .registry import SpecRegistry
-from .scenario import load_scenario_spec
 
 
 @dataclass(frozen=True)
@@ -72,16 +68,6 @@ class OptimizationSpec:
         if not self.scenarios or any(not scenario for scenario in self.scenarios):
             raise SpecError("optimization scenarios must be a non-empty string array")
 
-    def validate_parameter_space(self, registry: Mapping[str, Any]) -> None:
-        """Resolve every parameter_space name through the parameter registry.
-
-        Both policy and pool registry dimensions are legal; any unknown name
-        is a SpecError.  Callers build the registry for the run's policy and
-        pair template before invoking this (see
-        :func:`curve_fx_sim.specs.parameters.build_parameter_registry`).
-        """
-        validate_parameter_space_names(self.parameter_space, registry)
-
     def to_dict(self) -> dict[str, Any]:
         """Convert to serializable dictionary."""
         return {
@@ -102,11 +88,8 @@ def load_optimization_spec(
     path_or_id: str | os.PathLike[str],
     *,
     repository: Path,
-    parameter_space_authority: Literal["legacy_registry", "selected_schema"] = "legacy_registry",
 ) -> OptimizationSpec:
-    """Load and validate an optimization specification from TOML."""
-    if parameter_space_authority not in {"legacy_registry", "selected_schema"}:
-        raise ValueError(f"unsupported parameter_space_authority: {parameter_space_authority!r}")
+    """Load an optimization specification; schema validation belongs to the selected artifact."""
     registry = SpecRegistry.from_root(repository)
     root = registry.context.project_root
     candidate = registry.resolve("optimization", path_or_id)
@@ -147,27 +130,6 @@ def load_optimization_spec(
     scoring_config = dict(opt_data.get("scoring_config", {}))
     tags = tuple(opt_data.get("tags", []))
     source_path = repository_relative(candidate, root)
-
-    if parameter_space_authority == "legacy_registry":
-        # The default loader keeps the checked-in PolicySpec registry as its
-        # authority. Artifact-selected callers defer only this validation and
-        # must resolve canonical names against the selected evaluator schema.
-        template_json = None
-        if scenarios:
-            try:
-                primary_scenario = load_scenario_spec(scenarios[0], repository=root)
-            except SpecError as exc:
-                raise SpecError(
-                    f"optimization scenario {scenarios[0]!r} is invalid: {exc}"
-                ) from exc
-            if primary_scenario.template_path is not None:
-                template_file = root / primary_scenario.template_path
-                if template_file.is_file():
-                    with template_file.open("r", encoding="utf-8") as stream:
-                        template_json = json.load(stream)
-        policy_spec = load_policy_spec(policy_id, repository=root)
-        registry = build_parameter_registry(policy_spec, template_json, parameter_space)
-        validate_parameter_space_names(parameter_space, registry)
 
     return OptimizationSpec(
         id=opt_id,

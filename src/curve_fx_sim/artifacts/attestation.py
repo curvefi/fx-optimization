@@ -107,6 +107,7 @@ def find_attested_artifact(
     *,
     run_dir: Path,
     kind: str,
+    verify_digest: bool = False,
 ) -> Path:
     """Resolve exactly one top-level artifact of *kind*."""
     root = _validated_run_dir(manifest, run_dir)
@@ -123,7 +124,10 @@ def find_attested_artifact(
             matches.append(validated)
     if len(matches) != 1:
         raise SpecError(f"manifest must attest exactly one {kind} artifact")
-    return resolve_attested_file(matches[0], run_dir=root, label=f"{kind} artifact")
+    return resolve_attested_file(
+        matches[0], run_dir=root, label=f"{kind} artifact",
+        verify_digest=verify_digest,
+    )
 
 
 def verify_manifest_artifacts(

@@ -269,3 +269,22 @@ price_orientation = "quote_per_base"
 time_start = "2024-01-01T00:00:00Z"
 time_end = "2026-08-15T13:30:00Z"
 source_row_count = 1378891
+
+[[datasets]]
+id = "eurchf-candles"
+path = "data/market/eurchf/candles.json"
+original_source_path = "python/arb_sim/trade_data/eurchf/eurchf-20230101-20260814.json"
+provider = "FX-1-Minute-Data"
+upstream_url = "https://github.com/heswithme/FX-1-Minute-Data"
+storage = "git-lfs"
+processing = "filtered"
+redistribution = "unknown"
+license = "unknown"
+sha256 = "0de7a91e665faa746c79cb19bee887d76eb87c26c03628e26af7d277b0230962"
+byte_size = 41263833
+schema = "ohlcv_v1"
+schema_fields = ["timestamp", "open", "high", "low", "close", "volume"]
+pair = "eurchf"
+price_orientation = "quote_per_base"
+time_start = "2024-01-01T22:04:00Z"
+time_end = "2026-05-22T20:58:00Z"

@@ -30,7 +30,7 @@ def _evaluator_identity(core: Mapping[str, Any]) -> dict[str, Any]:
     return {
         key: value
         for key, value in core.items()
-        if key not in {"site", "remote_sha256"}
+        if key not in {"binary", "site", "remote_sha256"}
     }
 
 
@@ -296,13 +296,12 @@ def _run_remote_shiftclick_unlocked(
             )
 
     worker = shlex.quote(site.cluster.worker_command)
-    harness = shlex.quote(str(site.harness.remote_binary_path or site.harness.binary_name))
     project_root = remote_repo if shared_mounted else workspace
     command = (
         f"cd {shlex.quote(str(workspace))} && "
         f"{worker} --project-root {shlex.quote(str(project_root))} "
         f"--run-root {shlex.quote(str(workspace_runs))} "
-        f"replay shiftclick {shlex.quote(str(remote_spec))} --harness {harness}"
+        f"replay shiftclick {shlex.quote(str(remote_spec))}"
     )
     executed = ssh.run_ssh(blade, command, timeout=site.harness.timeout_seconds)
     if not executed.ok:
@@ -325,9 +324,8 @@ def _run_remote_shiftclick_unlocked(
     manifest_path = local_run_dir / "manifest.json"
     manifest = load_manifest(manifest_path, expected_kind="shiftclick")
     verify_manifest_artifacts(manifest, run_dir=local_run_dir)
-    find_attested_artifact(manifest, run_dir=local_run_dir, kind="trace")
-    if spec.trace_actions:
-        find_attested_artifact(manifest, run_dir=local_run_dir, kind="actions")
+    find_attested_artifact(manifest, run_dir=local_run_dir, kind="replay_trace_npz")
+    find_attested_artifact(manifest, run_dir=local_run_dir, kind="replay_trace_companion")
     _verify_remote_receipt(
         manifest,
         spec=spec,

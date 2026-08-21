@@ -27,10 +27,6 @@ from .pair import (
     PairSpec,
     load_pair_spec,
 )
-from .parameters import (
-    ParameterDim,
-    build_parameter_registry,
-)
 from .policy import (
     PolicyParameter,
     PolicySpec,
@@ -60,8 +56,6 @@ __all__ = [
     "serializable",
     "PairSpec",
     "load_pair_spec",
-    "ParameterDim",
-    "build_parameter_registry",
     "MarketFileRef",
     "ScenarioSpec",
     "load_scenario_spec",

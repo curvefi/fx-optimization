@@ -1,6 +1,7 @@
 from __future__ import annotations
 import hashlib, json, threading
 from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -97,6 +98,65 @@ def test_grouped_manifest_roundtrip_is_pathless_and_routes_open_observation_to_s
     assert groups == rebuilt and [point.candidate_id for point in loaded] == [point.candidate_id for point in points]
     assert all(group.session_key.open_session_values["run.disable"] is True for group in groups)
     assert all("policy_params" not in row for row in manifest["grid"]["pools"]) and "session_request" not in json.dumps(manifest)
+
+
+def test_named_grid_snaps_to_minimum_anchored_schema_lattice():
+    schema = CandidateSchema("curve_fx_parameter_schema_v1", SCHEMA, "p", (
+        ParameterDescriptor("pool.x", "pool_overrides.x", "real", "unit", "finite_binary64", "candidate",
+                            default=0, minimum=0, maximum=10, quantum=1),
+    ))
+    compiler = CandidateCompiler(schema)
+    scenario = ScenarioClosure("s", "pair", "e" * 64, ())
+    receipt = {}
+    def compile_values(*values):
+        grid = GridSpec("snap", "pair", axes=(AxisSpec(
+            "x", values=tuple(Decimal(str(value)) for value in values),
+            targets=(AxisTarget(("pool", "x")),),
+        ),))
+        return compile_grid_points(grid, compiler=compiler, artifact_sha256=ARTIFACT,
+                                   open_session={}, scenario=scenario, snap_receipt=receipt)
+    with pytest.warns(UserWarning, match=r"adjusted=2, collapsed=1; pool\.x=2"):
+        points = compile_values("1.1", "1.2", "2.0")
+    assert [point.coordinates["x"] for point in points] == [1, 2]
+    assert [point.coordinate_indices for point in points] == [(0,), (1,)]
+    assert receipt == {"adjusted_count": 2, "collapsed_count": 1,
+                       "adjusted_by_descriptor": {"pool.x": 2}}
+    with pytest.warns(UserWarning), pytest.raises(ValueError, match="collapse below two"):
+        compile_values("1.1", "1.2")
+
+def test_scalar_axis_couples_fee_targets_in_exact_display_units():
+    descriptors = tuple(
+        ParameterDescriptor(
+            f"pool.{name}", f"pool_overrides.pool.{name}", "real",
+            "fee_fraction", "binary64_fraction_or_1e10", "candidate",
+        )
+        for name in ("mid_fee", "out_fee")
+    ) + (ParameterDescriptor(
+        "policy.kappa", "evaluate_batch.candidates[].policy_params[0]", "real",
+        "dimensionless", "finite_binary64", "candidate", order=0,
+        default=1, minimum=0, maximum=5, quantum=0.05,
+    ),)
+    compiler = CandidateCompiler(CandidateSchema(
+        "curve_fx_parameter_schema_v1", SCHEMA, "p", descriptors,
+    ))
+    targets = tuple(
+        AxisTarget(("pool", name), display_scale=Decimal(10_000))
+        for name in ("mid_fee", "out_fee")
+    )
+    grid = GridSpec("fees", "pair", axes=(
+        AxisSpec("fee_bps", values=(Decimal(1),), targets=targets),
+        AxisSpec(
+            "kappa", values=(Decimal("1.5"),),
+            targets=(AxisTarget(("policy", "kappa")),),
+        ),
+    ))
+    point, = compile_grid_points(
+        grid, compiler=compiler, artifact_sha256=ARTIFACT,
+        open_session={}, scenario=ScenarioClosure("s", "pair", "e" * 64, ()),
+    )
+    assert point.coordinates["fee_bps"] == 1
+    assert point.pool_overrides == {"pool": {"mid_fee": 1_000_000, "out_fee": 1_000_000}}
+    assert point.policy_params == (1.5,)
 
 def test_grouped_executor_bounds_parallel_batches_orders_results_and_cleans_up(tmp_path: Path):
     compiler, points, groups, _ = _compiled()

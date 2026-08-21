@@ -1,6 +1,6 @@
 """One coherent Click CLI for the curve-fx-sim orchestrator (`fxsim`).
 
-Provides data verification, harness identity inspection, grid generation/execution/collection,
+Provides data verification, grid generation/execution/collection,
 optimization preflight/run/status/collect, heatmap rendering, shiftclick replay,
 trajectory plotting, and repository auditing.
 """
@@ -70,14 +70,12 @@ def _pair_map(raw: str) -> dict[str, float]:
     return pairs
 
 
-def _project_context(run_root: Path | None = None) -> ProjectContext:
+def _project_context() -> ProjectContext:
     """Return the explicit root context established by the top-level command."""
     context = click.get_current_context().find_root().obj
     if not isinstance(context, ProjectContext):
         raise click.ClickException("project context is unavailable")
-    if run_root is None:
-        return context
-    return ProjectContext.from_root(context.project_root, run_root=run_root)
+    return context
 
 
 # ---------------------------------------------------------------------------
@@ -136,27 +134,6 @@ def data_verify(manifest_path: Path | None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Harness commands
-# ---------------------------------------------------------------------------
-
-
-@main.group("harness")
-def harness_group() -> None:
-    """Inspect and verify evaluator binary identity and build capabilities."""
-
-
-@harness_group.command("identity")
-@click.argument("binary_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-def harness_identity(binary_path: Path) -> None:
-    """Query an evaluator binary for its attested build identity."""
-    try:
-        from .evaluation.identity import inspect_binary_identity
-        identity = inspect_binary_identity(binary_path)
-        _emit(identity.to_dict())
-    except Exception as exc:  # noqa: BLE001
-        _fail(exc)
-
-
 # ---------------------------------------------------------------------------
 # Evaluator commands
 # ---------------------------------------------------------------------------
@@ -278,111 +255,50 @@ def grid_group() -> None:
 @click.option("--pair", "pair_id", required=True, help="Pair specification path or ID.")
 @click.option("--grid", "grid_id", required=True, help="Grid specification path or ID.")
 @click.option("--scenario", "scenario_id", required=True, help="Scenario specification.")
-@click.option("--policy", "policy_id", default=None, help="Optional policy specification.")
-@click.option("--artifact-dir", type=click.Path(file_okay=False, path_type=Path), default=None, help="Selected evaluator artifact directory.")
-@click.option("--harness", "harness_path", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None, help="Attested evaluator binary.")
+@click.option("--artifact-dir", type=click.Path(file_okay=False, path_type=Path), required=True, help="Selected evaluator artifact directory.")
 @click.option("--run-id", default=None, help="Immutable run ID (generated if omitted).")
-@click.option(
-    "--output-root",
-    type=click.Path(path_type=Path, file_okay=False),
-    default=None,
-    help="Deprecated command-local alias for --run-root; never controls specs.",
-)
 def grid_generate(
     pair_id: str,
     grid_id: str,
     scenario_id: str,
-    policy_id: str | None,
-    artifact_dir: Path | None,
-    harness_path: Path | None,
+    artifact_dir: Path,
     run_id: str | None,
-    output_root: Path | None,
 ) -> None:
     """Generate an immutable Cartesian grid run manifest."""
     try:
-        if artifact_dir is None and harness_path is None:
-            raise click.UsageError("exactly one of --artifact-dir or --harness is required")
-        if artifact_dir is not None and harness_path is not None:
-            raise click.UsageError("--artifact-dir and --harness are mutually exclusive")
         from .artifacts.store import RunStore
-        # Initialize the execution package before grids.runner imports its collection
-        # helpers; the package backend references the runner's point loader.
-        from .execution import ExecutionBackend as _ExecutionBackend  # noqa: F401
-        from .evaluation.identity import inspect_binary_identity
         from .grids.runner import compile_grid_run
         from .specs.grid import load_grid_spec
         from .specs.pair import load_pair_spec
         from .specs.scenario import load_scenario_spec
-        from .specs.policy import load_policy_spec
-        from .evaluation.identity import validate_evaluator_identity
         from .artifacts.tables import MetricProjection
 
-        context = _project_context(output_root)
+        context = _project_context()
         store = RunStore(context)
         pair_spec = load_pair_spec(pair_id, repository=context.project_root)
         grid_spec = load_grid_spec(grid_id, repository=context.project_root)
         scenario_spec = load_scenario_spec(scenario_id, repository=context.project_root)
-        legacy_identity = inspect_binary_identity(harness_path) if harness_path is not None else None
-        effective_policy_id = policy_id or grid_spec.policy_id
-        if grid_spec.policy_id and policy_id and grid_spec.policy_id != policy_id:
-            raise click.ClickException("--policy does not match the grid policy_id")
-        policy_spec = (
-            load_policy_spec(effective_policy_id, repository=context.project_root)
-            if effective_policy_id
-            else None
-        )
-        if artifact_dir is not None:
-            from .evaluation.selected import SelectedEvaluator
-            from .evaluation.session import LocalSessionMaterialization
+        from .evaluation.selected import SelectedEvaluator
+        from .evaluation.session import LocalSessionMaterialization
 
-            selected = SelectedEvaluator.load(_context_path(artifact_dir, context.run_root))
-            identity = selected.verified_evaluator
-            effective_run_id = run_id or f"grid_{pair_spec.id}_{grid_spec.id}"
-            with tempfile.TemporaryDirectory(prefix="fxsim-grid-session-") as temporary:
-                materialization = LocalSessionMaterialization.from_scenario(
-                    scenario_spec, repository=context.project_root,
-                    manifest_root=Path(temporary), session_id=f"{effective_run_id}_baseline",
-                ).validated()
-                compilation = compile_grid_run(
-                    grid_spec,
-                    run_id=effective_run_id,
-                    pair_spec=pair_spec,
-                    scenario_spec=scenario_spec,
-                    store=store,
-                    metric_projection=MetricProjection.from_fields(identity.metric_fields, projection_id="grid"),
-                    selected_evaluator=selected,
-                    open_session=materialization.baseline_open_session_fields,
-                    scenario=materialization.closure,
-                    policy_spec=policy_spec,
-                )
-        else:
-            assert harness_path is not None
-            assert legacy_identity is not None
-            identity = legacy_identity
-            if policy_spec is None:
-                validate_evaluator_identity(
-                    identity,
-                    expected_policy_id="twocrypto_native",
-                    expected_policy_source_sha256="none",
-                    expected_policy_parameter_count=0,
-                )
-            else:
-                validate_evaluator_identity(
-                    identity,
-                    expected_policy_id=policy_spec.id,
-                    expected_policy_source_sha256=policy_spec.source_sha256,
-                    expected_policy_abi=policy_spec.policy_abi,
-                    expected_policy_parameter_count=len(policy_spec.parameters),
-                )
+        selected = SelectedEvaluator.load(_context_path(artifact_dir, context.run_root))
+        identity = selected.verified_evaluator
+        effective_run_id = run_id or f"grid_{pair_spec.id}_{grid_spec.id}"
+        with tempfile.TemporaryDirectory(prefix="fxsim-grid-session-") as temporary:
+            materialization = LocalSessionMaterialization.from_scenario(
+                scenario_spec, repository=context.project_root,
+                manifest_root=Path(temporary), session_id=f"{effective_run_id}_baseline",
+            ).validated()
             compilation = compile_grid_run(
                 grid_spec,
-                run_id=run_id or f"grid_{pair_spec.id}_{grid_spec.id}",
+                run_id=effective_run_id,
                 pair_spec=pair_spec,
                 scenario_spec=scenario_spec,
                 store=store,
                 metric_projection=MetricProjection.from_fields(identity.metric_fields, projection_id="grid"),
-                evaluator_identity=identity,
-                policy_spec=policy_spec,
+                selected_evaluator=selected,
+                open_session=materialization.baseline_open_session_fields,
+                scenario=materialization.closure,
             )
 
         _emit({
@@ -390,7 +306,7 @@ def grid_generate(
             "run_id": compilation.manifest["run_id"],
             "manifest_path": compilation.manifest_path.as_posix(),
             "run_dir": compilation.run_dir.as_posix(),
-            "pool_count": len(compilation.points),
+            "pool_count": len(compilation.plan),
         })
     except Exception as exc:  # noqa: BLE001
         _fail(exc)
@@ -401,14 +317,12 @@ def grid_generate(
 @click.option("--site", default="local", help="Site profile name or path (default 'local').")
 @click.option("--blades", multiple=True, help="Specific blades to target for cluster execution.")
 @click.option("--resume", is_flag=True, help="Resume incomplete execution.")
-@click.option("--harness", "harness_path", type=click.Path(dir_okay=False, path_type=Path), default=None, help="Explicit harness binary.")
 @click.option("--chunk-size", type=int, default=None, help="Override block-cyclic chunk size.")
 def grid_run(
     manifest_or_run_dir: Path,
     site: str,
     blades: tuple[str, ...],
     resume: bool,
-    harness_path: Path | None,
     chunk_size: int | None,
 ) -> None:
     """Execute one resolved grid run across local cores or cluster blades."""
@@ -420,20 +334,8 @@ def grid_run(
             manifest_file = manifest_file / "manifest.json"
 
         context = _project_context()
-        try:
-            manifest_payload = json.loads(manifest_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            manifest_payload = None
-        resolved = manifest_payload.get("resolved_spec") if isinstance(manifest_payload, dict) else None
-        candidate_compilation = resolved.get("candidate_compilation") if isinstance(resolved, dict) else None
-        if harness_path is not None and isinstance(candidate_compilation, dict) and candidate_compilation.get("mode"):
-            raise click.ClickException(
-                "artifact-selected grid manifests use their run-local evaluator; "
-                "--harness is not accepted"
-            )
-
         profile = load_site_profile(site, root=context.project_root)
-        backend = ExecutionBackend(site_profile=profile, harness_binary=harness_path)
+        backend = ExecutionBackend(site_profile=profile)
         summary = backend.run_grid(
             manifest_file,
             resume=resume,
@@ -456,12 +358,12 @@ def grid_run(
 
 @grid_group.command("collect")
 @click.argument("manifest_file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-@click.option("--out", "output_file", type=click.Path(path_type=Path, dir_okay=False), default=None, help="Output JSON path.")
+@click.option("--out", "output_file", type=click.Path(path_type=Path, dir_okay=False), default=None, help="Output NPZ path.")
 def grid_collect(manifest_file: Path, output_file: Path | None) -> None:
     """Strictly validate and merge shard results for an immutable grid run."""
     try:
         from .execution import collect_grid_results
-        result = collect_grid_results(manifest_file, output_file=output_file)
+        result = collect_grid_results(manifest_file, output_path=output_file)
         _emit({
             "status": "ok",
             "manifest": str(manifest_file.as_posix()),
@@ -502,6 +404,26 @@ def worker_grouped(request_path: Path, output_path: Path, remote_run_root: Path,
         _fail(exc)
 
 
+@worker_group.command("grid")
+@click.argument("request_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--out", "output_path", type=click.Path(dir_okay=False, path_type=Path), required=True)
+@click.option("--remote-run-root", type=click.Path(file_okay=False, path_type=Path), required=True)
+@click.option("--blade", default=None, hidden=True)
+def worker_grid(request_path: Path, output_path: Path, remote_run_root: Path,
+                blade: str | None) -> None:
+    """Execute one compact Cartesian-plan request."""
+    try:
+        from .execution.grouped_remote import execute_grid_work
+        receipt = execute_grid_work(
+            request_path, output_path, remote_run_root=remote_run_root,
+            repository=_project_context().project_root, blade=blade,
+        )
+        _emit({"status": "ok", "request_sha256": receipt.request_sha256,
+               "result": output_path.as_posix()})
+    except Exception as exc:  # noqa: BLE001
+        _fail(exc)
+
+
 # ---------------------------------------------------------------------------
 # Optimization commands
 # ---------------------------------------------------------------------------
@@ -514,101 +436,50 @@ def optimize_group() -> None:
 
 @optimize_group.command("preflight")
 @click.argument("spec_ref")
-@click.option("--artifact-dir", type=click.Path(file_okay=False, path_type=Path), default=None)
-def optimize_preflight(spec_ref: str, artifact_dir: Path | None) -> None:
+@click.option("--artifact-dir", type=click.Path(file_okay=False, path_type=Path), required=True)
+def optimize_preflight(spec_ref: str, artifact_dir: Path) -> None:
     """Validate optimization configuration, lattice bounds, and initial seeds."""
     try:
         from .specs.optimization import load_optimization_spec
-        from .specs.policy import load_policy_spec
-        from .optimization.profiles import profile_from_policy_spec
         context = _project_context()
         root = context.project_root
-        if artifact_dir is not None:
-            from .evaluation.selected import SelectedEvaluator
-            from .evaluation.session import LocalSessionMaterialization
-            from .optimization.search import SearchLayout
-            from .specs.scenario import load_scenario_spec
+        from .evaluation.selected import SelectedEvaluator
+        from .evaluation.session import LocalSessionMaterialization
+        from .optimization.search import SearchLayout
+        from .specs.scenario import load_scenario_spec
 
-            selected = SelectedEvaluator.load(_context_path(artifact_dir, context.run_root))
-            spec = load_optimization_spec(
-                spec_ref, repository=root, parameter_space_authority="selected_schema"
-            )
-            policy = selected.policy_identity
-            if spec.policy_id != policy["id"]:
-                raise ValueError(
-                    f"optimization policy_id {spec.policy_id!r} does not match "
-                    f"selected evaluator policy {policy['id']!r}"
-                )
-            scenario = load_scenario_spec(spec.scenarios[0], repository=root)
-            template_json = None
-            if scenario.template_path is not None:
-                with (root / scenario.template_path).open("r", encoding="utf-8") as stream:
-                    template_json = json.load(stream)
-            with tempfile.TemporaryDirectory(prefix="fxsim-opt-preflight-") as temporary:
-                materialization = LocalSessionMaterialization.from_scenario(
-                    scenario, repository=root, manifest_root=Path(temporary),
-                    session_id=f"preflight_{spec.id}",
-                ).validated()
-                layout = SearchLayout.from_schema(
-                    selected.compiler.schema, spec.parameter_space, template_json,
-                    materialization.baseline_open_session_fields,
-                )
-            _emit({
-                "status": "ok", "optimization_id": spec.id, "algorithm": spec.algorithm,
-                "pair": spec.pair_id, "policy_id": policy["id"],
-                "policy_source_sha256": policy["source_sha256"],
-                "artifact_sha256": selected.artifact_sha256,
-                "parameter_schema_sha256": selected.parameter_schema_sha256,
-                "dimensions": len(layout.dimensions),
-                "parameter_names": [item.name for item in layout.dimensions],
-                "geometry_sha256": layout.sha256, "default_vector": layout.default_vector,
-            })
-            return
+        selected = SelectedEvaluator.load(_context_path(artifact_dir, context.run_root))
         spec = load_optimization_spec(spec_ref, repository=root)
-        policy = load_policy_spec(spec.policy_id, repository=root)
-        profile = profile_from_policy_spec(policy, spec.parameter_space)
+        policy = selected.policy_identity
+        if spec.policy_id != policy["id"]:
+            raise ValueError(
+                f"optimization policy_id {spec.policy_id!r} does not match "
+                f"selected evaluator policy {policy['id']!r}"
+            )
+        scenario = load_scenario_spec(spec.scenarios[0], repository=root)
+        template_json = None
+        if scenario.template_path is not None:
+            with (root / scenario.template_path).open("r", encoding="utf-8") as stream:
+                template_json = json.load(stream)
+        with tempfile.TemporaryDirectory(prefix="fxsim-opt-preflight-") as temporary:
+            materialization = LocalSessionMaterialization.from_scenario(
+                scenario, repository=root, manifest_root=Path(temporary),
+                session_id=f"preflight_{spec.id}",
+            ).validated()
+            layout = SearchLayout.from_schema(
+                selected.compiler.schema, spec.parameter_space, template_json,
+                materialization.baseline_open_session_fields,
+            )
         _emit({
-            "status": "ok",
-            "optimization_id": spec.id,
-            "algorithm": spec.algorithm,
-            "pair": spec.pair_id,
-            "policy_id": policy.id,
-            "policy_source_sha256": policy.source_sha256,
-            "dimensions": len(profile.bounds),
-            "dense_parameter_count": profile.n_params(),
-            "parameter_names": list(profile.parameter_names),
+            "status": "ok", "optimization_id": spec.id, "algorithm": spec.algorithm,
+            "pair": spec.pair_id, "policy_id": policy["id"],
+            "policy_source_sha256": policy["source_sha256"],
+            "artifact_sha256": selected.artifact_sha256,
+            "parameter_schema_sha256": selected.parameter_schema_sha256,
+            "dimensions": len(layout.dimensions),
+            "parameter_names": [item.name for item in layout.dimensions],
+            "geometry_sha256": layout.sha256, "default_vector": layout.default_vector,
         })
-    except Exception as exc:  # noqa: BLE001
-        _fail(exc)
-
-
-@optimize_group.command("worker")
-@click.argument("bundle_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-@click.option("--harness", "harness_path", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
-@click.option("--root", "repository_root", type=click.Path(path_type=Path, file_okay=False), default=None, help="Deprecated project-root override for remote workers.")
-@click.option("--out", "output_file", type=click.Path(path_type=Path, dir_okay=False), required=True)
-def optimize_worker(
-    bundle_path: Path,
-    harness_path: Path,
-    repository_root: Path | None,
-    output_file: Path,
-) -> None:
-    """Evaluate one immutable optimization work bundle."""
-    try:
-        from .evaluation.client import SubprocessHarnessClient
-        from .optimization.worker import OptimizationWorkBundle, evaluate_work_bundle
-
-        bundle = OptimizationWorkBundle.from_json(bundle_path)
-        root = (repository_root or _project_context().project_root).resolve()
-        client = SubprocessHarnessClient(
-            harness_path,
-            repository=root,
-            work_dir=root,
-        )
-        result = evaluate_work_bundle(bundle, client)
-        result.to_json(output_file)
-        client.close()
-        _emit({"status": "ok", "bundle_id": result.bundle_id, "result": str(output_file)})
     except Exception as exc:  # noqa: BLE001
         _fail(exc)
 
@@ -619,23 +490,14 @@ def optimize_worker(
 @click.option("--blades", multiple=True, help="Specific blades to target for distributed execution.")
 @click.option("--run-id", default=None, help="Immutable run ID.")
 @click.option("--resume", is_flag=True, help="Resume incomplete optimization run.")
-@click.option(
-    "--output-root",
-    type=click.Path(path_type=Path, file_okay=False),
-    default=None,
-    help="Deprecated command-local alias for --run-root; never controls specs.",
-)
-@click.option("--harness", "harness_path", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None, help="Explicit local evaluator binary.")
-@click.option("--artifact-dir", type=click.Path(file_okay=False, path_type=Path), default=None, help="Verified evaluator artifact for schema-named local optimization.")
+@click.option("--artifact-dir", type=click.Path(file_okay=False, path_type=Path), required=True, help="Verified evaluator artifact for schema-named optimization.")
 def optimize_run(
     spec_ref: str,
     site: str,
     blades: tuple[str, ...],
     run_id: str | None,
     resume: bool,
-    output_root: Path | None,
-    harness_path: Path | None,
-    artifact_dir: Path | None,
+    artifact_dir: Path,
 ) -> None:
     """Execute adaptive parameter optimization."""
     try:
@@ -643,40 +505,16 @@ def optimize_run(
         from .optimization import run_optimization
         from .specs.optimization import load_optimization_spec
 
-        if harness_path is not None and artifact_dir is not None:
-            raise click.UsageError("--artifact-dir and --harness are mutually exclusive")
-        context = _project_context(output_root)
+        context = _project_context()
         store = RunStore(context)
-        client = None
-        selected = None
-        if harness_path is not None:
-            from .evaluation.client import SubprocessHarnessClient
+        from .evaluation.selected import SelectedEvaluator
 
-            client = SubprocessHarnessClient(
-                harness_path,
-                repository=context.project_root,
-                work_dir=context.project_root,
-            )
-        elif artifact_dir is not None:
-            from .evaluation.selected import SelectedEvaluator
-
-            selected = SelectedEvaluator.load(
-                _context_path(artifact_dir, context.run_root)
-            )
-        spec = (
-            load_optimization_spec(
-                spec_ref,
-                repository=context.project_root,
-                parameter_space_authority="selected_schema",
-            )
-            if selected is not None
-            else load_optimization_spec(spec_ref, repository=context.project_root)
-        )
+        selected = SelectedEvaluator.load(_context_path(artifact_dir, context.run_root))
+        spec = load_optimization_spec(spec_ref, repository=context.project_root)
         effective_run_id = run_id or f"opt_{spec.id}"
         result = run_optimization(
             spec,
             store=store,
-            client=client,
             run_id=effective_run_id,
             resume=resume,
             site=site,
@@ -742,32 +580,30 @@ def optimize_collect(run_id_or_path: str, output_file: Path | None) -> None:
 
 @main.group("replay")
 def replay_group() -> None:
-    """Replay candidate selections with full observation and atomic trace sidecars."""
+    """Replay candidate selections with full observation and attested NPZ replay traces."""
 
 
 @replay_group.command("shiftclick")
-@click.argument("spec_path", type=click.Path(exists=True, path_type=Path))
+@click.argument("spec_path", type=click.Path(exists=True))
 @click.option("--out", "output_dir", type=click.Path(path_type=Path, file_okay=False), default=None)
-@click.option("--harness", "harness_path", type=click.Path(dir_okay=False, path_type=Path), default=None)
 @click.option("--site", default="local", help="Local or SSH site profile.")
 @click.option("--blades", multiple=True, help="Exactly one blade for remote replay.")
 def replay_shiftclick(
-    spec_path: Path,
+    spec_path: str,
     output_dir: Path | None,
-    harness_path: Path | None,
     site: str,
     blades: tuple[str, ...],
 ) -> None:
     """Run one strict full-trace shiftclick replay and economic comparison."""
     try:
         from .artifacts.store import RunStore
-        from .evaluation.client import SubprocessHarnessClient
         from .shiftclick import run_shiftclick
         from .specs.shiftclick import load_shiftclick_spec
 
         context = _project_context()
         root = context.project_root
         spec = load_shiftclick_spec(spec_path, repository=root)
+        validated_spec_path = (root / spec.source_spec_path).resolve()
         store = RunStore(context)
         if site != "local" or blades:
             from .execution.site import load_site_profile
@@ -781,24 +617,16 @@ def replay_shiftclick(
                 raise click.ClickException("remote shiftclick requires exactly one --blades target")
             result = run_remote_shiftclick(
                 spec,
-                spec_path=spec_path,
+                spec_path=validated_spec_path,
                 store=store,
                 site=profile,
                 blade=targets[0],
             )
             _emit({"status": "ok", **result.to_dict()})
             return
-        if harness_path is None:
-            raise click.ClickException("--harness is required for a full-trace replay")
-        client = SubprocessHarnessClient(
-            harness_path,
-            repository=root,
-            work_dir=context.run_root,
-        )
         result = run_shiftclick(
             spec,
             store=store,
-            client=client,
             output_dir=output_dir,
         )
         _emit({"status": "ok", **result.to_dict()})
@@ -820,7 +648,6 @@ def replay_shiftclick(
 @click.option("--slipthr", type=float, default=20.0, show_default=True, help="Masked APY slippage cap in bps.")
 @click.option("--slipthr-max", type=float, default=100.0, show_default=True, help="Upper range of the slippage control in bps (not a second mask bound).")
 @click.option("--last-pdifthr", "last_pdiffthr", type=float, default=None, help="Masked final price difference threshold in bps.")
-@click.option("--harness", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None, help="Attested evaluator for exact-cell replay.")
 @click.option("--site", default="local", show_default=True, help="Local or configured SSH site for replay.")
 @click.option("--blade", default=None, help="Remote blade for replay (defaults to the first configured blade).")
 @click.option("--out", "output_file", type=click.Path(path_type=Path, dir_okay=False), default=None, help="PNG path; writes a state sidecar beside it.")
@@ -834,7 +661,6 @@ def view_run(
     slipthr: float,
     slipthr_max: float,
     last_pdiffthr: float | None,
-    harness: Path | None,
     site: str,
     blade: str | None,
     output_file: Path | None,
@@ -859,7 +685,6 @@ def view_run(
             slipthr=slipthr,
             slipthr_max=slipthr_max,
             final_pdiffthr=last_pdiffthr,
-            harness=harness,
             site=site,
             blade=blade,
             store=RunStore(_project_context()),
@@ -995,11 +820,11 @@ def plot_heatmap(
 @click.argument("diagnostic_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option("--out", "output_file", type=click.Path(path_type=Path, dir_okay=False), default=None)
 def plot_trajectory(diagnostic_dir: Path, output_file: Path | None) -> None:
-    """Render state trajectory from one manifest-attested trace."""
+    """Render one scenario from a manifest-attested replay archive."""
     try:
         from .artifacts.attestation import find_attested_artifact
         from .artifacts.manifest import load_manifest
-        from .plotting.trajectory import render_trajectory
+        from .plotting.shiftclick_view import render_shiftclick_figure
 
         manifest = load_manifest(
             diagnostic_dir / "manifest.json",
@@ -1008,40 +833,29 @@ def plot_trajectory(diagnostic_dir: Path, output_file: Path | None) -> None:
         trace_path = find_attested_artifact(
             manifest,
             run_dir=diagnostic_dir,
-            kind="trace",
+            kind="replay_trace_npz",
+            verify_digest=True,
+        )
+        companion_path = find_attested_artifact(
+            manifest,
+            run_dir=diagnostic_dir,
+            kind="replay_trace_companion",
+            verify_digest=True,
         )
         destination = output_file or diagnostic_dir / "trajectory.png"
-        try:
-            from .plotting.shiftclick_view import render_shiftclick_figure
-
-            actions = None
-            try:
-                from .artifacts.attestation import find_attested_artifact
-
-                actions = find_attested_artifact(
-                    manifest,
-                    run_dir=diagnostic_dir,
-                    kind="actions",
-                )
-            except Exception:
-                actions = None
-            figure = render_shiftclick_figure(
-                trace_path,
-                actions,
-                title=diagnostic_dir.name,
-                fee_source="both",
-            )
-            figure.savefig(destination, dpi=150)
-            image, state = destination, destination.with_suffix(".state.json")
-            state.write_text(
-                '{"schema_version": "fxsim_shiftclick_render_v1", '
-                f'"source": "{trace_path.name}"}}',
-                encoding="utf-8",
-            )
-        except Exception:
-            from .plotting.trajectory import render_trajectory
-
-            image, state = render_trajectory(trace_path, destination)
+        figure = render_shiftclick_figure(
+            trace_path,
+            companion_path=companion_path,
+            title=diagnostic_dir.name,
+            fee_source="both",
+        )
+        figure.savefig(destination, dpi=150)
+        image, state = destination, destination.with_suffix(".state.json")
+        state.write_text(
+            '{"schema_version": "fxsim_shiftclick_render_v1", '
+            f'"source": "{trace_path.name}"}}',
+            encoding="utf-8",
+        )
         _emit({
             "status": "ok",
             "diagnostic_dir": diagnostic_dir.as_posix(),

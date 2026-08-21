@@ -1,0 +1,40 @@
+[grid]
+id = "eurusd-monorepo-sparse-32"
+pair_id = "eurusd"
+tags = ["legacy", "monorepo", "eurusd", "sparse", "32"]
+
+[grid.static_overrides]
+"run.metric_projection" = "summary"
+
+[[grid.axes]]
+name = "A"
+target = { path = "pool.A", scale = 10000, kind = "decimal" }
+values = [50, 1000]
+
+[[grid.axes]]
+name = "donation_apy"
+target = { path = "pool.donation_apy", kind = "decimal" }
+values = [0.01, 0.1]
+
+[[grid.axes]]
+name = "mid_fee_bps"
+targets = [
+  { path = "pool.mid_fee", display_scale = 10000, kind = "decimal" },
+  { path = "pool.out_fee", display_scale = 10000, kind = "decimal" },
+]
+values = [1, 10]
+
+[[grid.axes]]
+name = "ma_time"
+target = { path = "pool.ma_time", kind = "integer" }
+values = [20775]
+
+[[grid.axes]]
+name = "reserved_profit_fraction"
+target = { path = "pool.reserved_profit_fraction", kind = "decimal" }
+values = [0.01, 0.5]
+
+[[grid.axes]]
+name = "user_swap_size_frac"
+target = { path = "pool.user_swap_size_frac", kind = "decimal" }
+values = [0, 0.08]

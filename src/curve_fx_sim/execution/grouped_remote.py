@@ -12,7 +12,8 @@ from typing import Any, Callable, Mapping
 
 from curve_fx_harness_client.models import CandidateResult
 
-from ..artifacts.io import atomic_write_bytes
+from ..artifacts.io import atomic_write_bytes, sha256_path
+from ..artifacts.manifest import load_manifest
 from ..evaluation.grouping import (
     CompiledEvaluation,
     bind_local_session_group,
@@ -28,9 +29,11 @@ from .collection import normalize_session_attestation
 from .grouped import execute_local_groups
 from .shared_nfs import package_identity_sha256
 from .site import validate_remote_host
-from .staging import validate_run_id
+from .paths import validate_run_id
 
-VERSION = "curve_fx_grouped_work_v1"
+VERSION = "curve_fx_grouped_work_v2"
+GRID_WORK_VERSION = "curve_fx_grid_work_v2"
+GRID_RECEIPT_VERSION = "curve_fx_grid_work_receipt_v2"
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
@@ -85,7 +88,7 @@ class GroupedWorkRequest:
     scenarios: tuple[ScenarioSpec, ...]
     selected_provenance_json: bytes
     chunk_size: int
-    lane_count: int
+    evaluator_workers: int
     package_sha256: str
 
     @property
@@ -95,7 +98,7 @@ class GroupedWorkRequest:
             "evaluations": [encode_compiled_evaluation(item) for item in self.evaluations],
             "scenarios": [item.to_dict() for item in self.scenarios],
             "selected_artifact_provenance": json.loads(self.selected_provenance_json),
-            "chunk_size": self.chunk_size, "lane_count": self.lane_count,
+            "chunk_size": self.chunk_size, "evaluator_workers": self.evaluator_workers,
             "package_sha256": self.package_sha256,
         })
 
@@ -120,11 +123,11 @@ class GroupedWorkRequest:
         for field in ("artifact_sha256", "binary_sha256", "parameter_schema_sha256"):
             _sha256(provenance.get(field), f"selected {field}")
         if (isinstance(self.chunk_size, bool) or not isinstance(self.chunk_size, int)
-                or isinstance(self.lane_count, bool)
-                or not isinstance(self.lane_count, int)):
-            raise GroupedRemoteError("chunk_size and lane_count must be integers")
-        if self.chunk_size < 1 or self.lane_count < 1:
-            raise GroupedRemoteError("chunk_size and lane_count must be positive")
+                or isinstance(self.evaluator_workers, bool)
+                or not isinstance(self.evaluator_workers, int)):
+            raise GroupedRemoteError("chunk_size and evaluator_workers must be integers")
+        if self.chunk_size < 1 or self.evaluator_workers < 1:
+            raise GroupedRemoteError("chunk_size and evaluator_workers must be positive")
         _sha256(self.package_sha256, "package_sha256")
         return self
     @classmethod
@@ -133,7 +136,7 @@ class GroupedWorkRequest:
         raw, value = _read_canonical(Path(path), "grouped request")
         _require_fields(value, {
             "version", "run_id", "request_id", "evaluations", "scenarios",
-            "selected_artifact_provenance", "chunk_size", "lane_count", "package_sha256",
+            "selected_artifact_provenance", "chunk_size", "evaluator_workers", "package_sha256",
         }, "grouped request")
         try:
             request = cls(
@@ -141,7 +144,7 @@ class GroupedWorkRequest:
                 tuple(decode_compiled_evaluation(item) for item in value["evaluations"]),
                 tuple(ScenarioSpec.from_dict(item) for item in value["scenarios"]),
                 canonical_json_bytes(value["selected_artifact_provenance"]),
-                value["chunk_size"], value["lane_count"], value["package_sha256"],
+                value["chunk_size"], value["evaluator_workers"], value["package_sha256"],
             ).validated()
         except (KeyError, TypeError, ValueError) as exc:
             raise GroupedRemoteError("grouped request contents are invalid") from exc
@@ -282,7 +285,8 @@ def execute_grouped_work(
         lambda group: bindings[group.key.sha256],
         tuple(str(item.evaluation_id) for item in request.evaluations),
         work_dir=work_root,
-        chunk_size=request.chunk_size, max_workers=request.lane_count, **optional)
+        chunk_size=request.chunk_size, max_workers=1,
+        evaluator_workers=request.evaluator_workers, **optional)
     receipt = GroupedWorkReceipt(
         request.sha256,
         blade_name,
@@ -295,6 +299,237 @@ def execute_grouped_work(
             execution.results_by_evaluation_id[str(item.evaluation_id)]
             for item in request.evaluations
         ),
+        time.monotonic() - started,
+    )
+    atomic_write_bytes(output, receipt.canonical_json)
+    return receipt
+
+
+@dataclass(frozen=True, slots=True)
+class GridWorkRequest:
+    """Small plan-reference request for one blade's persisted grid shards."""
+
+    run_id: str
+    request_id: str
+    blade: str
+    manifest_sha256: str
+    plan_sha256: str
+    artifact_sha256: str
+    metric_projection_sha256: str
+    package_sha256: str
+    evaluator_workers: int
+    shards: tuple[Mapping[str, Any], ...]
+
+    @property
+    def canonical_json(self) -> bytes:
+        return canonical_json_bytes({
+            "schema_version": GRID_WORK_VERSION,
+            "run_id": self.run_id, "request_id": self.request_id, "blade": self.blade,
+            "manifest_sha256": self.manifest_sha256, "plan_sha256": self.plan_sha256,
+            "artifact_sha256": self.artifact_sha256,
+            "metric_projection_sha256": self.metric_projection_sha256,
+            "package_sha256": self.package_sha256,
+            "evaluator_workers": self.evaluator_workers,
+            "shards": list(self.shards),
+        })
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.canonical_json).hexdigest()
+
+    def validated(self) -> GridWorkRequest:
+        validate_run_id(self.run_id)
+        if not isinstance(self.request_id, str) or not _TOKEN.fullmatch(self.request_id):
+            raise GroupedRemoteError("grid request_id is invalid")
+        validate_remote_host(self.blade, "grid request blade")
+        for name in (
+            "manifest_sha256", "plan_sha256", "artifact_sha256",
+            "metric_projection_sha256", "package_sha256",
+        ):
+            _sha256(getattr(self, name), name)
+        if (isinstance(self.evaluator_workers, bool)
+                or not isinstance(self.evaluator_workers, int)
+                or self.evaluator_workers < 1):
+            raise GroupedRemoteError("grid evaluator_workers must be a positive integer")
+        identifiers, previous = [], -1
+        for descriptor in self.shards:
+            if not isinstance(descriptor, Mapping) or set(descriptor) != {
+                "shard_id", "shard_index", "ranges",
+            }:
+                raise GroupedRemoteError("grid shard descriptor has invalid fields")
+            shard_id, shard_index = descriptor["shard_id"], descriptor["shard_index"]
+            if (not isinstance(shard_id, str) or not _TOKEN.fullmatch(shard_id)
+                    or isinstance(shard_index, bool) or not isinstance(shard_index, int)
+                    or shard_index < 0):
+                raise GroupedRemoteError("grid shard identity is invalid")
+            ranges = descriptor["ranges"]
+            if not isinstance(ranges, list) or not ranges:
+                raise GroupedRemoteError("grid shard ranges are invalid")
+            for pair in ranges:
+                if (not isinstance(pair, list) or len(pair) != 2
+                        or any(isinstance(value, bool) or not isinstance(value, int) for value in pair)
+                        or pair[0] < 0 or pair[1] <= pair[0] or pair[0] < previous):
+                    raise GroupedRemoteError("grid shard ranges are not sorted half-open ranges")
+                previous = pair[1]
+            identifiers.append(shard_id)
+        if not identifiers or len(identifiers) != len(set(identifiers)):
+            raise GroupedRemoteError("grid request shards are empty or duplicated")
+        return self
+
+    @classmethod
+    def from_json(cls, path: Path | str) -> GridWorkRequest:
+        raw, value = _read_canonical(Path(path), "grid request")
+        fields = {
+            "schema_version", "run_id", "request_id", "blade", "manifest_sha256",
+            "plan_sha256", "artifact_sha256", "metric_projection_sha256",
+            "package_sha256", "evaluator_workers", "shards",
+        }
+        if set(value) != fields or value.get("schema_version") != GRID_WORK_VERSION:
+            raise GroupedRemoteError("grid request has invalid fields or version")
+        try:
+            request = cls(
+                value["run_id"], value["request_id"], value["blade"],
+                value["manifest_sha256"], value["plan_sha256"],
+                value["artifact_sha256"], value["metric_projection_sha256"],
+                value["package_sha256"], value["evaluator_workers"],
+                tuple(value["shards"]),
+            ).validated()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GroupedRemoteError("grid request contents are invalid") from exc
+        if request.canonical_json != raw:
+            raise GroupedRemoteError("grid request is noncanonical")
+        return request
+
+
+@dataclass(frozen=True, slots=True)
+class GridWorkReceipt:
+    status: str
+    request_sha256: str
+    run_id: str
+    request_id: str
+    blade: str
+    plan_sha256: str
+    artifact_sha256: str
+    shards: tuple[Mapping[str, str], ...]
+    elapsed_seconds: float
+
+    @property
+    def canonical_json(self) -> bytes:
+        return canonical_json_bytes({
+            "schema_version": GRID_RECEIPT_VERSION, "status": self.status,
+            "request_sha256": self.request_sha256, "run_id": self.run_id,
+            "request_id": self.request_id, "blade": self.blade,
+            "plan_sha256": self.plan_sha256, "artifact_sha256": self.artifact_sha256,
+            "shards": list(self.shards), "elapsed_seconds": self.elapsed_seconds,
+        })
+
+    @classmethod
+    def from_json(cls, path: Path | str) -> GridWorkReceipt:
+        raw, value = _read_canonical(Path(path), "grid receipt")
+        fields = {
+            "schema_version", "status", "request_sha256", "run_id", "request_id",
+            "blade", "plan_sha256", "artifact_sha256", "shards", "elapsed_seconds",
+        }
+        if set(value) != fields or value.get("schema_version") != GRID_RECEIPT_VERSION:
+            raise GroupedRemoteError("grid receipt has invalid fields or version")
+        try:
+            shards = tuple(value["shards"])
+            if any(not isinstance(item, Mapping) or set(item) != {
+                "shard_id", "receipt_path", "receipt_sha256",
+            } for item in shards):
+                raise ValueError("invalid shard receipt")
+            receipt = cls(
+                str(value["status"]), _sha256(value["request_sha256"], "request_sha256"),
+                validate_run_id(value["run_id"]), str(value["request_id"]),
+                validate_remote_host(value["blade"], "grid receipt blade"),
+                _sha256(value["plan_sha256"], "plan_sha256"),
+                _sha256(value["artifact_sha256"], "artifact_sha256"),
+                shards, float(value["elapsed_seconds"]),
+            )
+            if (receipt.status != "complete" or not _TOKEN.fullmatch(receipt.request_id)
+                    or not math.isfinite(receipt.elapsed_seconds)
+                    or receipt.elapsed_seconds < 0):
+                raise ValueError("invalid grid receipt status or elapsed time")
+            for item in shards:
+                if (not _TOKEN.fullmatch(str(item["shard_id"]))
+                        or Path(str(item["receipt_path"])).parts != (
+                            "results", f"{item['shard_id']}.receipt.json")
+                        or not _SHA256.fullmatch(str(item["receipt_sha256"]))):
+                    raise ValueError("invalid shard receipt reference")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GroupedRemoteError("grid receipt contents are invalid") from exc
+        if receipt.canonical_json != raw:
+            raise GroupedRemoteError("grid receipt is noncanonical")
+        return receipt
+
+
+def execute_grid_work(
+    request_path: Path | str, output_path: Path | str, *,
+    remote_run_root: Path | str, repository: Path,
+    client_factory: Callable[[SelectedEvaluator, Path], Any] | None = None,
+    blade: str | None = None, timeout_seconds: float = 7200,
+) -> GridWorkReceipt:
+    """Reload and execute one exact shared-NFS Cartesian plan request."""
+    request_file, output, run_id, request_id = _exact_worker_paths(
+        remote_run_root, request_path, output_path,
+    )
+    request = GridWorkRequest.from_json(request_file)
+    blade_name = validate_remote_host(blade or socket.gethostname().split(".", 1)[0], "worker blade")
+    if (request.run_id != run_id or request.request_id != request_id
+            or request.blade != blade_name):
+        raise GroupedRemoteError("grid request identity differs from path or blade")
+    run_dir = Path(remote_run_root).resolve() / run_id
+    manifest_path = run_dir / "manifest.json"
+    if sha256_path(manifest_path) != request.manifest_sha256:
+        raise GroupedRemoteError("grid manifest differs from request")
+    manifest = load_manifest(manifest_path, expected_kind="grid")
+    selected = SelectedEvaluator.load(run_dir / "evaluator_artifact")
+    resolved = manifest.get("resolved_spec")
+    scenario_raw = resolved.get("scenario") if isinstance(resolved, Mapping) else None
+    projection_raw = resolved.get("metric_projection") if isinstance(resolved, Mapping) else None
+    if not isinstance(scenario_raw, Mapping) or not isinstance(projection_raw, Mapping):
+        raise GroupedRemoteError("grid manifest has no scenario or metric projection")
+    scenario = ScenarioSpec.from_dict(scenario_raw)
+    if canonical_json_bytes(scenario.to_dict()) != canonical_json_bytes(scenario_raw):
+        raise GroupedRemoteError("grid scenario is not canonical")
+    plan_raw = manifest["grid"]["plan"]
+    if (manifest.get("run_id") != run_id or plan_raw.get("plan_sha256") != request.plan_sha256
+            or selected.artifact_sha256 != request.artifact_sha256
+            or plan_raw.get("artifact_sha256") != request.artifact_sha256
+            or projection_raw.get("projection_sha256") != request.metric_projection_sha256
+            or selected.provenance != resolved.get("evaluator_artifact_selection")
+            or selected.manifest_core(binary_override="evaluator_artifact/evaluator") != manifest.get("core")
+            or package_identity_sha256(Path(repository).resolve()) != request.package_sha256):
+        raise GroupedRemoteError("grid plan, artifact, projection, or package identity differs")
+    manifest_shards = manifest["grid"].get("shards")
+    if (not isinstance(manifest_shards, list)
+            or any(dict(item) not in manifest_shards for item in request.shards)):
+        raise GroupedRemoteError("grid request contains a shard outside the manifest assignment")
+    from ..evaluation.plans import ScenarioKey
+    from ..grids.runner import load_grid_plan
+    from .grouped_grid import execute_grid_plan
+
+    scenario_key_raw = plan_raw["scenario_key"]
+    scenario_key = ScenarioKey(
+        scenario_key_raw["identity_json"].encode(), scenario_key_raw["sha256"],
+    ).validated()
+    plan = load_grid_plan(manifest, selected_evaluator=selected, scenario=scenario_key)
+    started = time.monotonic()
+    execution = execute_grid_plan(
+        manifest=manifest, plan=plan, selected=selected, scenario=scenario,
+        shards=request.shards, repository=Path(repository).resolve(), work_dir=run_dir,
+        blade=blade_name, work_request_sha256=request.sha256,
+        evaluator_workers=request.evaluator_workers, timeout_seconds=timeout_seconds,
+        client_factory=client_factory,
+    )
+    shard_receipts = tuple({
+        "shard_id": descriptor["shard_id"],
+        "receipt_path": path.relative_to(run_dir).as_posix(),
+        "receipt_sha256": sha256_path(path),
+    } for descriptor, path in zip(request.shards, execution.receipt_paths, strict=True))
+    receipt = GridWorkReceipt(
+        "complete", request.sha256, run_id, request_id, blade_name,
+        plan.plan_sha256, selected.artifact_sha256, shard_receipts,
         time.monotonic() - started,
     )
     atomic_write_bytes(output, receipt.canonical_json)
