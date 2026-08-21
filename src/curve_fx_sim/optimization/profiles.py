@@ -22,6 +22,63 @@ from ..specs.parameters import (
 )
 from ..specs.policy import PolicySpec
 from .lattice import LatticeSpec, TickAxis, decimal_value, quantize_lattice_float
+from .search import SearchLayout
+
+
+@dataclass(frozen=True, slots=True)
+class NamedProfile:
+    """Optimizer-facing name and geometry around a canonical search layout.
+
+    The layout is the sole source of dense-vector meaning.  This wrapper keeps
+    optimizer identity and a portable geometry receipt next to it without
+    exposing evaluator paths or wire-unit conversions.
+    """
+
+    optimizer_name: str
+    layout: SearchLayout
+
+    def __post_init__(self) -> None:
+        if not self.optimizer_name:
+            raise ValueError("optimizer_name must be non-empty")
+
+    @property
+    def geometry_sha256(self) -> str:
+        return self.layout.sha256
+
+    @property
+    def default_vector(self) -> tuple[int | float, ...]:
+        return self.layout.default_vector
+
+    @property
+    def initial_vector(self) -> tuple[int | float, ...]:
+        return self.default_vector
+
+    @property
+    def lattice(self) -> LatticeSpec:
+        return self.layout.create_lattice_spec()
+
+    def to_proposal(self, vector: Sequence[int | float]) -> dict[str, int | float]:
+        return self.layout.to_proposal(vector)
+
+    @property
+    def geometry_receipt(self) -> dict[str, object]:
+        """Return stable geometry metadata, omitting lowering-only details."""
+        return {
+            "optimizer_name": self.optimizer_name,
+            "schema_sha256": self.layout.schema_sha256,
+            "layout_sha256": self.layout.sha256,
+            "dimensions": [
+                {
+                    "name": item.name,
+                    "default": str(item.default),
+                    "minimum": str(item.minimum),
+                    "maximum": str(item.maximum),
+                    "step": str(item.step),
+                    "transform": item.transform,
+                }
+                for item in self.layout.dimensions
+            ],
+        }
 
 
 @dataclass(frozen=True)
@@ -298,6 +355,7 @@ def create_lattice_spec(profile: Profile) -> LatticeSpec:
 
 
 __all__ = [
+    "NamedProfile",
     "Profile",
     "PoolDim",
     "profile_from_policy_spec",

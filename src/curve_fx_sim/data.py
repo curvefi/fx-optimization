@@ -16,7 +16,7 @@ from pathlib import Path
 import tomllib
 from typing import Any, Iterable, Mapping
 
-from .specs.common import repository_root, assert_contained_path
+from .specs.common import assert_contained_path
 
 
 class DataVerificationError(ValueError):
@@ -46,13 +46,9 @@ class VerifiedDataset:
         }
 
 
-def load_data_manifest(path: str | os.PathLike[str] | None = None) -> dict[str, Any]:
+def load_data_manifest(path: str | os.PathLike[str]) -> dict[str, Any]:
     """Load ``data/manifest.toml`` and require the v1 dataset envelope."""
-    manifest_path = (
-        Path(path).resolve()
-        if path is not None
-        else (repository_root() / "data" / "manifest.toml").resolve()
-    )
+    manifest_path = Path(path).resolve()
     if not manifest_path.is_file():
         raise FileNotFoundError(f"data manifest not found at {manifest_path}")
 
@@ -140,7 +136,7 @@ def _schema_error(path: Path, record: Mapping[str, Any]) -> str | None:
 
 
 def verify_data(
-    root: str | os.PathLike[str] | None = None,
+    root: str | os.PathLike[str],
     manifest_path: str | os.PathLike[str] | None = None,
 ) -> tuple[VerifiedDataset, ...]:
     """Verify every manifest file and return immutable verified records.
@@ -149,7 +145,7 @@ def verify_data(
     if any dataset is missing, is an un-pulled Git LFS pointer, has a checksum mismatch,
     or fails schema verification.
     """
-    root_dir = repository_root(root)
+    root_dir = Path(root).resolve()
     manifest = load_data_manifest(manifest_path or (root_dir / "data" / "manifest.toml"))
     raw_datasets: Iterable[Mapping[str, Any]] = manifest.get("datasets", ())
 

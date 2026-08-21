@@ -8,11 +8,14 @@ trajectory plotting, and repository auditing.
 from __future__ import annotations
 
 import json
+import tempfile
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Sequence
 
 import click
+
+from .specs.common import ProjectContext
 
 
 def _jsonable(value: Any) -> Any:
@@ -67,6 +70,16 @@ def _pair_map(raw: str) -> dict[str, float]:
     return pairs
 
 
+def _project_context(run_root: Path | None = None) -> ProjectContext:
+    """Return the explicit root context established by the top-level command."""
+    context = click.get_current_context().find_root().obj
+    if not isinstance(context, ProjectContext):
+        raise click.ClickException("project context is unavailable")
+    if run_root is None:
+        return context
+    return ProjectContext.from_root(context.project_root, run_root=run_root)
+
+
 # ---------------------------------------------------------------------------
 # Top-level main CLI group
 # ---------------------------------------------------------------------------
@@ -74,8 +87,23 @@ def _pair_map(raw: str) -> dict[str, float]:
 
 @click.group()
 @click.version_option(package_name="curve-fx-sim")
-def main() -> None:
+@click.option(
+    "--project-root",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=Path("."),
+    show_default=True,
+    help="Project root containing configs/, data/, and policies/.",
+)
+@click.option(
+    "--run-root",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=None,
+    help="Run output directory (default: PROJECT_ROOT/runs).",
+)
+@click.pass_context
+def main(ctx: click.Context, project_root: Path, run_root: Path | None) -> None:
     """Reproducible Curve FX simulation, grid search, and optimization CLI."""
+    ctx.obj = ProjectContext.from_root(project_root, run_root=run_root)
 
 
 # ---------------------------------------------------------------------------
@@ -89,13 +117,15 @@ def data_group() -> None:
 
 
 @data_group.command("verify")
-@click.option("--root", type=click.Path(path_type=Path, file_okay=False), default=None, help="Repository root.")
 @click.option("--manifest", "manifest_path", type=click.Path(path_type=Path, dir_okay=False), default=None, help="Manifest path.")
-def data_verify(root: Path | None, manifest_path: Path | None) -> None:
+def data_verify(manifest_path: Path | None) -> None:
     """Verify all datasets declared by data/manifest.toml."""
     try:
         from .data import verify_data
-        verified = verify_data(root=root, manifest_path=manifest_path)
+        verified = verify_data(
+            root=_project_context().project_root,
+            manifest_path=manifest_path,
+        )
         _emit({
             "status": "ok",
             "verified_datasets_count": len(verified),
@@ -128,6 +158,113 @@ def harness_identity(binary_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Evaluator commands
+# ---------------------------------------------------------------------------
+
+
+@main.group("evaluator")
+def evaluator_group() -> None:
+    """Build and verify explicitly selected attested evaluator artifacts."""
+
+
+def _context_path(value: Path, root: Path) -> Path:
+    """Resolve a CLI path relative to an explicit context root."""
+    return value if value.is_absolute() else root / value
+
+
+def _evaluator_payload(artifact: Any, *, numeric_mode: str | None = None) -> dict[str, Any]:
+    """Select compact attestation fields without exposing the full description."""
+    description = artifact.description
+    policy = description["policy"]
+    build = description["build"]
+    mode = numeric_mode
+    if mode is None:
+        mode = "f64" if build["numeric_mode"] == "double" else "longdouble"
+    return {
+        "status": "ok",
+        "artifact_dir": artifact.receipt_path.parent.as_posix(),
+        "receipt_path": artifact.receipt_path.as_posix(),
+        "artifact_sha256": artifact.artifact_sha256,
+        "binary_path": artifact.binary_path.as_posix(),
+        "binary_sha256": artifact.binary_sha256,
+        "build_spec_sha256": artifact.build_spec_sha256,
+        "policy_id": policy["id"],
+        "policy_source_sha256": policy["source_sha256"],
+        "policy_parameter_count": policy["parameter_count"],
+        "numeric_mode": mode,
+        "real_digits": build["real_digits"],
+        "parameter_schema_sha256": description["parameter_schema_sha256"],
+    }
+
+
+@evaluator_group.command("build")
+@click.option("--pool-root", type=click.Path(file_okay=False, path_type=Path), required=True)
+@click.option("--harness-root", type=click.Path(file_okay=False, path_type=Path), required=True)
+@click.option("--artifact-dir", type=click.Path(file_okay=False, path_type=Path), required=True)
+@click.option("--policy", "policy_id", default=None)
+@click.option("--numeric-mode", type=click.Choice(["f64", "longdouble"]), default="longdouble", show_default=True)
+@click.option("--build-type", default="Release", show_default=True)
+@click.option("--ipo", "enable_ipo", is_flag=True)
+@click.option("--native-tuning", is_flag=True)
+def evaluator_build(
+    pool_root: Path,
+    harness_root: Path,
+    artifact_dir: Path,
+    policy_id: str | None,
+    numeric_mode: str,
+    build_type: str,
+    enable_ipo: bool,
+    native_tuning: bool,
+) -> None:
+    """Build a fresh attested evaluator artifact from explicit sources."""
+    try:
+        from .evaluation.builder import BuildSpec, build_evaluator
+        from .specs.policy import load_policy_spec
+
+        context = _project_context()
+        resolved_pool = _context_path(pool_root, context.project_root)
+        resolved_harness = _context_path(harness_root, context.project_root)
+        resolved_artifact = _context_path(artifact_dir, context.run_root)
+        values: dict[str, Any] = {
+            "pool_root": resolved_pool,
+            "harness_root": resolved_harness,
+            "numeric_mode": numeric_mode,
+            "build_type": build_type,
+            "enable_ipo": enable_ipo,
+            "native_tuning": native_tuning,
+        }
+        if policy_id is not None:
+            policy = load_policy_spec(policy_id, repository=context.project_root)
+            header = Path(policy.header_file)
+            values.update(
+                policy_header=_context_path(header, context.project_root),
+                policy_id=policy.id,
+                policy_abi=policy.policy_abi,
+                policy_expected_sha256=policy.source_sha256,
+            )
+        spec = BuildSpec(**values)
+        artifact = build_evaluator(spec, resolved_artifact)
+        _emit(_evaluator_payload(artifact, numeric_mode=spec.numeric_mode))
+    except Exception as exc:  # noqa: BLE001
+        _fail(exc)
+
+
+@evaluator_group.command("verify")
+@click.argument("artifact_dir", type=click.Path(path_type=Path, file_okay=False))
+def evaluator_verify(artifact_dir: Path) -> None:
+    """Re-verify one explicitly selected evaluator artifact."""
+    try:
+        from .evaluation.builder import load_evaluator_artifact
+
+        context = _project_context()
+        resolved_artifact = _context_path(artifact_dir, context.run_root)
+        artifact = load_evaluator_artifact(resolved_artifact)
+        _emit(_evaluator_payload(artifact))
+    except Exception as exc:  # noqa: BLE001
+        _fail(exc)
+
+
+# ---------------------------------------------------------------------------
 # Grid commands
 # ---------------------------------------------------------------------------
 
@@ -142,21 +279,35 @@ def grid_group() -> None:
 @click.option("--grid", "grid_id", required=True, help="Grid specification path or ID.")
 @click.option("--scenario", "scenario_id", required=True, help="Scenario specification.")
 @click.option("--policy", "policy_id", default=None, help="Optional policy specification.")
-@click.option("--harness", "harness_path", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True, help="Attested evaluator binary.")
+@click.option("--artifact-dir", type=click.Path(file_okay=False, path_type=Path), default=None, help="Selected evaluator artifact directory.")
+@click.option("--harness", "harness_path", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None, help="Attested evaluator binary.")
 @click.option("--run-id", default=None, help="Immutable run ID (generated if omitted).")
-@click.option("--output-root", type=click.Path(path_type=Path, file_okay=False), default=Path("."), help="Repository root.")
+@click.option(
+    "--output-root",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=None,
+    help="Deprecated command-local alias for --run-root; never controls specs.",
+)
 def grid_generate(
     pair_id: str,
     grid_id: str,
     scenario_id: str,
     policy_id: str | None,
-    harness_path: Path,
+    artifact_dir: Path | None,
+    harness_path: Path | None,
     run_id: str | None,
-    output_root: Path,
+    output_root: Path | None,
 ) -> None:
     """Generate an immutable Cartesian grid run manifest."""
     try:
+        if artifact_dir is None and harness_path is None:
+            raise click.UsageError("exactly one of --artifact-dir or --harness is required")
+        if artifact_dir is not None and harness_path is not None:
+            raise click.UsageError("--artifact-dir and --harness are mutually exclusive")
         from .artifacts.store import RunStore
+        # Initialize the execution package before grids.runner imports its collection
+        # helpers; the package backend references the runner's point loader.
+        from .execution import ExecutionBackend as _ExecutionBackend  # noqa: F401
         from .evaluation.identity import inspect_binary_identity
         from .grids.runner import compile_grid_run
         from .specs.grid import load_grid_spec
@@ -166,45 +317,73 @@ def grid_generate(
         from .evaluation.identity import validate_evaluator_identity
         from .artifacts.tables import MetricProjection
 
-        store = RunStore(root=output_root)
-        pair_spec = load_pair_spec(pair_id, repository=store.root_dir)
-        grid_spec = load_grid_spec(grid_id, repository=store.root_dir)
-        scenario_spec = load_scenario_spec(scenario_id, repository=store.root_dir)
-        identity = inspect_binary_identity(harness_path)
+        context = _project_context(output_root)
+        store = RunStore(context)
+        pair_spec = load_pair_spec(pair_id, repository=context.project_root)
+        grid_spec = load_grid_spec(grid_id, repository=context.project_root)
+        scenario_spec = load_scenario_spec(scenario_id, repository=context.project_root)
+        legacy_identity = inspect_binary_identity(harness_path) if harness_path is not None else None
         effective_policy_id = policy_id or grid_spec.policy_id
         if grid_spec.policy_id and policy_id and grid_spec.policy_id != policy_id:
             raise click.ClickException("--policy does not match the grid policy_id")
         policy_spec = (
-            load_policy_spec(effective_policy_id, repository=store.root_dir)
+            load_policy_spec(effective_policy_id, repository=context.project_root)
             if effective_policy_id
             else None
         )
-        if policy_spec is None:
-            validate_evaluator_identity(
-                identity,
-                expected_policy_id="twocrypto_native",
-                expected_policy_source_sha256="none",
-                expected_policy_parameter_count=0,
-            )
+        if artifact_dir is not None:
+            from .evaluation.selected import SelectedEvaluator
+            from .evaluation.session import LocalSessionMaterialization
+
+            selected = SelectedEvaluator.load(_context_path(artifact_dir, context.run_root))
+            identity = selected.verified_evaluator
+            effective_run_id = run_id or f"grid_{pair_spec.id}_{grid_spec.id}"
+            with tempfile.TemporaryDirectory(prefix="fxsim-grid-session-") as temporary:
+                materialization = LocalSessionMaterialization.from_scenario(
+                    scenario_spec, repository=context.project_root,
+                    manifest_root=Path(temporary), session_id=f"{effective_run_id}_baseline",
+                ).validated()
+                compilation = compile_grid_run(
+                    grid_spec,
+                    run_id=effective_run_id,
+                    pair_spec=pair_spec,
+                    scenario_spec=scenario_spec,
+                    store=store,
+                    metric_projection=MetricProjection.from_fields(identity.metric_fields, projection_id="grid"),
+                    selected_evaluator=selected,
+                    open_session=materialization.baseline_open_session_fields,
+                    scenario=materialization.closure,
+                    policy_spec=policy_spec,
+                )
         else:
-            validate_evaluator_identity(
-                identity,
-                expected_policy_id=policy_spec.id,
-                expected_policy_source_sha256=policy_spec.source_sha256,
-                expected_policy_abi=policy_spec.policy_abi,
-                expected_policy_parameter_count=len(policy_spec.parameters),
+            assert harness_path is not None
+            assert legacy_identity is not None
+            identity = legacy_identity
+            if policy_spec is None:
+                validate_evaluator_identity(
+                    identity,
+                    expected_policy_id="twocrypto_native",
+                    expected_policy_source_sha256="none",
+                    expected_policy_parameter_count=0,
+                )
+            else:
+                validate_evaluator_identity(
+                    identity,
+                    expected_policy_id=policy_spec.id,
+                    expected_policy_source_sha256=policy_spec.source_sha256,
+                    expected_policy_abi=policy_spec.policy_abi,
+                    expected_policy_parameter_count=len(policy_spec.parameters),
+                )
+            compilation = compile_grid_run(
+                grid_spec,
+                run_id=run_id or f"grid_{pair_spec.id}_{grid_spec.id}",
+                pair_spec=pair_spec,
+                scenario_spec=scenario_spec,
+                store=store,
+                metric_projection=MetricProjection.from_fields(identity.metric_fields, projection_id="grid"),
+                evaluator_identity=identity,
+                policy_spec=policy_spec,
             )
-        fields = identity.metric_fields
-        compilation = compile_grid_run(
-            grid_spec,
-            run_id=run_id or f"grid_{pair_spec.id}_{grid_spec.id}",
-            pair_spec=pair_spec,
-            scenario_spec=scenario_spec,
-            store=store,
-            metric_projection=MetricProjection.from_fields(fields, projection_id="grid"),
-            evaluator_identity=identity,
-            policy_spec=policy_spec,
-        )
 
         _emit({
             "status": "ok",
@@ -240,13 +419,27 @@ def grid_run(
         if manifest_file.is_dir():
             manifest_file = manifest_file / "manifest.json"
 
-        profile = load_site_profile(site)
+        context = _project_context()
+        try:
+            manifest_payload = json.loads(manifest_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            manifest_payload = None
+        resolved = manifest_payload.get("resolved_spec") if isinstance(manifest_payload, dict) else None
+        candidate_compilation = resolved.get("candidate_compilation") if isinstance(resolved, dict) else None
+        if harness_path is not None and isinstance(candidate_compilation, dict) and candidate_compilation.get("mode"):
+            raise click.ClickException(
+                "artifact-selected grid manifests use their run-local evaluator; "
+                "--harness is not accepted"
+            )
+
+        profile = load_site_profile(site, root=context.project_root)
         backend = ExecutionBackend(site_profile=profile, harness_binary=harness_path)
         summary = backend.run_grid(
             manifest_file,
             resume=resume,
             blades=list(blades) if blades else None,
             chunk_size=chunk_size,
+            repository=context.project_root,
         )
         _emit({
             "status": summary.status,
@@ -278,6 +471,37 @@ def grid_collect(manifest_file: Path, output_file: Path | None) -> None:
         _fail(exc)
 
 
+@main.group("worker")
+def worker_group() -> None:
+    """Run narrow artifact-authoritative worker protocols."""
+
+
+@worker_group.command("package-identity")
+def worker_package_identity() -> None:
+    """Print the project package identity used by execution closures."""
+    from .execution.shared_nfs import package_identity_sha256
+    click.echo(package_identity_sha256(_project_context().project_root))
+
+
+@worker_group.command("grouped")
+@click.argument("request_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--out", "output_path", type=click.Path(dir_okay=False, path_type=Path), required=True)
+@click.option("--remote-run-root", type=click.Path(file_okay=False, path_type=Path), required=True)
+@click.option("--blade", default=None, hidden=True)
+def worker_grouped(request_path: Path, output_path: Path, remote_run_root: Path,
+                   blade: str | None) -> None:
+    """Execute one canonical grouped request against its run-local evaluator."""
+    try:
+        from .execution.grouped_remote import execute_grouped_work
+        receipt = execute_grouped_work(request_path, output_path,
+            remote_run_root=remote_run_root,
+            repository=_project_context().project_root, blade=blade)
+        _emit({"status": "ok", "request_sha256": receipt.request_sha256,
+               "result": output_path.as_posix()})
+    except Exception as exc:  # noqa: BLE001
+        _fail(exc)
+
+
 # ---------------------------------------------------------------------------
 # Optimization commands
 # ---------------------------------------------------------------------------
@@ -289,17 +513,58 @@ def optimize_group() -> None:
 
 
 @optimize_group.command("preflight")
-@click.argument("spec_path", type=click.Path(exists=True, path_type=Path))
-def optimize_preflight(spec_path: Path) -> None:
+@click.argument("spec_ref")
+@click.option("--artifact-dir", type=click.Path(file_okay=False, path_type=Path), default=None)
+def optimize_preflight(spec_ref: str, artifact_dir: Path | None) -> None:
     """Validate optimization configuration, lattice bounds, and initial seeds."""
     try:
         from .specs.optimization import load_optimization_spec
         from .specs.policy import load_policy_spec
         from .optimization.profiles import profile_from_policy_spec
-        from .specs.common import repository_root
+        context = _project_context()
+        root = context.project_root
+        if artifact_dir is not None:
+            from .evaluation.selected import SelectedEvaluator
+            from .evaluation.session import LocalSessionMaterialization
+            from .optimization.search import SearchLayout
+            from .specs.scenario import load_scenario_spec
 
-        root = repository_root(spec_path)
-        spec = load_optimization_spec(spec_path, repository=root)
+            selected = SelectedEvaluator.load(_context_path(artifact_dir, context.run_root))
+            spec = load_optimization_spec(
+                spec_ref, repository=root, parameter_space_authority="selected_schema"
+            )
+            policy = selected.policy_identity
+            if spec.policy_id != policy["id"]:
+                raise ValueError(
+                    f"optimization policy_id {spec.policy_id!r} does not match "
+                    f"selected evaluator policy {policy['id']!r}"
+                )
+            scenario = load_scenario_spec(spec.scenarios[0], repository=root)
+            template_json = None
+            if scenario.template_path is not None:
+                with (root / scenario.template_path).open("r", encoding="utf-8") as stream:
+                    template_json = json.load(stream)
+            with tempfile.TemporaryDirectory(prefix="fxsim-opt-preflight-") as temporary:
+                materialization = LocalSessionMaterialization.from_scenario(
+                    scenario, repository=root, manifest_root=Path(temporary),
+                    session_id=f"preflight_{spec.id}",
+                ).validated()
+                layout = SearchLayout.from_schema(
+                    selected.compiler.schema, spec.parameter_space, template_json,
+                    materialization.baseline_open_session_fields,
+                )
+            _emit({
+                "status": "ok", "optimization_id": spec.id, "algorithm": spec.algorithm,
+                "pair": spec.pair_id, "policy_id": policy["id"],
+                "policy_source_sha256": policy["source_sha256"],
+                "artifact_sha256": selected.artifact_sha256,
+                "parameter_schema_sha256": selected.parameter_schema_sha256,
+                "dimensions": len(layout.dimensions),
+                "parameter_names": [item.name for item in layout.dimensions],
+                "geometry_sha256": layout.sha256, "default_vector": layout.default_vector,
+            })
+            return
+        spec = load_optimization_spec(spec_ref, repository=root)
         policy = load_policy_spec(spec.policy_id, repository=root)
         profile = profile_from_policy_spec(policy, spec.parameter_space)
         _emit({
@@ -320,7 +585,7 @@ def optimize_preflight(spec_path: Path) -> None:
 @optimize_group.command("worker")
 @click.argument("bundle_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--harness", "harness_path", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
-@click.option("--root", "repository_root", type=click.Path(path_type=Path, file_okay=False), default=None)
+@click.option("--root", "repository_root", type=click.Path(path_type=Path, file_okay=False), default=None, help="Deprecated project-root override for remote workers.")
 @click.option("--out", "output_file", type=click.Path(path_type=Path, dir_okay=False), required=True)
 def optimize_worker(
     bundle_path: Path,
@@ -334,9 +599,11 @@ def optimize_worker(
         from .optimization.worker import OptimizationWorkBundle, evaluate_work_bundle
 
         bundle = OptimizationWorkBundle.from_json(bundle_path)
+        root = (repository_root or _project_context().project_root).resolve()
         client = SubprocessHarnessClient(
             harness_path,
-            repository=(repository_root or bundle_path.parent).resolve(),
+            repository=root,
+            work_dir=root,
         )
         result = evaluate_work_bundle(bundle, client)
         result.to_json(output_file)
@@ -347,21 +614,28 @@ def optimize_worker(
 
 
 @optimize_group.command("run")
-@click.argument("spec_path", type=click.Path(exists=True, path_type=Path))
+@click.argument("spec_ref")
 @click.option("--site", default="local", help="Site profile name or path.")
 @click.option("--blades", multiple=True, help="Specific blades to target for distributed execution.")
 @click.option("--run-id", default=None, help="Immutable run ID.")
 @click.option("--resume", is_flag=True, help="Resume incomplete optimization run.")
-@click.option("--output-root", type=click.Path(path_type=Path, file_okay=False), default=Path("."))
+@click.option(
+    "--output-root",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=None,
+    help="Deprecated command-local alias for --run-root; never controls specs.",
+)
 @click.option("--harness", "harness_path", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None, help="Explicit local evaluator binary.")
+@click.option("--artifact-dir", type=click.Path(file_okay=False, path_type=Path), default=None, help="Verified evaluator artifact for schema-named local optimization.")
 def optimize_run(
-    spec_path: Path,
+    spec_ref: str,
     site: str,
     blades: tuple[str, ...],
     run_id: str | None,
     resume: bool,
-    output_root: Path,
+    output_root: Path | None,
     harness_path: Path | None,
+    artifact_dir: Path | None,
 ) -> None:
     """Execute adaptive parameter optimization."""
     try:
@@ -369,13 +643,35 @@ def optimize_run(
         from .optimization import run_optimization
         from .specs.optimization import load_optimization_spec
 
-        store = RunStore(root=output_root)
+        if harness_path is not None and artifact_dir is not None:
+            raise click.UsageError("--artifact-dir and --harness are mutually exclusive")
+        context = _project_context(output_root)
+        store = RunStore(context)
         client = None
+        selected = None
         if harness_path is not None:
             from .evaluation.client import SubprocessHarnessClient
 
-            client = SubprocessHarnessClient(harness_path, repository=store.root_dir)
-        spec = load_optimization_spec(spec_path)
+            client = SubprocessHarnessClient(
+                harness_path,
+                repository=context.project_root,
+                work_dir=context.project_root,
+            )
+        elif artifact_dir is not None:
+            from .evaluation.selected import SelectedEvaluator
+
+            selected = SelectedEvaluator.load(
+                _context_path(artifact_dir, context.run_root)
+            )
+        spec = (
+            load_optimization_spec(
+                spec_ref,
+                repository=context.project_root,
+                parameter_space_authority="selected_schema",
+            )
+            if selected is not None
+            else load_optimization_spec(spec_ref, repository=context.project_root)
+        )
         effective_run_id = run_id or f"opt_{spec.id}"
         result = run_optimization(
             spec,
@@ -385,7 +681,8 @@ def optimize_run(
             resume=resume,
             site=site,
             blades=blades,
-            repository=store.root_dir,
+            repository=context.project_root,
+            selected_evaluator=selected,
         )
         _emit({"status": "ok", "run_id": effective_run_id, "result": _jsonable(result)})
     except Exception as exc:  # noqa: BLE001
@@ -397,9 +694,17 @@ def optimize_run(
 def optimize_status(run_id_or_path: str) -> None:
     """Query current optimization progress and best candidate checkpoint."""
     try:
+        from .artifacts.store import RunStore
         from .optimization import status_optimization
 
-        _emit(status_optimization(run_id_or_path).to_dict())
+        context = _project_context()
+        _emit(
+            status_optimization(
+                run_id_or_path,
+                store=RunStore(context),
+                repository=context.project_root,
+            ).to_dict()
+        )
     except Exception as exc:  # noqa: BLE001
         _fail(exc)
 
@@ -410,9 +715,15 @@ def optimize_status(run_id_or_path: str) -> None:
 def optimize_collect(run_id_or_path: str, output_file: Path | None) -> None:
     """Collect and finalize optimization trajectory and candidate ranking."""
     try:
+        from .artifacts.store import RunStore
         from .optimization import collect_optimization
 
-        result = collect_optimization(run_id_or_path)
+        context = _project_context()
+        result = collect_optimization(
+            run_id_or_path,
+            store=RunStore(context),
+            repository=context.project_root,
+        )
         payload = {"status": "ok", **result.to_dict()}
         if output_file is not None:
             from .artifacts.io import atomic_write_json
@@ -452,12 +763,12 @@ def replay_shiftclick(
         from .artifacts.store import RunStore
         from .evaluation.client import SubprocessHarnessClient
         from .shiftclick import run_shiftclick
-        from .specs.common import repository_root
         from .specs.shiftclick import load_shiftclick_spec
 
-        spec = load_shiftclick_spec(spec_path)
-        root = repository_root()
-        store = RunStore(root)
+        context = _project_context()
+        root = context.project_root
+        spec = load_shiftclick_spec(spec_path, repository=root)
+        store = RunStore(context)
         if site != "local" or blades:
             from .execution.site import load_site_profile
             from .shiftclick import run_remote_shiftclick
@@ -479,7 +790,11 @@ def replay_shiftclick(
             return
         if harness_path is None:
             raise click.ClickException("--harness is required for a full-trace replay")
-        client = SubprocessHarnessClient(harness_path, repository=root)
+        client = SubprocessHarnessClient(
+            harness_path,
+            repository=root,
+            work_dir=context.run_root,
+        )
         result = run_shiftclick(
             spec,
             store=store,
@@ -493,6 +808,79 @@ def replay_shiftclick(
 # ---------------------------------------------------------------------------
 # Plotting commands
 # ---------------------------------------------------------------------------
+
+
+@main.command("view")
+@click.argument("run_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--metrics", default=None, help="Comma-separated metrics to tile (default: all table metrics).")
+@click.option("--ncol", type=int, default=3, show_default=True, help="Tiles per row.")
+@click.option("--log-axis", "log_axis_values", multiple=True, help="Log-scale an axis; repeat or comma-separate.")
+@click.option("--max-pricethr", type=float, default=100.0, show_default=True, help="Masked max price difference threshold in bps.")
+@click.option("--skewthr", type=float, default=None, help="Masked max skew threshold in percent.")
+@click.option("--slipthr", type=float, default=20.0, show_default=True, help="Masked APY slippage cap in bps.")
+@click.option("--slipthr-max", type=float, default=100.0, show_default=True, help="Upper range of the slippage control in bps (not a second mask bound).")
+@click.option("--last-pdifthr", "last_pdiffthr", type=float, default=None, help="Masked final price difference threshold in bps.")
+@click.option("--harness", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None, help="Attested evaluator for exact-cell replay.")
+@click.option("--site", default="local", show_default=True, help="Local or configured SSH site for replay.")
+@click.option("--blade", default=None, help="Remote blade for replay (defaults to the first configured blade).")
+@click.option("--out", "output_file", type=click.Path(path_type=Path, dir_okay=False), default=None, help="PNG path; writes a state sidecar beside it.")
+def view_run(
+    run_dir: Path,
+    metrics: str | None,
+    ncol: int,
+    log_axis_values: tuple[str, ...],
+    max_pricethr: float,
+    skewthr: float | None,
+    slipthr: float,
+    slipthr_max: float,
+    last_pdiffthr: float | None,
+    harness: Path | None,
+    site: str,
+    blade: str | None,
+    output_file: Path | None,
+) -> None:
+    """Open the maintained three-window N-D explorer for one run directory."""
+    try:
+        from .artifacts.store import RunStore
+        from .plotting.explorer import open_explorer
+        from .plotting.heatmap import interactive_backend_active
+
+        if slipthr > slipthr_max:
+            raise click.ClickException("--slipthr cannot exceed --slipthr-max")
+        selected_metrics = _metric_list(metrics) if metrics is not None else None
+        log_axes = [name.strip() for raw in log_axis_values for name in raw.split(",") if name.strip()]
+        explorer = open_explorer(
+            run_dir,
+            metrics=selected_metrics,
+            ncol=ncol,
+            log_axes=log_axes,
+            max_pricethr=max_pricethr,
+            skewthr=skewthr,
+            slipthr=slipthr,
+            slipthr_max=slipthr_max,
+            final_pdiffthr=last_pdiffthr,
+            harness=harness,
+            site=site,
+            blade=blade,
+            store=RunStore(_project_context()),
+        )
+        image = sidecar = None
+        try:
+            if output_file is not None:
+                image, sidecar = explorer.save(output_file)
+            if interactive_backend_active():
+                explorer.show()
+        finally:
+            explorer.close()
+        _emit({
+            "status": "ok",
+            "run_dir": run_dir.as_posix(),
+            "metrics": list(explorer.metrics),
+            "output": image.as_posix() if image is not None else None,
+            "state": sidecar.as_posix() if sidecar is not None else None,
+        })
+    except Exception as exc:  # noqa: BLE001
+        _fail(exc)
 
 
 @main.group("plot")
@@ -525,13 +913,13 @@ def plot_group() -> None:
     "--slipthr",
     type=float,
     default=None,
-    help="Lower bound (bps) of the tw_real_slippage_1pct pass window; cells below it are masked (fraction units, bps/10000). Requires --metrics.",
+    help="Slippage cap in bps for masked APY metrics. Requires --metrics.",
 )
 @click.option(
     "--slipthr-max",
     type=float,
     default=None,
-    help="Upper bound (bps) of the tw_real_slippage_1pct pass window; cells above it are masked (fraction units, bps/10000). Requires --metrics.",
+    help="Upper range of the slippage control in bps (not a second mask bound). Requires --metrics.",
 )
 @click.option("--x", "x_axis", default=None, help="Parameter name for X axis.")
 @click.option("--y", "y_axis", default=None, help="Parameter name for Y axis.")
@@ -551,100 +939,51 @@ def plot_heatmap(
 ) -> None:
     """Render a parameter heatmap from an attested evaluation table.
 
-    Always writes the PNG slice and the fxsim_heatmap_state_v1 sidecar
-    (carrying the full N-D data pointers).  With --metrics renders one tile per
-    metric in an --ncol grid sharing the same slice and validity mask; masked
-    cells are NaN on every tile.  When a display-capable matplotlib backend is
-    active the interactive slider figure is shown automatically.
+    Uses the same maintained explorer as ``fxsim view`` and always writes the
+    PNG slice plus its fxsim_heatmap_state_v1 sidecar.  With --metrics it
+    renders one tile per metric in an --ncol grid.
     """
     try:
-        from .artifacts.attestation import load_attested_evaluation_table
-        from .artifacts.manifest import load_manifest
-        from .plotting.heatmap import (
-            HeatmapDataset,
-            HeatmapState,
-            MatplotlibHeatmapTilesView,
-            MatplotlibHeatmapView,
-            MaskSpec,
-            interactive_backend_active,
-        )
-        from .plotting.masked_metrics import MASKED_METRIC_SOURCES
+        from .artifacts.store import RunStore
+        from .plotting.explorer import open_explorer
+        from .plotting.heatmap import interactive_backend_active
 
-        manifest = load_manifest(run_dir / "manifest.json")
-        table, table_path = load_attested_evaluation_table(
-            manifest,
-            run_dir=run_dir,
-        )
         destination = output_file or run_dir / "heatmap.png"
-        dataset = HeatmapDataset.from_table(table)
-        tile_metrics = _metric_list(metrics) if metrics is not None else None
+        tile_metrics = _metric_list(metrics) if metrics is not None else ([metric] if metric else None)
         if slipthr is not None and slipthr_max is not None and slipthr > slipthr_max:
             raise click.ClickException("--slipthr cannot exceed --slipthr-max")
-        log_axes = [name for raw in log_axis_values for name in raw.split(",") if name.strip()]
-        if tile_metrics is None:
-            if log_axes or max_pricethr is not None or slipthr is not None or slipthr_max is not None:
-                raise click.ClickException(
-                    "--ncol/--log-axis/--max-pricethr/--slipthr/--slipthr-max require --metrics"
-                )
-            state = HeatmapState.default(
-                dataset,
-                metric=metric,
-                x_axis=x_axis,
-                y_axis=y_axis,
-            )
-            state.source = table_path.name
-            view = MatplotlibHeatmapView(dataset, state)
-            try:
-                image, sidecar = view.save(destination)
-            finally:
-                if interactive_backend_active():
-                    view.show()
-                view.close()
-            _emit({
-                "status": "ok",
-                "run_dir": run_dir.as_posix(),
-                "results_source": table_path.as_posix(),
-                "metric": state.metric,
-                "output": image.as_posix(),
-                "state": sidecar.as_posix(),
-            })
-            return
-        available = tuple(dataset.metrics) + tuple(sorted(MASKED_METRIC_SOURCES))
-        missing = [name for name in tile_metrics if name not in available]
-        if missing:
-            raise click.ClickException(
-                f"unknown heatmap metric(s): {', '.join(missing)}; "
-                f"available metrics: {', '.join(available)}"
-            )
-        mask = MaskSpec(
-            max_price_diff_bps=max_pricethr,
-            slippage_thr_bps=slipthr,
-            slippage_thr_max_bps=slipthr_max,
-        )
-        view = MatplotlibHeatmapTilesView(
-            dataset,
-            tiles=tile_metrics,
+        log_axes = [
+            name.strip()
+            for raw in log_axis_values
+            for name in raw.split(",")
+            if name.strip()
+        ]
+        explorer = open_explorer(
+            run_dir,
+            metrics=tile_metrics,
+            ncol=ncol if metrics is not None else 1,
+            log_axes=log_axes,
             x_axis=x_axis,
             y_axis=y_axis,
-            ncol=ncol,
-            log_axes=log_axes,
-            mask=mask,
+            max_pricethr=max_pricethr,
+            slipthr=slipthr,
+            slipthr_max=slipthr_max,
+            store=RunStore(_project_context()),
         )
-        view.state.source = table_path.name
         try:
-            image, sidecar = view.save(destination)
-        finally:
+            image, sidecar = explorer.save(destination)
             if interactive_backend_active():
-                view.show()
-            view.close()
+                explorer.show()
+        finally:
+            explorer.close()
         _emit({
             "status": "ok",
             "run_dir": run_dir.as_posix(),
-            "results_source": table_path.as_posix(),
-            "metric": view.state.tiles[0],
-            "metrics": list(view.state.tiles),
-            "ncol": view.state.ncol,
-            "log_axes": list(view.state.log_axes),
+            "results_source": (run_dir / str(explorer.state.source)).as_posix(),
+            "metric": explorer.state.tiles[0],
+            "metrics": list(explorer.state.tiles),
+            "ncol": explorer.state.ncol,
+            "log_axes": list(explorer.state.log_axes),
             "output": image.as_posix(),
             "state": sidecar.as_posix(),
         })
@@ -934,15 +1273,12 @@ def verify_run(run_dir: Path) -> None:
 
 
 @repo_group.command("audit")
-@click.option("--root", type=click.Path(exists=True, file_okay=False, path_type=Path), default=None)
-def repo_audit(root: Path | None) -> None:
+def repo_audit() -> None:
     """Verify that no forbidden historical binaries or run outputs are tracked."""
     try:
         import subprocess
 
-        from .specs.common import repository_root
-
-        repo = root.resolve() if root is not None else repository_root()
+        repo = _project_context().project_root
         proc = subprocess.run(
             ["git", "-C", str(repo), "ls-files", "-z"],
             check=True,

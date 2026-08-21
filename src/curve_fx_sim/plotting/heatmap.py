@@ -21,7 +21,11 @@ from matplotlib.widgets import RadioButtons, Slider
 from ..artifacts.io import atomic_write_json
 from ..artifacts.tables import EvaluationTable
 from ..evaluation.selection import SelectionRef
-from .masked_metrics import MASKED_METRIC_SOURCES, SLIPPAGE_APY_MASK_SOURCES
+from .masked_metrics import (
+    MASKED_METRIC_SOURCES,
+    SKEW_MASKED_METRICS,
+    SLIPPAGE_APY_MASK_SOURCES,
+)
 from ..grids.analysis import (
     GridAnalysisError,
     dense_grid_axes,
@@ -110,8 +114,24 @@ def _auto_log(values: Sequence[Any]) -> bool:
         return False
     if np.any(~np.isfinite(numbers)) or np.any(numbers <= 0):
         return False
-    ratios = numbers[1:] / numbers[:-1]
-    return bool(np.allclose(ratios, np.median(ratios), rtol=0.08, atol=0.0))
+    log_diffs = np.diff(np.log(numbers))
+    linear_diffs = np.diff(numbers)
+    if np.any(log_diffs <= 0) or np.any(linear_diffs <= 0):
+        return False
+    log_mean = float(np.mean(log_diffs))
+    linear_mean = float(np.mean(linear_diffs))
+    if log_mean <= 0 or linear_mean <= 0:
+        return False
+    log_cv = float(np.std(log_diffs) / log_mean)
+    linear_cv = float(np.std(linear_diffs) / linear_mean)
+    if log_cv < 0.05 and log_cv < linear_cv:
+        return True
+    # A forced-included value may perturb two gaps in an otherwise geometric grid.
+    median = float(np.median(log_diffs))
+    if median <= 0:
+        return False
+    close_share = float(np.mean(np.abs(log_diffs / median - 1.0) < 0.15))
+    return close_share >= 0.85 and log_cv < linear_cv
 
 
 def _inferred_scale(values: Sequence[Any]) -> AxisScale:
@@ -387,7 +407,13 @@ class HeatmapDataset:
         return mask
 
     def _masked_metric_array(self, name: str, mask: MaskSpec) -> np.ndarray:
-        """Legacy masked-metric derivation (see plotting.masked_metrics)."""
+        """Apply conditional legacy filters to a masked metric.
+
+        Raw tiles are observations, not pass/fail views: their values are only
+        invalidated by a failed evaluation row.  The threshold controls belong
+        to the derived ``*_masked`` family and are intentionally conditional
+        on that metric's semantics.
+        """
         source = MASKED_METRIC_SOURCES[name]
         if source not in self.metrics:
             raise HeatmapValidationError(
@@ -406,7 +432,7 @@ class HeatmapDataset:
             )
             if pdiff is None:
                 raise HeatmapValidationError("price-difference mask metric is unavailable")
-            values[pdiff > mask.max_price_diff_bps / 10_000.0] = np.nan
+            values[np.abs(pdiff) > mask.max_price_diff_bps / 10_000.0] = np.nan
         slippage_source = SLIPPAGE_APY_MASK_SOURCES.get(name)
         if slippage_source is not None and mask.slippage_thr_bps is not None:
             if slippage_source not in self.metrics:
@@ -415,6 +441,20 @@ class HeatmapDataset:
                 )
             slippage = np.asarray(self.metrics[slippage_source], dtype=float)
             values[~np.isfinite(slippage) | (slippage > mask.slippage_thr_bps / 10_000.0)] = np.nan
+        if name in SKEW_MASKED_METRICS:
+            if mask.max_skew_percent is not None:
+                if "max_7d_skew" not in self.metrics:
+                    raise HeatmapValidationError("skew mask metric is unavailable")
+                skew = np.asarray(self.metrics["max_7d_skew"], dtype=float)
+                values[~np.isfinite(skew) | (np.abs(skew) > mask.max_skew_percent / 100.0)] = np.nan
+            if mask.max_final_price_diff_bps is not None:
+                if "final_rel_price_diff" not in self.metrics:
+                    raise HeatmapValidationError("final price-difference mask metric is unavailable")
+                final_diff = np.asarray(self.metrics["final_rel_price_diff"], dtype=float)
+                values[
+                    ~np.isfinite(final_diff)
+                    | (np.abs(final_diff) > mask.max_final_price_diff_bps / 10_000.0)
+                ] = np.nan
         return values
 
     def metric_array(self, name: str, mask: MaskSpec = MaskSpec()) -> np.ndarray:
@@ -423,7 +463,7 @@ class HeatmapDataset:
         if name not in self.metrics:
             raise HeatmapValidationError(f"unknown heatmap metric {name!r}")
         values = np.asarray(self.metrics[name], dtype=float).copy()
-        values[~self._mask(mask)] = np.nan
+        values[~np.asarray(self.valid, dtype=bool)] = np.nan
         return values
 
     def slice_metric(
@@ -453,7 +493,7 @@ class HeatmapDataset:
             result = result.T
         return np.asarray(result, dtype=float)
 
-    def point(self, indices: Sequence[int], mask: MaskSpec = MaskSpec()) -> HeatmapSelection:
+    def point(self, indices: Sequence[int]) -> HeatmapSelection:
         if len(indices) != len(self.axes):
             raise HeatmapValidationError("heatmap point dimensionality is invalid")
         location = tuple(int(index) for index in indices)
@@ -465,11 +505,11 @@ class HeatmapDataset:
         candidate_id = str(self.candidate_ids[location])
         if not candidate_id:
             raise HeatmapValidationError("selected heatmap cell has no exact candidate")
-        if not bool(self.valid[location]) or not bool(self._mask(mask)[location]):
-            raise HeatmapValidationError("selected heatmap cell is invalid or masked")
+        if not bool(self.valid[location]):
+            raise HeatmapValidationError("selected heatmap cell is invalid")
         metrics: dict[str, float | None] = {}
         for name in self.metrics:
-            value = float(self.metric_array(name, mask)[location])
+            value = float(self.metric_array(name)[location])
             metrics[name] = value if math.isfinite(value) else None
         return HeatmapSelection(
             candidate_id=candidate_id,
@@ -662,8 +702,12 @@ class HeatmapState:
         candidates = active + [axis.key for axis in dataset.axes if axis.key not in active]
         if len(candidates) < 2:
             raise HeatmapValidationError("heatmap needs two axes")
-        selected_x = x_axis or candidates[0]
-        selected_y = y_axis or next(key for key in candidates if key != selected_x)
+        canonical = {"donation_apy", "reserved_profit_fraction"}
+        if x_axis is None and y_axis is None and canonical <= set(active):
+            selected_x, selected_y = "donation_apy", "reserved_profit_fraction"
+        else:
+            selected_x = x_axis or candidates[0]
+            selected_y = y_axis or next(key for key in candidates if key != selected_x)
         metrics = tuple(dataset.metrics)
         resolved_metric = metric
         if resolved_metric is None:
@@ -801,8 +845,12 @@ class HeatmapTilesState:
         candidates = active + [axis.key for axis in dataset.axes if axis.key not in active]
         if len(candidates) < 2:
             raise HeatmapValidationError("heatmap needs two axes")
-        selected_x = x_axis or candidates[0]
-        selected_y = y_axis or next(key for key in candidates if key != selected_x)
+        canonical = {"donation_apy", "reserved_profit_fraction"}
+        if x_axis is None and y_axis is None and canonical <= set(active):
+            selected_x, selected_y = "donation_apy", "reserved_profit_fraction"
+        else:
+            selected_x = x_axis or candidates[0]
+            selected_y = y_axis or next(key for key in candidates if key != selected_x)
         return cls(
             axes=dataset.axes,
             metrics=tuple(dataset.metrics),
@@ -832,9 +880,9 @@ def _edges(centers: np.ndarray, *, logarithmic: bool) -> np.ndarray:
     if len(centers) == 1:
         center = float(centers[0])
         if logarithmic:
-            factor = math.sqrt(10.0)
+            factor = math.sqrt(2.0)
             return np.asarray([center / factor, center * factor])
-        width = max(abs(center) * 0.1, 0.5)
+        width = abs(center) * 0.5 if center else 0.5
         return np.asarray([center - width, center + width])
     if logarithmic:
         logs = np.log(centers)
@@ -1030,7 +1078,7 @@ class MatplotlibHeatmapView:
         indices = [self.state.slider_indices.get(axis.key, 0) for axis in self.dataset.axes]
         indices[self.dataset.axis_index(x_axis.key)] = x_index
         indices[self.dataset.axis_index(y_axis.key)] = y_index
-        return self.dataset.point(indices, self.state.mask)
+        return self.dataset.point(indices)
 
     def _on_click(self, event: MouseEvent) -> None:
         if event.button not in {MouseButton.LEFT, 1}:

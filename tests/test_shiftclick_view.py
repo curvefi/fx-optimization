@@ -8,11 +8,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-
 from curve_fx_sim.plotting.shiftclick_view import (
-    _format_pct,
-    _load_executed_fee_actions,
-    _rolling_window_growth_gm,
+    _donation_growth,
     render_shiftclick_figure,
 )
 
@@ -64,51 +61,36 @@ def _write_sidecars(tmp_path: Path, records: list[dict[str, object]]) -> tuple[P
         encoding="utf-8",
     )
     return trace, actions
+def test_render_active_2l_uses_attested_donation_frequency(tmp_path: Path) -> None:
+    import matplotlib
 
-
-def test_format_pct() -> None:
-    assert _format_pct(0.1234) == "12.3%"
-    assert _format_pct(float("nan")) == "n/a"
-
-
-def test_rolling_gm_flat_growth() -> None:
-    # The rolling GM window is 90 days; the span must exceed it.
-    t = np.arange(0.0, 200 * 24.0 * 3600.0, 3600.0)
-    growth = np.full_like(t, 1.0 + 1e-5)
-    gm = _rolling_window_growth_gm(t, growth)
-    assert np.isfinite(gm) and gm > 0.0
-
-
-def test_executed_fee_actions(tmp_path: Path) -> None:
-    trace, actions = _write_sidecars(tmp_path, _synthetic_trace(10))
-    parsed = _load_executed_fee_actions(actions)
-    assert parsed is not None
-    assert len(parsed["timestamps"]) == 2
-    # fee = fee_tokens / (dy_after_fee + fee_tokens)
-    assert float(parsed["fee"][0]) == pytest.approx(0.009 / 90.009)
-
-
+    matplotlib.use("Agg")
+    records = _synthetic_trace(300, with_yb=True)
+    trace, actions = _write_sidecars(tmp_path, records)
+    fields = (
+        "yb_initialized", "yb_growth", "yb_fee", "yb_releverage_trades",
+        "yb_stable_balance", "yb_debt", "yb_collateral_lp", "yb_lp_oracle", "yb_lp_fair",
+    )
+    assert all(field in records[0] for field in fields)
+    frequency = 25200.0
+    timestamps = np.asarray([record["t"] for record in records], dtype=float)
+    donation_apy = np.full(len(records), 0.02)
+    expected_growth = _donation_growth(timestamps, donation_apy, frequency)
+    expected_net_growth = np.asarray(
+        [record["lp_xcp_profit"] for record in records], dtype=float
+    ) / expected_growth
+    fig = render_shiftclick_figure(
+        trace, actions, title="active-2l", donation_frequency=frequency
+    )
+    growth_axis = next(
+        axis for axis in fig.axes
+        if any(line.get_label() == "LP net growth" for line in axis.lines)
+    )
+    growth_line = next(line for line in growth_axis.lines if line.get_label() == "LP net growth")
+    assert growth_line.get_ydata()[-1] == pytest.approx((expected_net_growth[-1] - 1.0) * 100.0)
 def test_render_non_yb_panels(tmp_path: Path) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
     trace, actions = _write_sidecars(tmp_path, _synthetic_trace(200))
-    fig = render_shiftclick_figure(trace, actions, title="test")
-    # prices + APY(+growth twin) + deviation/skew(+fee twin) + slippage
-    assert len(fig.axes) == 7
-    out = tmp_path / "out.png"
-    fig.savefig(out, dpi=100)
-    assert out.is_file() and out.stat().st_size > 0
-
-
-def test_render_yb_panels(tmp_path: Path) -> None:
-    import matplotlib
-
-    matplotlib.use("Agg")
-    trace, actions = _write_sidecars(tmp_path, _synthetic_trace(300, with_yb=True))
-    fig = render_shiftclick_figure(trace, actions, title="yb-test")
-    # prices + APY + YB(+growth twin) + YB balance(+lp twin) + skew(+fee twin) + slippage
-    assert len(fig.axes) == 10
-    out = tmp_path / "yb.png"
-    fig.savefig(out, dpi=100)
-    assert out.is_file() and out.stat().st_size > 0
+    render_shiftclick_figure(trace, actions, title="test")

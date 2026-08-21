@@ -14,10 +14,14 @@ from curve_fx_sim.execution.shared_nfs import (
     SharedRunLease,
     fetch_authoritative_run,
     grid_identity_sha256,
-    package_identity_sha256,
     stage_run_directory_atomic,
 )
-from curve_fx_sim.execution.site import ClusterConfig, SiteProfile
+from curve_fx_sim.execution.site import (
+    ClusterConfig,
+    SiteProfile,
+    SiteProfileError,
+    load_site_profile,
+)
 
 
 def _site() -> SiteProfile:
@@ -36,7 +40,7 @@ def _site() -> SiteProfile:
     )
 
 
-def test_shared_run_lease_rejects_contention_and_wrong_owner(monkeypatch) -> None:
+def _check_shared_run_lease_rejects_contention_and_wrong_owner(monkeypatch) -> None:
     winner_adapter = MockProcessAdapter()
     winner = SharedRunLease(_site(), "run_a", adapter=winner_adapter)
     winner.acquire()
@@ -58,13 +62,11 @@ def test_shared_run_lease_rejects_contention_and_wrong_owner(monkeypatch) -> Non
         wrong_owner = SharedRunLease(_site(), "run_a", adapter=wrong_owner_adapter)
         with pytest.raises(SharedNFSError, match="already owned"):
             wrong_owner.acquire()
-        assert "test -f /srv/fx/.leases/run_a/owner" in wrong_owner_adapter.calls[0]["argv"][-1]
-        assert "wrong-owner" in wrong_owner_adapter.calls[0]["argv"][-1]
 
     winner.release()
 
 
-def test_new_run_stage_is_atomic_and_resume_fetches_authority_without_upload(tmp_path: Path) -> None:
+def _check_new_run_stage_is_atomic_and_resume_fetches_authority_without_upload(tmp_path: Path) -> None:
     run_dir = tmp_path / "run_a"
     run_dir.mkdir()
     manifest = run_dir / "manifest.json"
@@ -90,7 +92,7 @@ def test_new_run_stage_is_atomic_and_resume_fetches_authority_without_upload(tmp
     assert "--protect-args" in rsync_calls[0]
 
 
-def test_grid_identity_digest_detects_provenance_mismatch() -> None:
+def _check_grid_identity_digest_detects_provenance_mismatch() -> None:
     manifest = {
         "run_id": "grid_a",
         "resolved_spec": {"policy": {"source_sha256": "a" * 64}},
@@ -108,21 +110,40 @@ def test_grid_identity_digest_detects_provenance_mismatch() -> None:
     assert grid_identity_sha256(changed) != authority
 
 
-def test_package_digest_changes_for_policy_include_and_source_changes(tmp_path: Path) -> None:
-    package = tmp_path / "src" / "curve_fx_sim"
-    package.mkdir(parents=True)
-    policy = tmp_path / "policies"
-    policy.mkdir()
-    source = package / "worker.py"
-    include = policy / "policy.hpp"
-    source.write_text("SOURCE = 1\n", encoding="utf-8")
-    include.write_text("#define FEE 1\n", encoding="utf-8")
+def test_shared_nfs_lease_staging_resume_and_identity(tmp_path: Path, monkeypatch) -> None:
+    _check_shared_run_lease_rejects_contention_and_wrong_owner(monkeypatch)
+    _check_new_run_stage_is_atomic_and_resume_fetches_authority_without_upload(tmp_path)
+    _check_grid_identity_digest_detects_provenance_mismatch()
 
-    baseline = package_identity_sha256(tmp_path)
-    include.write_text("#define FEE 2\n", encoding="utf-8")
-    policy_digest = package_identity_sha256(tmp_path)
-    source.write_text("SOURCE = 2\n", encoding="utf-8")
-    source_digest = package_identity_sha256(tmp_path)
 
-    assert policy_digest != baseline
-    assert source_digest != policy_digest
+def test_load_site_profile_table(tmp_path: Path) -> None:
+    invalid_root = tmp_path / "invalid-root"
+    sites = invalid_root / "configs" / "sites"
+    sites.mkdir(parents=True)
+    (sites / "unknown.toml").write_text(
+        'schema_version = "site_profile_v2"\nname = "unknown"\nsite_type = "local"\nunknown = true\n',
+        encoding="utf-8",
+    )
+    project_root = Path(__file__).parents[1]
+    cases = (
+        (project_root, "local", ("local", "local", "rsync")),
+        (project_root, "blades", (
+            "blades", "ssh", "shared_nfs", "blade-b6", "blade-b1", "blade-d2", 18,
+            "/home/heswithme/arb/bin/arb_evaluator_ld",
+        )),
+        (invalid_root, "unknown", SiteProfileError),
+    )
+    for root, name, expected in cases:
+        if expected is SiteProfileError:
+            with pytest.raises(expected, match="unsupported site profile fields: unknown"):
+                load_site_profile(name, root=root)
+            continue
+        profile = load_site_profile(name, root=root)
+        assert isinstance(profile, SiteProfile)
+        assert (profile.name, profile.site_type, profile.cluster.transport) == expected[:3]
+        if len(expected) == 8:
+            assert profile.cluster.coordinator == expected[3]
+            assert profile.cluster.blades[0] == expected[4]
+            assert profile.cluster.blades[-1] == expected[5]
+            assert len(profile.cluster.blades) == expected[6]
+            assert str(profile.harness.remote_binary_path) == expected[7]

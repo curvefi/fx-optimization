@@ -1,56 +1,57 @@
 # `fxsim` workflow and artifact guide
 
-Run every command from `curve-fx-optimization/` after building an installed pool and an `arb_evaluator_ld` harness binary. The orchestrator is the only workflow CLI; pool and harness repositories provide build products only.
+Run every command from `curve-fx-optimization/`. The orchestrator is the only workflow CLI; pool and harness repositories provide build inputs for one selected evaluator artifact.
 
-## Data and identity
+## Data and artifact identity
 
 ```sh
 git lfs pull
 uv run --frozen --no-sync fxsim data verify
-uv run --frozen --no-sync fxsim harness identity \
-  /path/to/curve-fx-arb-harness/build/arb_evaluator_ld
+artifact=/private/tmp/curve-fx-packet-b-f64.PyhpyD/artifact
+uv run --frozen --no-sync fxsim evaluator build \
+  --pool-root ../twocrypto-cpp \
+  --harness-root ../curve-fx-arb-harness \
+  --artifact-dir "$artifact" \
+  --policy native_policy_dual_ema_stale_cap_v1 \
+  --numeric-mode f64
+uv run --frozen --no-sync fxsim evaluator verify "$artifact"
 ```
 
-`data/manifest.toml` lists expected paths and SHA-256 values. Keep the identity JSON and data-verification output with each run. Production market data may be private Git-LFS content; access, licensing, and redistribution are maintainer-controlled and are not inferred from this repository.
+`data/manifest.toml` lists expected paths and SHA-256 values. Keep artifact verification and data-verification output with each run. Production market data may be private Git-LFS content; access, licensing, and redistribution are maintainer-controlled and are not inferred from this repository.
 
-## Blade deployment
+## Grouped blade deployment
 
-The blade profile expects the three repositories at `$HOME/arb/{twocrypto-cpp,curve-fx-arb-harness,curve-fx-optimization}` on shared NFS. Deploy or update those checkouts, then run the checked-in bootstrap once from a blade:
-
-```sh
-ssh blade-b6 '$HOME/arb/curve-fx-optimization/scripts/bootstrap_blade.sh $HOME/arb'
-```
-
-`scripts/bootstrap_blade.sh` pins nixpkgs, uv, and Python; builds and installs `twocrypto-cpp`; builds `$HOME/arb/bin/arb_evaluator_ld`; creates the frozen optimization environment; and emits `$HOME/arb/bin/fxsim-worker`. `configs/sites/blades.toml` names those deployed paths. Re-run the bootstrap after changing any repository or after replacing the shared workspace; cluster commands fail closed when either executable is absent.
+Grouped blade artifact mode must be build-selected and launched on the configured Linux coordinator. The coordinator owns artifact selection and grouped dispatch; do not infer live blade proof from local artifact runs. The existing site/bootstrap files describe deployment inputs, but remain separate from artifact authority.
 
 ## Grid lifecycle
 
 ```sh
 uv run --frozen --no-sync fxsim grid generate \
-  --pair chfusd --grid chfusd-policy-smoke --scenario chfusd-smoke \
-  --harness /path/to/curve-fx-arb-harness/build/arb_evaluator_ld \
-  --run-id grid_chfusd_policy_smoke
+  --pair yb-weth --grid yb-weth-a-fee-donation-8 \
+  --scenario yb-weth-ethusd-2024-latest \
+  --artifact-dir "$artifact" \
+  --run-id grid_yb_weth_a_fee_donation_8
 uv run --frozen --no-sync fxsim grid run \
-  runs/grid_chfusd_policy_smoke/manifest.json --site local \
-  --harness /path/to/curve-fx-arb-harness/build/arb_evaluator_ld
+  runs/grid_yb_weth_a_fee_donation_8/manifest.json --site local
 uv run --frozen --no-sync fxsim grid collect \
-  runs/grid_chfusd_policy_smoke/manifest.json
+  runs/grid_yb_weth_a_fee_donation_8/manifest.json
 ```
 
-Use `--site blades`, repeated `--blades NAME`, `--chunk-size N`, and `--resume` for SSH execution/resume. The generated run contains `manifest.json` with canonical `grid.pools`; execution adds `grid_results.json` and the single JSON `evaluation_table.json`. Collection validates exact candidate coverage and the shared `MetricProjection`.
+The generated manifest records grouped candidate plans compiled from the selected schema. Run it locally without `--harness`; grouped blade execution requires the configured Linux coordinator and its selected artifact.
 
 ## Optimization lifecycle
 
 ```sh
 uv run --frozen --no-sync fxsim optimize preflight \
-  configs/optimization/smoke-chfusd.toml
+  configs/optimization/example-pool-dims.toml --artifact-dir "$artifact"
 uv run --frozen --no-sync fxsim optimize run \
-  configs/optimization/smoke-chfusd.toml --run-id opt_chfusd_local
-uv run --frozen --no-sync fxsim optimize status runs/opt_chfusd_local
-uv run --frozen --no-sync fxsim optimize collect runs/opt_chfusd_local
+  configs/optimization/example-pool-dims.toml --artifact-dir "$artifact" \
+  --run-id opt_example_pool_dims
+uv run --frozen --no-sync fxsim optimize status runs/opt_example_pool_dims
+uv run --frozen --no-sync fxsim optimize collect runs/opt_example_pool_dims
 ```
 
-Pass `--resume` to continue only an identity-matching checkpoint. Use `--site blades --blades blade-b6` to run the same TMRBCD work bundles on one blade. The run directory contains `manifest.json`, `checkpoint.json`, `evaluation_table.json`, `winner.json`, and `topk.json`. `winner.json` is an optimizer-winner `SelectionRef`, not an executable request until normalized into a replay plan.
+The example uses Nevergrad TwoPointsDE. Pass `--resume` only for an identity-matching checkpoint. The run directory contains the manifest, checkpoint, evaluation table, winner, and top-k selections. The same CandidateCompiler and SessionGroup execution contract is shared by grid and optimization.
 
 ## Ranking and plots
 
@@ -61,11 +62,29 @@ uv run --frozen --no-sync fxsim plot heatmap \
   --out runs/grid_chfusd_policy_smoke/heatmap.png
 uv run --frozen --no-sync fxsim plot trajectory \
   runs/shiftclick_chfusd_optimizer_winner
+uv run --frozen --no-sync fxsim view \
+  runs/grid_chfusd_policy_smoke --metrics apy \
+  --out runs/grid_chfusd_policy_smoke/view.png
 ```
 
-Heatmaps read `evaluation_table.json`; trajectories read an attested trace selected from a shiftclick `manifest.json`.
+`fxsim view RUN_DIR` opens separate Heatmaps, Controls, and Metrics windows. Use
+`--out` for a PNG export and adjacent state sidecar; export is immutable and
+does not open a legacy `--arb` compatibility path. Plain clicks update the
+metrics window. Shift-click replays the exact table cell with its attested
+source YieldBasis mode and strict economic comparison. Right-click selects the
+same `SelectionRef`, disables YieldBasis, and records a sparse counterfactual
+trace targeting roughly 10,000 observations. Both use `--harness` locally or a
+configured `--site`/`--blade` remotely.
+Heatmaps read the attested `evaluation_table.npz`; trajectories read an attested
+trace selected from a shiftclick `manifest.json`.
+
+## Compatibility-only legacy mode
+
+Direct `--harness` execution and a site `remote_binary_path` are retained only for older binary-selected runs. They are not equivalent to the selected artifact authority or the grouped grid/optimization workflow above.
 
 ## Shiftclick selections
+
+The replay examples below use the compatibility binary path; they do not replace the selected artifact authority.
 
 Create the directory and a TOML under `configs/shiftclick/` with a required `source_run_id`:
 

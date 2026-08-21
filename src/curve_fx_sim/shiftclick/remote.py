@@ -5,12 +5,11 @@ from __future__ import annotations
 import json
 import secrets
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping
 
-from ..analysis.economics import compare_economics
 from ..artifacts.attestation import find_attested_artifact, verify_manifest_artifacts
 from ..artifacts.manifest import load_manifest, write_manifest_atomic
 from ..artifacts.store import RunStore
@@ -19,7 +18,7 @@ from ..execution.adapter import SSHProcessAdapter
 from ..execution.site import SiteProfile
 from ..execution.shared_nfs import shared_run_lease
 from ..specs.shiftclick import ShiftclickSpec
-from .runner import selection_from_spec
+from .runner import ReplayObservationPolicy, selection_from_spec
 
 def _require_mapping(value: Any, label: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
@@ -55,6 +54,7 @@ def _verify_remote_receipt(
     )
 
     selection = selection_from_spec(spec)
+    policy = ReplayObservationPolicy.from_spec(spec)
     expected_plan = normalize_selection(
         selection,
         store=store,
@@ -62,6 +62,10 @@ def _verify_remote_receipt(
         trace_interval=spec.trace_interval,
         trace_actions=spec.trace_actions,
         evaluation_table=source_table,
+    )
+    expected_plan = replace(
+        expected_plan,
+        scenario_spec=policy.scenario(expected_plan.scenario_spec),
     )
     if (
         expected_plan.pair_spec.id != spec.pair_id
@@ -90,6 +94,8 @@ def _verify_remote_receipt(
     expected_spec.pop("source_spec_path", None)
     if observed_spec != expected_spec:
         raise RuntimeError("remote shiftclick resolved spec differs from the request")
+    if dict(_require_mapping(resolved.get("observation_policy"), "observation policy")) != policy.to_dict():
+        raise RuntimeError("remote shiftclick observation policy differs from the request")
 
     observed_plan = dict(_require_mapping(resolved.get("replay_plan"), "replay plan"))
     expected_plan_payload = expected_plan.to_dict()
@@ -139,7 +145,7 @@ def _verify_remote_receipt(
     if projection is None:
         raise RuntimeError("source evaluation table has no MetricProjection")
     try:
-        recomputed = compare_economics(
+        _, recomputed = policy.compare(
             source_row.metrics,
             _require_mapping(replay.get("metrics"), "replay metrics"),
             expected_fingerprint=source_row.economic_fingerprint or "",
@@ -148,7 +154,7 @@ def _verify_remote_receipt(
         )
     except (TypeError, ValueError) as exc:
         raise RuntimeError("remote shiftclick economics do not match the source row") from exc
-    if dict(comparison) != recomputed.to_dict():
+    if dict(comparison) != recomputed:
         raise RuntimeError(
             "remote shiftclick economic comparison is not bound to the source row"
         )
@@ -291,9 +297,12 @@ def _run_remote_shiftclick_unlocked(
 
     worker = shlex.quote(site.cluster.worker_command)
     harness = shlex.quote(str(site.harness.remote_binary_path or site.harness.binary_name))
+    project_root = remote_repo if shared_mounted else workspace
     command = (
         f"cd {shlex.quote(str(workspace))} && "
-        f"{worker} replay shiftclick {shlex.quote(str(remote_spec))} --harness {harness}"
+        f"{worker} --project-root {shlex.quote(str(project_root))} "
+        f"--run-root {shlex.quote(str(workspace_runs))} "
+        f"replay shiftclick {shlex.quote(str(remote_spec))} --harness {harness}"
     )
     executed = ssh.run_ssh(blade, command, timeout=site.harness.timeout_seconds)
     if not executed.ok:

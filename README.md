@@ -19,10 +19,23 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
 cmake --build build --target arb_evaluator_ld --parallel
 
 cd /path/to/curve-fx-optimization
-uv sync --frozen --extra dev
+uv sync --frozen --group dev
 ```
 
-For production policy runs, configure the harness with a concrete header from this repository and `POLICY_EXPECTED_SHA256`; see [`docs/workflows.md`](docs/workflows.md) and the harness build guide. The evaluator binary must be inspected with `fxsim harness identity` before use. A sibling path is a build/install prerequisite only; normal commands and all outputs stay under this repository.
+Build or select one evaluator artifact for the workflow. The artifact directory is the authority for the evaluator, policy, numeric mode, and parameter schema; verify it before generating a run:
+
+```sh
+artifact=/private/tmp/curve-fx-packet-b-f64.PyhpyD/artifact
+uv run --frozen --no-sync fxsim evaluator build \
+  --pool-root ../twocrypto-cpp \
+  --harness-root ../curve-fx-arb-harness \
+  --artifact-dir "$artifact" \
+  --policy native_policy_dual_ema_stale_cap_v1 \
+  --numeric-mode f64
+uv run --frozen --no-sync fxsim evaluator verify "$artifact"
+```
+
+The configured Linux coordinator must build/select and launch the same grouped artifact mode for blade execution; this checkout does not claim live blade proof. A sibling repository is a build prerequisite only; normal commands and outputs stay under this repository.
 
 ## Repository-owned inputs
 
@@ -46,85 +59,72 @@ A missing/private dataset is an access or provenance failure. This private repos
 ## Inspect evaluator identity
 
 ```sh
-uv run --frozen --no-sync fxsim harness identity \
-  /path/to/curve-fx-arb-harness/build/arb_evaluator_ld
+uv run --frozen --no-sync fxsim evaluator verify "$artifact"
 ```
 
-The JSON identity includes binary/pool/harness/policy revisions or hashes, compiler and numeric mode, capabilities, metric fields, and protocol limits. Keep the output with the run manifest.
+Keep the verification output with the run manifest. The selected artifact records the binary, source closures, policy, numeric mode, and canonical parameter schema.
 
 ## Finite grids: local and blades
 
-Generate an immutable request set. `--pair`, `--grid`, and `--scenario` accept IDs or TOML paths; `--harness` is required:
+Generate an immutable request set from the selected artifact. `--pair`, `--grid`, and `--scenario` accept IDs or TOML paths:
 
 ```sh
 uv run --frozen --no-sync fxsim grid generate \
-  --pair chfusd --grid chfusd-policy-smoke --scenario chfusd-smoke \
-  --harness /path/to/curve-fx-arb-harness/build/arb_evaluator_ld \
-  --run-id grid_chfusd_policy_smoke
+  --pair yb-weth --grid yb-weth-a-fee-donation-8 \
+  --scenario yb-weth-ethusd-2024-latest \
+  --artifact-dir "$artifact" \
+  --run-id grid_yb_weth_a_fee_donation_8
 ```
 
-The command creates the immutable `runs/grid_chfusd_policy_smoke/manifest.json`; its `grid.pools` section is the sole compiled request representation. Every point carries the complete dense policy vector; the pool template fixes pool economics and the scenario fixes typed session economics.
+The command creates an immutable manifest whose grouped candidate plans are compiled from the selected schema. The pool template supplies base economics and the scenario supplies base typed session inputs.
 
-Run all points locally, or dispatch deterministic block-cyclic shards to the injected SSH blade profile:
+Run the artifact-selected manifest locally without a harness override:
 
 ```sh
 uv run --frozen --no-sync fxsim grid run \
-  runs/grid_chfusd_policy_smoke/manifest.json --site local \
-  --harness /path/to/curve-fx-arb-harness/build/arb_evaluator_ld
-
-uv run --frozen --no-sync fxsim grid run \
-  runs/grid_chfusd_policy_smoke/manifest.json --site blades \
-  --harness /path/to/curve-fx-arb-harness/build/arb_evaluator_ld
+  runs/grid_yb_weth_a_fee_donation_8/manifest.json --site local
 ```
 
-Use `--blades blade-b1 --blades blade-b2` to restrict SSH targets, `--chunk-size 2048` to set block size, and `--resume` to continue incomplete execution. Collect/validate a completed grid with:
+Use the configured coordinator/blade grouped transport only after the artifact has been build-selected there. Collect/validate a completed grid with:
 
 ```sh
 uv run --frozen --no-sync fxsim grid collect \
-  runs/grid_chfusd_policy_smoke/manifest.json
+  runs/grid_yb_weth_a_fee_donation_8/manifest.json
 ```
 
-Collection rejects missing, overlapping, unknown, or hash-mismatched shards and writes `runs/grid_chfusd_policy_smoke/evaluation_table.json`.
+Collection rejects missing, overlapping, unknown, or hash-mismatched shards and writes the evaluation table beside the manifest.
 
 ## Adaptive optimization: local and distributed
 
-Preflight a typed spec, then run TMRBCD locally:
+Preflight and run the representative Nevergrad TwoPointsDE spec against the same selected artifact:
 
 ```sh
 uv run --frozen --no-sync fxsim optimize preflight \
-  configs/optimization/smoke-chfusd.toml
+  configs/optimization/example-pool-dims.toml --artifact-dir "$artifact"
 uv run --frozen --no-sync fxsim optimize run \
-  configs/optimization/smoke-chfusd.toml --run-id opt_chfusd_local
+  configs/optimization/example-pool-dims.toml --artifact-dir "$artifact" \
+  --run-id opt_example_pool_dims
 ```
 
-The same spec contract supports Nevergrad TwoPointsDE by setting
-`algorithm = "nevergrad_two_points_de"`. The pinned adapter asks in batches,
-quantizes every proposal onto the exact decimal lattice, checkpoints the
-optimizer and pending batch synchronously, and restores deterministically.
-TMRBCD remains the default for existing specs.
+The adapter asks in batches and quantizes proposals onto the exact schema lattice. TMRBCD remains available for existing specs.
 
-After the blade deployment in [`docs/workflows.md`](docs/workflows.md), run the same exact-lattice TMRBCD search through the SSH worker transport:
-
-```sh
-uv run --frozen --no-sync fxsim optimize run \
-  configs/optimization/smoke-chfusd.toml --site blades \
-  --blades blade-b6 --run-id opt_chfusd_blades
-```
-
-Omit `--blades` to use the complete site profile. Local and distributed runs share the same optimizer, scoring, checkpoint, and artifact contracts; the distributed manifest additionally records the remote evaluator SHA-256 identity.
+Grouped blade execution must be launched from the configured Linux coordinator after selecting/building the artifact there; no live blade result is implied by these local commands. The coordinator owns grouped artifact selection and dispatch; local and distributed runs share candidate, scoring, and artifact contracts.
 
 Resume an incomplete run with `--resume`. Inspect and collect by run directory or manifest path:
 
 ```sh
 uv run --frozen --no-sync fxsim optimize run \
-  configs/optimization/smoke-chfusd.toml --run-id opt_chfusd_local --resume
-uv run --frozen --no-sync fxsim optimize status runs/opt_chfusd_local
-uv run --frozen --no-sync fxsim optimize collect runs/opt_chfusd_local
+  configs/optimization/example-pool-dims.toml --artifact-dir "$artifact" \
+  --run-id opt_example_pool_dims --resume
+uv run --frozen --no-sync fxsim optimize status runs/opt_example_pool_dims
+uv run --frozen --no-sync fxsim optimize collect runs/opt_example_pool_dims
 ```
 
 The run directory contains `manifest.json`, incremental `checkpoint.json`, `evaluation_table.json`, `winner.json`, and `topk.json`. The winner and top-k records are attested `SelectionRef` values; local and blade execution use the same scoring, dense policy request, and candidate identity.
 
 ## Ranking, heatmaps, and shiftclick
+
+Ranking and plots consume attested run artifacts. The shiftclick replay examples below retain the compatibility binary path; they do not replace the selected artifact workflow.
 
 Rank one attested evaluation table:
 
@@ -183,6 +183,10 @@ For cluster replay, replace `--harness ...` with `--site blades --blades blade-b
 uv run --frozen --no-sync fxsim plot trajectory \
   runs/shiftclick_chfusd-optimizer-winner
 ```
+
+## Compatibility-only legacy mode
+
+Direct `--harness` execution and a site `remote_binary_path` are compatibility paths for older binary-selected runs. They are not equivalent to the selected artifact authority and are not the canonical grouped workflow above.
 
 ## Ownership and dependency direction
 

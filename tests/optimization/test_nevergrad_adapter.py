@@ -19,11 +19,11 @@ def _lattice() -> LatticeSpec:
     )
 
 
-def _optimizer() -> NevergradTwoPointsDEOptimizer:
+def _optimizer(*, budget: int = 12) -> NevergradTwoPointsDEOptimizer:
     return NevergradTwoPointsDEOptimizer(
         _lattice(),
         initial_params=[2.0, 0.0],
-        budget=12,
+        budget=budget,
         seed=123,
         num_workers=4,
     )
@@ -44,9 +44,13 @@ def test_nevergrad_uses_exact_bounded_lattice_and_resumes_deterministically() ->
     first = original.ask(4)
     assert all(_lattice().decode(_lattice().encode(point)) == point for point in first)
     _tell_batch(original, first)
+    state = original.snapshot()
 
-    restored = _optimizer()
-    restored.restore(original.snapshot())
+    with pytest.raises(ValueError, match="budget"):
+        _optimizer(budget=8).restore(state)
+
+    restored = _optimizer(budget=24)
+    restored.restore(state)
     assert restored.step == 4
     restored_points = restored.ask(4)
     original_points = original.ask(4)
@@ -54,7 +58,10 @@ def test_nevergrad_uses_exact_bounded_lattice_and_resumes_deterministically() ->
 
     _tell_batch(original, original_points)
     _tell_batch(restored, restored_points)
-    assert restored.snapshot() == original.snapshot()
+    restored_state = restored.snapshot()
+    original_state = original.snapshot()
+    assert restored_state["history"] == original_state["history"]
+    assert restored_state["step"] == original_state["step"]
 
 
 def test_nevergrad_enforces_complete_ask_tell_batches() -> None:

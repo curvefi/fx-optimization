@@ -12,19 +12,23 @@ from typing import Any, Mapping
 
 from .common import (
     SpecError,
-    assert_contained_path,
     canonical_decimal,
     canonical_primitive,
     format_exact_decimal,
     repository_relative,
-    repository_root,
     serializable,
 )
+from .registry import SpecRegistry
 
 
 @dataclass(frozen=True)
 class AxisTarget:
-    """Mapping from display coordinate value to pool/policy override key path."""
+    """Grid coordinate presentation transform and target selector.
+
+    ``scale / display_scale`` converts a displayed coordinate to its semantic
+    value.  It is not an evaluator wire scale: schema-backed grids pass that
+    value under :attr:`proposal_name` to ``CandidateCompiler``.
+    """
 
     path: tuple[str, ...]
     scale: Decimal = Decimal("1")
@@ -40,6 +44,20 @@ class AxisTarget:
             if scaled == scaled.to_integral():
                 return int(scaled)
             return format_exact_decimal(scaled)
+        return str(value)
+
+    @property
+    def proposal_name(self) -> str:
+        """Return the direct canonical name used by schema-backed grids."""
+        return ".".join(self.path)
+
+    def transform_proposal_value(self, value: Decimal) -> Any:
+        """Convert one display value to canonical human/schema units."""
+        scaled = (value * self.scale) / self.display_scale
+        if self.kind in {"integer", "bps"}:
+            return int(scaled)
+        if self.kind == "decimal":
+            return int(scaled) if scaled == scaled.to_integral() else scaled
         return str(value)
 
     def to_dict(self) -> dict[str, Any]:
@@ -252,28 +270,12 @@ def _parse_axis(data: Mapping[str, Any], index: int) -> AxisSpec:
 def load_grid_spec(
     path_or_id: str | os.PathLike[str],
     *,
-    repository: Path | None = None,
+    repository: Path,
 ) -> GridSpec:
     """Load and validate a grid exploration TOML specification."""
-    root = repository.resolve() if repository is not None else repository_root()
-    candidate = Path(path_or_id)
-
-    if not candidate.is_file():
-        search_paths = [
-            root / "configs" / "grids" / f"{path_or_id}.toml",
-            root / "configs" / f"{path_or_id}.toml",
-            root / "grids" / f"{path_or_id}.toml",
-        ]
-        found = None
-        for p in search_paths:
-            if p.is_file():
-                found = p
-                break
-        if found is None:
-            raise FileNotFoundError(f"Grid specification not found: {path_or_id}")
-        candidate = found
-
-    assert_contained_path(candidate, root, allow_symlinks=True)
+    registry = SpecRegistry.from_root(repository)
+    root = registry.context.project_root
+    candidate = registry.resolve("grid", path_or_id)
 
     with candidate.open("rb") as stream:
         raw_data = tomllib.load(stream)

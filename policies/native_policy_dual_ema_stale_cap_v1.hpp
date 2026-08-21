@@ -19,14 +19,36 @@
 #include <type_traits>
 
 #include "pools/twocrypto_fx/policies/common.hpp"
+#include "pools/twocrypto_fx/policy_descriptor.hpp"
 
 namespace arb::pools::twocrypto_fx {
 
 template <typename T>
 struct ChallengeFeePolicy {
-    static constexpr const char* NAME = "native_policy_dual_ema_stale_cap_v1";
-    static constexpr std::size_t PARAM_COUNT = 5;
-    static constexpr double LN2 = 0.69314718055994530942;
+    inline static constexpr PolicyDescriptor<5> DESCRIPTOR{
+        "native_policy_dual_ema_stale_cap_v1",
+        {{{"fast_half_life_s", 0, "seconds",
+           3600.0L, 60.0L, 86400.0L, 10.0L},
+          {"slow_half_life_s", 1, "seconds",
+           86400.0L, 60.0L, 604800.0L, 10.0L},
+          {"kappa", 2, "dimensionless",
+           1.0L, 0.0L, 5.0L, 0.05L},
+          {"min_cap_bps", 3, "basis_points",
+           10.0L, 0.0L, 250.0L, 0.5L},
+          {"deadband_bps", 4, "basis_points",
+           0.0L, 0.0L, 100.0L, 0.5L}}},
+    };
+    static constexpr const char* NAME = DESCRIPTOR.name.data();
+    static constexpr std::size_t PARAM_COUNT = DESCRIPTOR.size();
+    static constexpr long double LN2 = 0.69314718055994530942L;
+
+    enum class Parameter : std::size_t {
+        FastHalfLife = 0,
+        SlowHalfLife,
+        Kappa,
+        MinCapBps,
+        DeadbandBps,
+    };
 
     struct State {
         bool initialized{false};
@@ -44,9 +66,10 @@ struct ChallengeFeePolicy {
 
     static T param(
         const PolicyConfig<T>& params,
-        std::size_t index,
+        Parameter parameter,
         T fallback
     ) {
+        const std::size_t index = static_cast<std::size_t>(parameter);
         return index < params.n_params ? params.params[index] : fallback;
     }
 
@@ -57,23 +80,23 @@ struct ChallengeFeePolicy {
     }
 
     static T fast_half_life_s(const PolicyConfig<T>& params) {
-        return clamp_local(param(params, 0, T(3600)), T(60), T(86400));
+        return clamp_local(param(params, Parameter::FastHalfLife, T(3600)), T(60), T(86400));
     }
 
     static T slow_half_life_s(const PolicyConfig<T>& params) {
-        return clamp_local(param(params, 1, T(86400)), T(60), T(604800));
+        return clamp_local(param(params, Parameter::SlowHalfLife, T(86400)), T(60), T(604800));
     }
 
     static T kappa(const PolicyConfig<T>& params) {
-        return clamp_local(param(params, 2, T(1)), T(0), T(5));
+        return clamp_local(param(params, Parameter::Kappa, T(1)), T(0), T(5));
     }
 
     static T min_cap_bps(const PolicyConfig<T>& params) {
-        return clamp_local(param(params, 3, T(10)), T(0), T(250));
+        return clamp_local(param(params, Parameter::MinCapBps, T(10)), T(0), T(250));
     }
 
     static T deadband_bps(const PolicyConfig<T>& params) {
-        return clamp_local(param(params, 4, T(0)), T(0), T(100));
+        return clamp_local(param(params, Parameter::DeadbandBps, T(0)), T(0), T(100));
     }
 
     static T max_cap_bps() {
@@ -107,10 +130,8 @@ struct ChallengeFeePolicy {
         if constexpr (std::is_same_v<T, uint256>) {
             return sample;
         } else {
-            const T keep = T(std::exp(
-                -LN2 * static_cast<double>(dt) /
-                static_cast<double>(half_life_s)
-            ));
+            using std::exp;
+            const T keep = exp(-T(LN2) * T(dt) / half_life_s);
             return sample * (T(1) - keep) + before * keep;
         }
     }

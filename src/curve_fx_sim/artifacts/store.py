@@ -6,18 +6,29 @@ import os
 from pathlib import Path
 from typing import Any, Mapping
 
-from ..specs.common import assert_contained_path, repository_root
+from ..specs.common import ProjectContext, assert_contained_path
 from .manifest import load_manifest, write_manifest_atomic
 from .tables import EvaluationTable
 
 
 class RunStore:
-    """Manages repository-relative immutable runs under `<repo_root>/runs/`."""
+    """Manage immutable runs with separate project and output roots."""
 
-    def __init__(self, root: str | os.PathLike[str] | None = None) -> None:
-        self.root_dir = repository_root(root).resolve()
-        self.runs_dir = (self.root_dir / "runs").resolve()
-        self.runs_dir.mkdir(parents=True, exist_ok=True)
+    def __init__(
+        self,
+        root: ProjectContext | str | os.PathLike[str],
+        *,
+        run_root: str | os.PathLike[str] | None = None,
+    ) -> None:
+        if isinstance(root, ProjectContext):
+            if run_root is not None:
+                raise TypeError("run_root cannot override a ProjectContext")
+            context = root
+        else:
+            context = ProjectContext.from_root(root, run_root=run_root)
+        self.context = context
+        self.root_dir = context.project_root
+        self.runs_dir = context.run_root
 
     def allocate_run_dir(self, run_kind: str, run_id: str) -> Path:
         """Allocate a new immutable run directory strictly contained in runs/."""
@@ -27,6 +38,7 @@ class RunStore:
         assert_contained_path(run_path, self.runs_dir, allow_symlinks=False)
         if run_path.exists():
             raise FileExistsError(f"immutable run directory already exists: {run_id}")
+        self.runs_dir.mkdir(parents=True, exist_ok=True)
         run_path.mkdir(parents=True, exist_ok=False)
         return run_path
 
@@ -62,7 +74,7 @@ class RunStore:
         if candidate.is_dir():
             candidate = candidate / "manifest.json"
         if candidate.is_file():
-            assert_contained_path(candidate, self.root_dir, allow_symlinks=True)
+            assert_contained_path(candidate, self.runs_dir, allow_symlinks=True)
             return load_manifest(candidate, expected_kind=expected_kind)
         return load_manifest(self.get_run_dir(str(run_id_or_path)) / "manifest.json", expected_kind=expected_kind)
 

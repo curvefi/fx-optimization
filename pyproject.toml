@@ -13,11 +13,6 @@ dependencies = [
     "scipy>=1.11.0",
 ]
 
-[project.optional-dependencies]
-dev = [
-    "pytest>=8.0.0",
-]
-
 [project.scripts]
 fxsim = "curve_fx_sim.cli:main"
 
@@ -30,3 +25,8 @@ packages = ["src/curve_fx_sim"]
 
 [tool.uv.sources]
 curve_fx_harness_client = { path = "../curve-fx-arb-harness/python", editable = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]

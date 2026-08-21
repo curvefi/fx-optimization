@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
@@ -19,6 +20,9 @@ from ..specs.common import (
 from ..specs.pair import PairSpec, load_pair_spec
 from ..specs.policy import PolicySpec
 from ..specs.scenario import ScenarioSpec, load_scenario_spec
+from .grouping import SessionGroupKey
+from .plans import CandidateCompiler, CandidatePlan
+from .session import LocalSessionMaterialization
 
 SelectionKind = Literal["grid_point", "optimizer_winner", "candidate_id"]
 
@@ -86,6 +90,7 @@ class ReplayPlan:
     trace_actions: bool = True
     artifact_dir: Path | None = None
     economic_fingerprint: str | None = None
+    compiled_candidate: CandidatePlan | None = None
     tags: tuple[str, ...] = ()
     def __post_init__(self) -> None:
         if self.observation_level not in {"summary", "full_trace"}:
@@ -108,6 +113,8 @@ class ReplayPlan:
             "trace_actions": self.trace_actions,
             "artifact_dir": self.artifact_dir.as_posix() if self.artifact_dir else None,
             "economic_fingerprint": self.economic_fingerprint,
+            "compiled_candidate_sha256": self.compiled_candidate.candidate_sha256 if self.compiled_candidate else None,
+            "compiled_session_key": self.compiled_candidate.session_key.sha256 if self.compiled_candidate else None,
             "tags": list(self.tags),
         }
 
@@ -196,12 +203,23 @@ def _verify_grid_row(manifest: Mapping[str, Any], row: EvaluationRow) -> None:
             f"grid row {row.candidate_id!r} does not identify exactly one canonical pool"
         )
     pool = matches[0]
-    expected_params = {"vector": list(pool.get("policy_params", ()))}
+    if "proposal_evidence" in pool:
+        import json
+
+        try:
+            candidate = json.loads(str(pool["candidate_json"]))
+            expected_params = {"vector": candidate["policy_params"]}
+            expected_overrides = candidate["pool_overrides"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SpecError("compiled grid candidate evidence is invalid") from exc
+    else:
+        expected_params = {"vector": list(pool.get("policy_params", ()))}
+        expected_overrides = pool.get("pool_overrides", {})
     checks = (
         ("ordinal", row.ordinal, pool.get("ordinal")),
         ("coordinates", row.coordinates, pool.get("coordinates")),
         ("policy vector", row.params, expected_params),
-        ("pool overrides", row.pool_overrides, pool.get("pool_overrides", {})),
+        ("pool overrides", row.pool_overrides, expected_overrides),
     )
     for label, actual, expected in checks:
         if actual != expected:
@@ -414,10 +432,86 @@ def normalize_selection(
     )
 
 
+def compile_selected_replay(
+    plan: ReplayPlan,
+    *,
+    manifest: Mapping[str, Any],
+    selected_evaluator: Any,
+    materialization: LocalSessionMaterialization,
+    yb_off: bool = False,
+) -> ReplayPlan:
+    """Recompile one selected row through its run-local evaluator evidence."""
+    compiler = selected_evaluator.compiler
+    row = plan.source_row
+    if manifest.get("run_kind") == "grid":
+        from ..grids.runner import load_grouped_grid
+
+        points, _ = load_grouped_grid(
+            manifest, parameter_schema=compiler.schema,
+            artifact_sha256=selected_evaluator.artifact_sha256)
+        matches = [point for point in points if point.ordinal == row.ordinal and point.candidate_id == row.candidate_id]
+        if len(matches) != 1 or matches[0].evaluation is None:
+            raise SpecError("selected grid row has no exact compiled candidate evidence")
+        point = matches[0]
+        proposal = point.proposal_dict
+        expected_candidate_sha = point.evaluation.candidate.candidate_sha256
+        expected_group = point.session_group_id
+        if point.evaluation.evaluation_id != row.candidate_id:
+            raise SpecError("selected grid evaluation ID does not match its table row")
+    elif manifest.get("run_kind") == "optimization":
+        named = row.params.get("named")
+        lineage = row.params.get("evaluation_lineage")
+        if not isinstance(named, Mapping) or not isinstance(lineage, list):
+            raise SpecError("selected optimizer row has no named proposal or evaluation lineage")
+        matches = [item for item in lineage if isinstance(item, Mapping) and item.get("evaluation_id") == row.candidate_id]
+        if len(matches) != 1:
+            raise SpecError("selected optimizer row has no exact primary evaluation lineage")
+        evidence = matches[0]
+        if evidence.get("scenario_id") != plan.scenario_spec.id:
+            raise SpecError("selected optimizer evaluation lineage has the wrong scenario")
+        proposal = dict(named)
+        expected_candidate_sha = str(evidence.get("candidate_sha256", ""))
+        expected_group = str(evidence.get("session_group_id", ""))
+        if row.params.get("candidate_sha256") != expected_candidate_sha:
+            raise SpecError("selected optimizer candidate SHA differs from its lineage")
+    else:
+        raise SpecError("artifact replay requires a grid or optimization source run")
+
+    compiled_proposal: dict[str, object] = {}
+    for name, value in proposal.items():
+        descriptor = compiler.schema.descriptor(name)
+        if descriptor.classification == "observation" and descriptor.lowering_path.startswith("evaluate_batch."):
+            continue
+        value_type = descriptor.value_type
+        if value_type == "real" and isinstance(value, str):
+            value = Decimal(value)
+        elif value_type == "real_pair" and isinstance(value, (list, tuple)):
+            value = tuple(Decimal(item) if isinstance(item, str) else item for item in value)
+        compiled_proposal[name] = value
+    if yb_off:
+        compiler.schema.descriptor("run.yb_mode")
+        compiled_proposal["run.yb_mode"] = "off"
+        compiled_proposal.pop("run.yb_releverage", None)
+    candidate = compiler.compile(
+        compiled_proposal, open_session=materialization.baseline_open_session_fields,
+        scenario=materialization.closure)
+    if candidate.candidate_sha256 != expected_candidate_sha:
+        raise SpecError("selected proposal recompiles to a different candidate SHA")
+    group = SessionGroupKey.create(
+        selected_evaluator.artifact_sha256, compiler.schema,
+        candidate.scenario_key, candidate.session_key).validated()
+    if not yb_off and group.sha256 != expected_group:
+        raise SpecError("selected proposal recompiles to a different SessionGroup")
+    return replace(
+        plan, policy_params={"vector": list(candidate.policy_params)},
+        pool_overrides=candidate.pool_overrides, compiled_candidate=candidate)
+
+
 __all__ = [
     "SelectionKind",
     "SelectionRef",
     "ReplayPlan",
     "load_attested_evaluation_table",
+    "compile_selected_replay",
     "normalize_selection",
 ]

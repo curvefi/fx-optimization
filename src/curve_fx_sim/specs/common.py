@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import os
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -17,6 +18,52 @@ class SpecError(ValueError):
 
 class PathContainmentError(ValueError):
     """Raised when a path escapes its containment root."""
+
+
+@dataclass(frozen=True)
+class ProjectContext:
+    """Immutable project paths shared by spec resolution and run storage."""
+
+    project_root: Path
+    run_root: Path
+
+    def __post_init__(self) -> None:
+        project = Path(self.project_root).resolve()
+        configured_runs = Path(self.run_root)
+        runs = (
+            configured_runs.resolve()
+            if configured_runs.is_absolute()
+            else (project / configured_runs).resolve()
+        )
+        object.__setattr__(self, "project_root", project)
+        object.__setattr__(self, "run_root", runs)
+
+    @classmethod
+    def from_root(
+        cls,
+        project_root: str | os.PathLike[str],
+        *,
+        run_root: str | os.PathLike[str] | None = None,
+    ) -> ProjectContext:
+        root = Path(project_root).resolve()
+        if run_root is None:
+            runs = root / "runs"
+        else:
+            configured_runs = Path(run_root)
+            runs = (
+                configured_runs.resolve()
+                if configured_runs.is_absolute()
+                else (root / configured_runs).resolve()
+            )
+        return cls(project_root=root, run_root=runs)
+
+    @property
+    def config_root(self) -> Path:
+        return self.project_root / "configs"
+
+    @property
+    def data_root(self) -> Path:
+        return self.project_root / "data"
 
 
 def canonical_decimal(value: Any, *, label: str = "value") -> Decimal:
@@ -110,22 +157,9 @@ def canonical_json_bytes(value: Any) -> bytes:
     ).encode("utf-8")
 
 
-def _find_repo_root(candidate: Path) -> Path:
-    current = candidate.resolve()
-    if current.is_file():
-        current = current.parent
-    for parent in [current, *current.parents]:
-        if (parent / "pyproject.toml").is_file() or (parent / ".git").exists():
-            return parent
-    return current
-
-
-def repository_root(path: str | os.PathLike[str] | None = None) -> Path:
-    """Return the repository root used for relative serialized paths."""
-    if path is not None:
-        candidate = Path(path)
-        return _find_repo_root(candidate)
-    return _find_repo_root(Path.cwd())
+def repository_root(path: str | os.PathLike[str]) -> Path:
+    """Normalize an explicitly supplied project root."""
+    return ProjectContext.from_root(path).project_root
 
 
 def assert_contained_path(
@@ -158,9 +192,9 @@ def assert_contained_path(
     return target_resolved
 
 
-def repository_relative(path: str | os.PathLike[str], root: Path | None = None) -> Path:
+def repository_relative(path: str | os.PathLike[str], root: Path) -> Path:
     """Normalize a path to a repository-relative Path without '..' escapes, raising PathContainmentError if outside root."""
-    repo = root.resolve() if root is not None else repository_root()
+    repo = root.resolve()
     target = Path(path)
 
     resolved = assert_contained_path(target, repo, allow_symlinks=True)
@@ -197,6 +231,7 @@ def serializable(value: Any) -> Any:
 __all__ = [
     "SpecError",
     "PathContainmentError",
+    "ProjectContext",
     "canonical_decimal",
     "format_exact_decimal",
     "canonical_primitive",

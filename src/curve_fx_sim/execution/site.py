@@ -14,7 +14,7 @@ from pathlib import Path, PurePosixPath
 import tomllib
 from typing import Any, Mapping, Sequence
 
-from ..specs.common import repository_root
+from ..specs.registry import SpecRegistry
 
 
 class SiteProfileError(ValueError):
@@ -366,35 +366,20 @@ class SiteProfile:
 
 def find_site_profile_path(
     name_or_path: str | os.PathLike[str],
-    root: Path | None = None,
+    root: Path,
 ) -> Path:
     """Locate a site profile by name or explicit file path."""
-    candidate = Path(name_or_path)
-    if candidate.is_file():
-        return candidate.resolve()
-
-    repo = repository_root(root)
-    sites_dir = repo / "configs" / "sites"
-
-    # Try name with .toml suffix
-    name_str = str(name_or_path)
-    if not name_str.endswith(".toml"):
-        with_suffix = sites_dir / f"{name_str}.toml"
-        if with_suffix.is_file():
-            return with_suffix.resolve()
-
-    direct = sites_dir / name_str
-    if direct.is_file():
-        return direct.resolve()
-
-    raise SiteProfileError(
-        f"site profile '{name_or_path}' not found in {sites_dir} or as a file path"
-    )
+    registry = SpecRegistry.from_root(root)
+    try:
+        return registry.resolve("site", name_or_path)
+    except FileNotFoundError as exc:
+        raise SiteProfileError(str(exc)) from exc
 
 
 def load_site_profile(
     name_or_path: str | os.PathLike[str] | None = None,
-    root: Path | None = None,
+    *,
+    root: Path,
 ) -> SiteProfile:
     """Load and parse a site profile TOML file.
 

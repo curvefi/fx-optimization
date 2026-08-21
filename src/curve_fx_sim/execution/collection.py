@@ -132,6 +132,34 @@ def grid_request_set_sha256(
     return hashlib.sha256(_canonical_json(request)).hexdigest()
 
 
+def group_request_set_sha256(
+    manifest: Mapping[str, Any],
+    ordinals: Sequence[int],
+    session_attestation: Any,
+) -> str:
+    """Bind one homogeneous shard to its portable group and local request proof."""
+    grid = manifest.get("grid")
+    resolved = manifest.get("resolved_spec")
+    core = manifest.get("core")
+    pools = grid.get("pools") if isinstance(grid, Mapping) else None
+    if not isinstance(pools, list) or not isinstance(resolved, Mapping) or not isinstance(core, Mapping):
+        raise CollectionError("cannot attest a grouped shard without its canonical manifest")
+    try:
+        selected = [pools[int(ordinal)] for ordinal in ordinals]
+    except (IndexError, TypeError, ValueError) as exc:
+        raise CollectionError("grouped shard ordinals are outside grid.pools") from exc
+    request = {
+        "schema_version": "fxsim_group_request_v1",
+        "run_id": manifest.get("run_id"),
+        "grid_id": grid.get("grid_id"),
+        "pools": selected,
+        "resolved_spec": resolved,
+        "core": core,
+        "session_attestation": _session_digest_view(session_attestation),
+    }
+    return hashlib.sha256(_canonical_json(request)).hexdigest()
+
+
 def make_shard_result(
     *,
     run_id: str,
@@ -218,11 +246,7 @@ def _load_shard_records(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]
             f"invalid shard result schema in {path}: expected an object with schema_version and rows"
         )
     rows = payload.get("rows")
-    if (
-        payload.get("schema_version") != SHARD_RESULT_SCHEMA_VERSION
-        or set(payload) != _SHARD_RESULT_FIELDS
-        or not isinstance(rows, list)
-    ):
+    if payload.get("schema_version") != SHARD_RESULT_SCHEMA_VERSION or set(payload) != _SHARD_RESULT_FIELDS or not isinstance(rows, list):
         raise CollectionError(
             f"invalid shard result schema in {path}: expected {SHARD_RESULT_SCHEMA_VERSION!r}"
         )
@@ -238,6 +262,41 @@ def _record_index(record: Mapping[str, Any]) -> int:
         return int(record["pool_index"])
     except (TypeError, ValueError) as exc:
         raise CollectionError(f"record has invalid pool_index: {record}") from exc
+
+
+def is_grouped_shard_complete(
+    manifest: Mapping[str, Any], descriptor: Mapping[str, Any], path: Path
+) -> bool:
+    """Return whether one durable grouped shard is exact and relocation-safe."""
+    try:
+        payload, rows = _load_shard_records(path)
+        ranges = _ranges(descriptor)
+        ordinals = [value for start, end in ranges for value in range(start, end)]
+        group_id = str(descriptor["session_group_id"])
+        observation_id = str(descriptor["observation_id"])
+        pools = manifest["grid"]["pools"]
+        if any(
+            pools[value]["session_group_id"] != group_id
+            or pools[value]["observation_id"] != observation_id
+            for value in ordinals
+        ):
+            return False
+        attestation = normalize_session_attestation(
+            payload["session_attestation"],
+            expected_session_id=f"sess_{manifest['run_id']}_{group_id[:12]}",
+        )
+        return (
+            payload["run_id"] == manifest["run_id"]
+            and payload["shard_id"] == descriptor["shard_id"]
+            and payload["shard_index"] == descriptor["shard_index"]
+            and payload["ranges"] == [list(value) for value in ranges]
+            and payload["rows_sha256"] == _rows_checksum(rows)
+            and [int(row["pool_index"]) for row in rows] == ordinals
+            and payload["request_set_sha256"]
+            == group_request_set_sha256(manifest, ordinals, attestation)
+        )
+    except (CollectionError, IndexError, KeyError, TypeError, ValueError):
+        return False
 
 
 def _descriptor_checksum_error(
@@ -298,6 +357,10 @@ def validate_shards(
     an unrelated malformed row in an earlier shard.
     """
     assignments, expected_total = _manifest_grid_shards(manifest)
+    resolved = manifest.get("resolved_spec")
+    compilation = resolved.get("candidate_compilation") if isinstance(resolved, Mapping) else None
+    grouped = isinstance(compilation, Mapping) and compilation.get("mode") == "schema_grouped_v1"
+    pools = manifest["grid"]["pools"]
     expected_indices: set[int] = set()
     descriptor_ranges: dict[str, set[int]] = {}
     for desc in assignments:
@@ -313,6 +376,17 @@ def validate_shards(
         if expected_indices.intersection(shard_expected):
             raise CollectionError(f"shard assignments overlap at pool indices for {shard_id}")
         expected_indices.update(shard_expected)
+        if grouped:
+            group_id = desc.get("session_group_id")
+            observation_id = desc.get("observation_id")
+            if not isinstance(group_id, str) or not isinstance(observation_id, str):
+                raise CollectionError(f"grouped shard {shard_id} has no group/observation identity")
+            if any(
+                pools[index].get("session_group_id") != group_id
+                or pools[index].get("observation_id") != observation_id
+                for index in shard_expected
+            ):
+                raise CollectionError(f"grouped shard {shard_id} is not homogeneous")
 
     if expected_indices != set(range(expected_total)):
         raise CollectionError("shard assignments do not exactly partition grid.pools")
@@ -335,6 +409,7 @@ def validate_shards(
     run_id = manifest.get("run_id")
     common_session_digests: dict[str, str] | None = None
     common_request_set_sha256: str | None = None
+    grouped_proofs: dict[str, dict[str, str]] = {}
 
     for desc in assignments:
         shard_id = str(desc["shard_id"])
@@ -354,31 +429,48 @@ def validate_shards(
         if checksum_error:
             raise CollectionError(checksum_error)
 
-        blade = str(desc.get("blade", ""))
-        expected_session_id = f"sess_{run_id}_{blade}"
         raw_attestation = payload.get("session_attestation")
         if not isinstance(raw_attestation, Mapping) or set(raw_attestation) != {
             "session_id",
             *SESSION_ATTESTATION_FIELDS,
         }:
             raise CollectionError(f"shard result {shard_file} has invalid session_attestation fields")
-        attestation = normalize_session_attestation(
-            raw_attestation,
-            expected_session_id=expected_session_id,
-        )
+        if grouped:
+            group_id = str(desc["session_group_id"])
+            attestation = normalize_session_attestation(
+                raw_attestation, expected_session_id=f"sess_{run_id}_{group_id[:12]}"
+            )
+        else:
+            blade = str(desc.get("blade", ""))
+            attestation = normalize_session_attestation(
+                raw_attestation,
+                expected_session_id=f"sess_{run_id}_{blade}",
+            )
         session_digests = _session_digest_view(attestation)
-        if common_session_digests is None:
-            common_session_digests = session_digests
-        elif session_digests != common_session_digests:
-            raise CollectionError(f"shard result {shard_file} was evaluated against a different opened session")
-
-        expected_request_sha256 = grid_request_set_sha256(manifest, attestation)
+        if grouped:
+            previous = grouped_proofs.get(group_id)
+            if previous is None:
+                grouped_proofs[group_id] = session_digests
+            elif previous != session_digests:
+                raise CollectionError(
+                    f"shard result {shard_file} has a different attestation for its session group"
+                )
+            expected_request_sha256 = group_request_set_sha256(
+                manifest, sorted(descriptor_ranges[shard_id]), attestation
+            )
+        else:
+            if common_session_digests is None:
+                common_session_digests = session_digests
+            elif session_digests != common_session_digests:
+                raise CollectionError(f"shard result {shard_file} was evaluated against a different opened session")
+            expected_request_sha256 = grid_request_set_sha256(manifest, attestation)
         if payload.get("request_set_sha256") != expected_request_sha256:
             raise CollectionError(f"shard result {shard_file} does not match the manifest request set")
-        if common_request_set_sha256 is None:
-            common_request_set_sha256 = expected_request_sha256
-        elif expected_request_sha256 != common_request_set_sha256:
-            raise CollectionError(f"shard result {shard_file} has a different request set")
+        if not grouped:
+            if common_request_set_sha256 is None:
+                common_request_set_sha256 = expected_request_sha256
+            elif expected_request_sha256 != common_request_set_sha256:
+                raise CollectionError(f"shard result {shard_file} has a different request set")
 
         shard_expected = descriptor_ranges[shard_id]
         shard_actual: set[int] = set()
@@ -472,7 +564,7 @@ def write_grid_results_npz(
     run_id: str,
     schema_signature: str,
     request_set_sha256: str,
-    session_attestation: Mapping[str, str],
+    session_attestation: Mapping[str, Any],
     rows: Sequence[Mapping[str, Any]],
 ) -> Path:
     """Atomically write collected result rows as compressed, pickle-free NPZ."""
@@ -566,15 +658,33 @@ def collect_grid_results(
             fetch_remote_shards(manifest, results_dir, ssh_config=ssh_config, adapter=adapter)
 
     sorted_records, schema_sig = validate_shards(manifest, results_dir)
-    first_shard_id = str(assignments[0]["shard_id"])
-    first_payload, _ = _load_shard_records(results_dir / f"{first_shard_id}.json")
+    payloads = [
+        _load_shard_records(results_dir / f"{desc['shard_id']}.json")[0]
+        for desc in assignments
+    ]
+    resolved = manifest.get("resolved_spec")
+    compilation = resolved.get("candidate_compilation") if isinstance(resolved, Mapping) else None
+    grouped = isinstance(compilation, Mapping) and compilation.get("mode") == "schema_grouped_v1"
+    if grouped:
+        request_set_sha256 = hashlib.sha256(
+            _canonical_json([payload["request_set_sha256"] for payload in payloads])
+        ).hexdigest()
+        session_attestation: Mapping[str, Any] = {
+            str(descriptor["session_group_id"]): _session_digest_view(
+                payload["session_attestation"]
+            )
+            for descriptor, payload in zip(assignments, payloads, strict=True)
+        }
+    else:
+        request_set_sha256 = str(payloads[0]["request_set_sha256"])
+        session_attestation = _session_digest_view(payloads[0]["session_attestation"])
     target_output = output_file or (run_dir / "grid_results.npz")
     write_grid_results_npz(
         target_output,
         run_id=str(manifest.get("run_id", "")),
         schema_signature=schema_sig,
-        request_set_sha256=str(first_payload["request_set_sha256"]),
-        session_attestation=_session_digest_view(first_payload["session_attestation"]),
+        request_set_sha256=request_set_sha256,
+        session_attestation=session_attestation,
         rows=sorted_records,
     )
     if manifest.get("run_kind") == "grid" and isinstance(manifest.get("resolved_spec"), Mapping):
@@ -595,6 +705,8 @@ __all__ = [
     "collect_grid_results",
     "fetch_remote_shards",
     "grid_request_set_sha256",
+    "group_request_set_sha256",
+    "is_grouped_shard_complete",
     "make_shard_result",
     "normalize_session_attestation",
     "load_grid_results_npz",

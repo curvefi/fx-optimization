@@ -14,11 +14,10 @@ from typing import Any, Mapping, Sequence
 
 from .common import (
     SpecError,
-    assert_contained_path,
     canonical_json_bytes,
     repository_relative,
-    repository_root,
 )
+from .registry import SpecRegistry
 
 
 def _strict_int(value: Any, *, label: str) -> int:
@@ -48,6 +47,114 @@ def _strict_bool(value: Any, *, label: str) -> bool:
 def _validate_sha256(value: str | None, *, label: str) -> None:
     if value is not None and not re.fullmatch(r"[0-9a-f]{64}", value):
         raise SpecError(f"{label} must be a lowercase 64-character SHA-256")
+
+
+@dataclass(frozen=True, slots=True)
+class ScenarioMarketInput:
+    """Path-independent identity of one market input in declaration order."""
+
+    kind: str
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if not self.kind or not self.kind.strip():
+            raise SpecError("scenario closure market input kind must be non-empty")
+        _validate_sha256(self.sha256, label="scenario closure market input sha256")
+
+    def to_dict(self) -> dict[str, str]:
+        return {"kind": self.kind, "sha256": self.sha256}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ScenarioMarketInput:
+        unknown = sorted(set(data) - {"kind", "sha256"})
+        if unknown:
+            raise SpecError(
+                "unsupported scenario closure market input fields: "
+                + ", ".join(unknown)
+            )
+        return cls(kind=str(data["kind"]), sha256=str(data["sha256"]))
+
+
+@dataclass(frozen=True, slots=True)
+class ScenarioClosure:
+    """Verified, path-independent scenario content identity."""
+
+    scenario_id: str
+    pair_id: str
+    template_sha256: str
+    market_inputs: tuple[ScenarioMarketInput, ...]
+    schema_version: str = "curve_fx_scenario_closure_v1"
+
+    def __post_init__(self) -> None:
+        if self.schema_version != "curve_fx_scenario_closure_v1":
+            raise SpecError(f"unsupported scenario closure schema {self.schema_version!r}")
+        if not self.scenario_id or not self.scenario_id.strip():
+            raise SpecError("scenario closure scenario_id must be non-empty")
+        if not self.pair_id or not self.pair_id.strip():
+            raise SpecError("scenario closure pair_id must be non-empty")
+        _validate_sha256(self.template_sha256, label="scenario closure template_sha256")
+        object.__setattr__(self, "market_inputs", tuple(self.market_inputs))
+        if not all(isinstance(item, ScenarioMarketInput) for item in self.market_inputs):
+            raise SpecError("scenario closure market_inputs must contain typed entries")
+
+    @classmethod
+    def from_verified(
+        cls,
+        scenario: ScenarioSpec,
+        *,
+        template_sha256: str,
+        market_sha256s: Sequence[str],
+    ) -> ScenarioClosure:
+        """Close a validated spec over digests verified by the staging boundary."""
+        if len(market_sha256s) != len(scenario.market_files):
+            raise SpecError("scenario closure requires one digest per declared market input")
+        return cls(
+            scenario_id=scenario.id,
+            pair_id=scenario.pair_id,
+            template_sha256=template_sha256,
+            market_inputs=tuple(
+                ScenarioMarketInput(kind=ref.kind, sha256=digest)
+                for ref, digest in zip(scenario.market_files, market_sha256s, strict=True)
+            ),
+        )
+
+    def to_identity(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "scenario_id": self.scenario_id,
+            "pair_id": self.pair_id,
+            "template_sha256": self.template_sha256,
+            "market_inputs": [item.to_dict() for item in self.market_inputs],
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.to_identity()
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ScenarioClosure:
+        known = {
+            "schema_version",
+            "scenario_id",
+            "pair_id",
+            "template_sha256",
+            "market_inputs",
+        }
+        unknown = sorted(set(data) - known)
+        if unknown:
+            raise SpecError("unsupported scenario closure fields: " + ", ".join(unknown))
+        return cls(
+            schema_version=str(data["schema_version"]),
+            scenario_id=str(data["scenario_id"]),
+            pair_id=str(data["pair_id"]),
+            template_sha256=str(data["template_sha256"]),
+            market_inputs=tuple(
+                ScenarioMarketInput.from_dict(item) for item in data["market_inputs"]
+            ),
+        )
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(canonical_json_bytes(self.to_identity())).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -343,28 +450,12 @@ class ScenarioSpec:
 def load_scenario_spec(
     path_or_id: str | os.PathLike[str],
     *,
-    repository: Path | None = None,
+    repository: Path,
 ) -> ScenarioSpec:
     """Load and validate a scenario TOML specification."""
-    root = repository.resolve() if repository is not None else repository_root()
-    candidate = Path(path_or_id)
-
-    if not candidate.is_file():
-        search_paths = [
-            root / "configs" / "scenarios" / f"{path_or_id}.toml",
-            root / "configs" / f"{path_or_id}.toml",
-            root / "data" / "scenarios" / f"{path_or_id}.toml",
-        ]
-        found = None
-        for p in search_paths:
-            if p.is_file():
-                found = p
-                break
-        if found is None:
-            raise FileNotFoundError(f"Scenario specification not found: {path_or_id}")
-        candidate = found
-
-    assert_contained_path(candidate, root, allow_symlinks=True)
+    registry = SpecRegistry.from_root(repository)
+    root = registry.context.project_root
+    candidate = registry.resolve("scenario", path_or_id)
 
     with candidate.open("rb") as stream:
         raw_data = tomllib.load(stream)
@@ -456,4 +547,10 @@ def load_scenario_spec(
     return ScenarioSpec.from_dict(materialized)
 
 
-__all__ = ["MarketFileRef", "ScenarioSpec", "load_scenario_spec"]
+__all__ = [
+    "MarketFileRef",
+    "ScenarioClosure",
+    "ScenarioMarketInput",
+    "ScenarioSpec",
+    "load_scenario_spec",
+]

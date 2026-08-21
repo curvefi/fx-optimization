@@ -17,7 +17,7 @@ from typing import Any, Final, Mapping
 
 from ..artifacts.io import atomic_write_json
 from ..specs.common import assert_contained_path, repository_root
-from ..specs.scenario import ScenarioSpec
+from ..specs.scenario import ScenarioClosure, ScenarioSpec
 
 _RUN_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9._-]+$")
 
@@ -140,6 +140,8 @@ class WorkBundle:
     session_manifest_remote: PurePosixPath
     session_manifest_local_sha256: str
     session_manifest_remote_sha256: str
+    scenario_closure: ScenarioClosure | None = None
+    scenario_closure_sha256: str | None = None
     session_config: dict[str, Any] = field(default_factory=dict)
     template_local: Path | None = None
     template_remote: PurePosixPath | None = None
@@ -222,6 +224,12 @@ def prepare_work_bundle(
             )
         )
 
+    scenario_closure = ScenarioClosure.from_verified(
+        scenario_spec,
+        template_sha256=template_sha,
+        market_sha256s=tuple(entry.sha256 for entry in market_entries),
+    )
+
     inputs_dir = manifest_resolved.parent / "inputs"
     inputs_dir.mkdir(parents=True, exist_ok=True)
     local_session_manifest = inputs_dir / "session_manifest.local.json"
@@ -262,6 +270,8 @@ def prepare_work_bundle(
         session_manifest_remote=remote_session_manifest,
         session_manifest_local_sha256=sha256_path(local_session_manifest),
         session_manifest_remote_sha256=sha256_path(remote_session_manifest_local),
+        scenario_closure=scenario_closure,
+        scenario_closure_sha256=scenario_closure.sha256,
         session_config=session_config,
         template_local=template_local,
         template_remote=template_remote,

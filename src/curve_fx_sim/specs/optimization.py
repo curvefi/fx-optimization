@@ -7,18 +7,17 @@ import os
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 from .common import (
     SpecError,
-    assert_contained_path,
     canonical_primitive,
     repository_relative,
-    repository_root,
     serializable,
 )
 from .parameters import build_parameter_registry, validate_parameter_space_names
 from .policy import load_policy_spec
+from .registry import SpecRegistry
 from .scenario import load_scenario_spec
 
 
@@ -102,28 +101,15 @@ class OptimizationSpec:
 def load_optimization_spec(
     path_or_id: str | os.PathLike[str],
     *,
-    repository: Path | None = None,
+    repository: Path,
+    parameter_space_authority: Literal["legacy_registry", "selected_schema"] = "legacy_registry",
 ) -> OptimizationSpec:
     """Load and validate an optimization specification from TOML."""
-    root = repository.resolve() if repository is not None else repository_root()
-    candidate = Path(path_or_id)
-
-    if not candidate.is_file():
-        search_paths = [
-            root / "configs" / "optimizations" / f"{path_or_id}.toml",
-            root / "configs" / f"{path_or_id}.toml",
-            root / "optimizations" / f"{path_or_id}.toml",
-        ]
-        found = None
-        for p in search_paths:
-            if p.is_file():
-                found = p
-                break
-        if found is None:
-            raise FileNotFoundError(f"Optimization specification not found: {path_or_id}")
-        candidate = found
-
-    assert_contained_path(candidate, root, allow_symlinks=True)
+    if parameter_space_authority not in {"legacy_registry", "selected_schema"}:
+        raise ValueError(f"unsupported parameter_space_authority: {parameter_space_authority!r}")
+    registry = SpecRegistry.from_root(repository)
+    root = registry.context.project_root
+    candidate = registry.resolve("optimization", path_or_id)
 
     with candidate.open("rb") as stream:
         raw_data = tomllib.load(stream)
@@ -162,26 +148,26 @@ def load_optimization_spec(
     tags = tuple(opt_data.get("tags", []))
     source_path = repository_relative(candidate, root)
 
-    # Resolve every parameter_space name through the parameter registry: policy
-    # parameters (PolicySpec order) plus the curated pool-economics allowlist
-    # when the primary scenario's template is available. Unknown names fail
-    # here, at the guaranteed load path, before any run starts.
-    template_json = None
-    if scenarios:
-        try:
-            primary_scenario = load_scenario_spec(scenarios[0], repository=root)
-        except SpecError as exc:
-            raise SpecError(
-                f"optimization scenario {scenarios[0]!r} is invalid: {exc}"
-            ) from exc
-        if primary_scenario.template_path is not None:
-            template_file = root / primary_scenario.template_path
-            if template_file.is_file():
-                with template_file.open("r", encoding="utf-8") as stream:
-                    template_json = json.load(stream)
-    policy_spec = load_policy_spec(policy_id, repository=root)
-    registry = build_parameter_registry(policy_spec, template_json, parameter_space)
-    validate_parameter_space_names(parameter_space, registry)
+    if parameter_space_authority == "legacy_registry":
+        # The default loader keeps the checked-in PolicySpec registry as its
+        # authority. Artifact-selected callers defer only this validation and
+        # must resolve canonical names against the selected evaluator schema.
+        template_json = None
+        if scenarios:
+            try:
+                primary_scenario = load_scenario_spec(scenarios[0], repository=root)
+            except SpecError as exc:
+                raise SpecError(
+                    f"optimization scenario {scenarios[0]!r} is invalid: {exc}"
+                ) from exc
+            if primary_scenario.template_path is not None:
+                template_file = root / primary_scenario.template_path
+                if template_file.is_file():
+                    with template_file.open("r", encoding="utf-8") as stream:
+                        template_json = json.load(stream)
+        policy_spec = load_policy_spec(policy_id, repository=root)
+        registry = build_parameter_registry(policy_spec, template_json, parameter_space)
+        validate_parameter_space_names(parameter_space, registry)
 
     return OptimizationSpec(
         id=opt_id,

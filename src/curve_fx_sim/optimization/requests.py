@@ -11,9 +11,13 @@ mirroring the seam in :mod:`curve_fx_sim.grids.model`).
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
+from ..evaluation.plans import CandidateCompiler, CandidatePlan, ScenarioKey
+from ..specs.scenario import ScenarioClosure
 from .profiles import Profile
+from .profiles import NamedProfile
+from .search import SearchLayout
 
 
 def _set_nested(target: dict[str, Any], path: Sequence[str], value: Any) -> None:
@@ -66,4 +70,21 @@ def split_request(
     return policy_params, pool_overrides
 
 
-__all__ = ["split_request"]
+def compile_named_request(
+    profile: NamedProfile | SearchLayout,
+    vector: Sequence[int | float],
+    compiler: CandidateCompiler,
+    *,
+    open_session: Mapping[str, object],
+    scenario: ScenarioClosure | ScenarioKey,
+) -> CandidatePlan:
+    """Compile one optimizer vector through the canonical named-proposal seam."""
+    proposal = profile.to_proposal(vector)
+    return compiler.compile(
+        proposal,
+        open_session=open_session,
+        scenario=scenario,
+    )
+
+
+__all__ = ["compile_named_request", "split_request"]

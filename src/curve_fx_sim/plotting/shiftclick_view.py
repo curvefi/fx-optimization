@@ -297,6 +297,53 @@ def _load_executed_fee_actions(path: Path | None) -> dict[str, np.ndarray] | Non
     }
 
 
+def _infer_donation_frequency(path: Path | None) -> float:
+    """Infer cadence only when donation action metadata is unambiguous."""
+    if path is None or not path.is_file():
+        return 0.0
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, TypeError, ValueError):
+        return 0.0
+    actions = payload if isinstance(payload, list) else payload.get("actions") or []
+    donations = [
+        action for action in actions
+        if isinstance(action, dict) and action.get("type") == "donation"
+    ]
+    if len(donations) < 2:
+        return 0.0
+
+    frequencies = []
+    for action in donations:
+        try:
+            frequency = float(action.get("freq_s", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(frequency) and frequency > 0.0:
+            frequencies.append(frequency)
+    if len(frequencies) >= 2:
+        cadence = frequencies[0]
+        return cadence if all(
+            np.isclose(frequency, cadence, rtol=0.0, atol=1e-6) for frequency in frequencies
+        ) else 0.0
+
+    timestamps = []
+    for action in donations:
+        try:
+            timestamp = float(action["ts"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if np.isfinite(timestamp):
+            timestamps.append(timestamp)
+    if len(timestamps) < 2:
+        return 0.0
+    deltas = np.diff(sorted(timestamps))
+    cadence = float(deltas[0])
+    if cadence <= 0.0 or not np.all(np.isclose(deltas, cadence, rtol=0.0, atol=1e-6)):
+        return 0.0
+    return cadence
+
+
 def _plot_executed_fee_axis(ax, executed_fee, *, max_points: int = 5000, spine_offset=None):
     if executed_fee is None:
         return None
@@ -533,6 +580,7 @@ def render_shiftclick_figure(
     bin_hours: float = 6.0,
     apy_ymax: float | None = None,
     max_points: int = DEFAULT_MAX_POINTS,
+    donation_frequency: float | None = None,
 ):
     """Build the legacy multi-panel shiftclick figure from trace sidecars."""
     payload = json.loads(Path(trace_path).read_text())
@@ -553,7 +601,13 @@ def render_shiftclick_figure(
     sampled_pool_fee = pool_fee
     lp_xcp_profit = detailed["lp_xcp_profit"]
     donation_apy = detailed["donation_apy"]
-    donation_frequency = float(detailed.get("donation_frequency", 0.0) or 0.0)
+    if donation_frequency is None:
+        donation_frequency = _infer_donation_frequency(actions_path)
+    else:
+        try:
+            donation_frequency = float(donation_frequency)
+        except (TypeError, ValueError):
+            donation_frequency = 0.0
     donation_growth = _donation_growth(timestamps, donation_apy, donation_frequency)
     with np.errstate(invalid="ignore", divide="ignore"):
         net_lp_growth = lp_xcp_profit / donation_growth

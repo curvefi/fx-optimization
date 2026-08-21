@@ -159,10 +159,14 @@ class NevergradTwoPointsDEOptimizer:
         """Rebuild deterministic optimizer state from safe ask/tell history."""
         if payload.get("schema_version") != NEVERGRAD_STATE_SCHEMA_VERSION:
             raise ValueError("unsupported Nevergrad optimizer_state schema_version")
+        stored_budget = payload.get("budget")
+        if isinstance(stored_budget, bool) or not isinstance(stored_budget, int):
+            raise ValueError("Nevergrad optimizer_state budget must be a non-bool integer")
+        if stored_budget > self.budget:
+            raise ValueError("Nevergrad optimizer_state budget cannot decrease")
         for field, expected in (
             ("algorithm", "nevergrad_two_points_de"),
             ("seed", self.seed),
-            ("budget", self.budget),
             ("num_workers", self.num_workers),
         ):
             if payload.get(field) != expected:
@@ -182,6 +186,8 @@ class NevergradTwoPointsDEOptimizer:
             raw_losses = raw_batch.get("losses")
             if not isinstance(raw_ticks, list) or not isinstance(raw_losses, list):
                 raise ValueError("Nevergrad optimizer_state history entry is malformed")
+            if self.step + len(raw_ticks) > self.budget:
+                raise ValueError("Nevergrad optimizer_state step does not match history")
             generated = self.ask(len(raw_ticks))
             generated_ticks = tuple(self.lattice.encode(point) for point in generated)
             expected_ticks = tuple(tuple(int(value) for value in point) for point in raw_ticks)

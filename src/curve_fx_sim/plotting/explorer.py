@@ -1,0 +1,1061 @@
+"""Small interactive N-D heatmap explorer over the attested table API.
+
+The explorer deliberately keeps the table and manifest as its only sources of
+truth.  A cell click therefore carries a ``SelectionRef`` rather than
+reconstructing pool parameters from displayed axis values.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+import secrets
+import tempfile
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.backend_bases import MouseButton, MouseEvent
+from matplotlib.ticker import (
+    FixedFormatter,
+    FixedLocator,
+    FormatStrFormatter,
+    NullFormatter,
+    NullLocator,
+)
+from matplotlib.widgets import RadioButtons, Slider
+
+from ..artifacts.attestation import find_attested_artifact
+from ..artifacts.io import atomic_write_json
+from ..artifacts.manifest import load_manifest
+from ..artifacts.store import RunStore
+from ..artifacts.tables import EvaluationTable
+from ..evaluation.selection import SelectionRef
+from ..specs.shiftclick import ShiftclickSpec
+from .heatmap import (
+    HeatmapAxis,
+    HeatmapDataset,
+    HeatmapSelection,
+    HeatmapTilesState,
+    MaskSpec,
+    _auto_log,
+    _edges,
+)
+from .masked_metrics import (
+    MASKED_METRIC_SOURCES,
+    SKEW_MASKED_METRICS,
+    SLIPPAGE_APY_MASK_SOURCES,
+)
+
+_LN2 = math.log(2.0)
+_MAX_TICKS = 12
+_SPARSE_TRACE_POINTS = 10_000
+
+
+@dataclass(frozen=True)
+class _AxisView:
+    key: str
+    name: str
+    centers: np.ndarray
+    labels: tuple[str, ...]
+    positional: bool
+    logarithmic: bool
+
+
+def _format_duration_short(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    days, remainder = divmod(total, 86_400)
+    hours, remainder = divmod(remainder, 3_600)
+    minutes, seconds = divmod(remainder, 60)
+    if days:
+        return f"{days}d" if not hours else f"{days}d{hours}h"
+    if hours:
+        return f"{hours}h" if not minutes else f"{hours}h{minutes}m"
+    if minutes:
+        return f"{minutes}m" if not seconds else f"{minutes}m{seconds}s"
+    return f"{seconds}s"
+
+
+def _axis_name_and_labels(name: str, values: Sequence[float]) -> tuple[str, tuple[str, ...]]:
+    key = name.lower()
+    display_name = name
+    if name == "A" or key == "a":
+        return f"{name} (÷1e4)", tuple(f"{value / 1e4:.2f}" for value in values)
+    if key in {"reserved_profit_fraction", "admin_fee"}:
+        scaled = bool(values) and max(abs(value) for value in values) > 1.0
+        if scaled:
+            return f"{name} (÷1e10)", tuple(f"{value / 1e10:.2f}" for value in values)
+        return display_name, tuple(f"{value:.4g}" for value in values)
+    if "fee_bps" in key:
+        return f"{name} (bps)", tuple(f"{value:.2f}" for value in values)
+    if "fee" in key and "gamma" not in key:
+        return f"{name} (bps)", tuple(f"{value / 1e10 * 1e4:.2f}" for value in values)
+    if "ma_time" in key or "price_source_ema_half_time" in key:
+        suffix = "" if "hrs" in key else " (hrs)"
+        return display_name + suffix, tuple(_format_duration_short(value * _LN2) for value in values)
+    if key.endswith("_wad"):
+        return f"{name} (/1e18)", tuple(f"{value / 1e18:.6g}" for value in values)
+    if "gamma" in key:
+        return display_name, tuple(f"{value / 1e18:.5f}" for value in values)
+    if "liquidity" in key or "balance" in key:
+        return f"{name} (/1e18)", tuple(f"{value / 1e18:.2f}" for value in values)
+    return display_name, tuple(f"{value:.4g}" for value in values)
+
+
+def _format_slider_value(name: str, value: float) -> str:
+    key = name.lower()
+    if "fee_bps" in key:
+        return f"{value:.1f} bps"
+    if key in {"reserved_profit_fraction", "admin_fee"}:
+        return f"{(value / 1e10 if abs(value) > 1 else value):.4f}"
+    if "fee" in key and "gamma" not in key:
+        return f"{value / 1e10 * 1e4:.1f} bps"
+    if "ma_time" in key or "price_source_ema_half_time" in key:
+        return _format_duration_short(value * _LN2)
+    if name == "A" or key == "a":
+        return f"{value / 1e4:.2f}"
+    if key.endswith("_wad"):
+        return f"{value / 1e18:.6g}"
+    if "gamma" in key:
+        return f"{value / 1e18:.6f}"
+    if "apy" in key or "ratio" in key:
+        return f"{value:.4f}"
+    return f"{value:.4g}"
+
+
+def _target_name(target: Mapping[str, Any], fallback: str) -> str:
+    path = target.get("path")
+    return (
+        str(path[-1])
+        if isinstance(path, Sequence) and not isinstance(path, (str, bytes)) and path
+        else fallback
+    )
+
+
+def _target_value(value: Any, target: Mapping[str, Any]) -> float:
+    scale = float(target.get("scale", 1))
+    display_scale = float(target.get("display_scale", 1))
+    transformed = float(value) * scale / display_scale
+    return float(int(transformed)) if target.get("kind") in {"integer", "bps"} else transformed
+
+
+def _select_ticks(length: int, maximum: int = _MAX_TICKS) -> tuple[int, ...]:
+    if length <= maximum:
+        return tuple(range(length))
+    return tuple(sorted(set(int(index) for index in np.linspace(0, length - 1, maximum, dtype=int))))
+
+
+def _apply_fixed_ticks(target: Any, values: Sequence[float], labels: Sequence[str]) -> None:
+    target.set_major_locator(FixedLocator(values))
+    target.set_major_formatter(FixedFormatter(labels or [""] * len(values)))
+    target.set_minor_locator(NullLocator())
+    target.set_minor_formatter(NullFormatter())
+    target.get_offset_text().set_visible(False)
+
+
+def _auto_font_size(nx: int, ny: int) -> int:
+    grid = max(1, nx, ny)
+    if grid <= 4:
+        return 6
+    if grid <= 8:
+        return 7
+    if grid <= 16:
+        return 8
+    if grid >= 32:
+        return 10
+    return int(round(8 + (grid - 16) / 16 * 2))
+
+
+def _finite_clim(values: np.ndarray) -> tuple[float, float]:
+    finite = values[np.isfinite(values)]
+    if not finite.size:
+        return (0.0, 1.0)
+    lower, upper = float(np.min(finite)), float(np.max(finite))
+    if lower == upper:
+        epsilon = 1e-12 if upper == 0 else abs(upper) * 1e-12
+        lower, upper = lower - epsilon, upper + epsilon
+    return lower, upper
+
+
+def _axis_metadata(dataset: HeatmapDataset, axis: HeatmapAxis) -> Mapping[str, Any]:
+    axes = dataset.metadata.get("axes")
+    index = dataset.axis_index(axis.key)
+    if isinstance(axes, Sequence) and index < len(axes) and isinstance(axes[index], Mapping):
+        return axes[index]
+    return {}
+
+
+def _targets(metadata: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+    raw = metadata.get("targets") or metadata.get("target")
+    if isinstance(raw, Mapping):
+        return (raw,)
+    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+        return tuple(target for target in raw if isinstance(target, Mapping))
+    return ()
+
+
+def _axis_view(
+    dataset: HeatmapDataset,
+    axis: HeatmapAxis,
+    explicit_logs: set[str],
+) -> _AxisView:
+    metadata = _axis_metadata(dataset, axis)
+    targets = _targets(metadata)
+    if axis.is_coupled:
+        labels: list[str] = []
+        for row in axis.values:
+            parts = []
+            for index, (name, value) in enumerate(zip(axis.names, row, strict=True)):
+                target = targets[index] if index < len(targets) else {}
+                try:
+                    raw = _target_value(value, target) if target else float(value)
+                    parts.append(_format_slider_value(name, raw))
+                except (TypeError, ValueError, ZeroDivisionError):
+                    parts.append(str(value))
+            labels.append("(" + "/".join(parts) + ")")
+        return _AxisView(
+            key=axis.key,
+            name=axis.key,
+            centers=np.arange(len(axis.values), dtype=float),
+            labels=tuple(labels),
+            positional=True,
+            logarithmic=False,
+        )
+    try:
+        numeric = np.asarray(axis.values, dtype=float)
+    except (TypeError, ValueError):
+        return _AxisView(
+            key=axis.key,
+            name=axis.key,
+            centers=np.arange(len(axis.values), dtype=float),
+            labels=axis.display_labels,
+            positional=True,
+            logarithmic=False,
+        )
+    name = axis.names[0]
+    if targets:
+        name = _target_name(targets[0], name)
+        try:
+            numeric = np.asarray([_target_value(value, targets[0]) for value in axis.values])
+        except (TypeError, ValueError, ZeroDivisionError):
+            numeric = np.asarray(axis.values, dtype=float)
+    positional = len(numeric) > 1 and not bool(np.all(np.diff(numeric) > 0))
+    display_name, labels = _axis_name_and_labels(name, numeric.tolist())
+    centers = np.arange(len(numeric), dtype=float) if positional else numeric
+    logarithmic = not positional and (
+        axis.key in explicit_logs or axis.scale == "log" or _auto_log(numeric)
+    )
+    return _AxisView(axis.key, display_name, centers, labels, positional, logarithmic)
+
+
+def _main_figure_size(nx: int, ny: int, rows: int, cols: int) -> tuple[float, float]:
+    cell_aspect = ny / max(1, nx)
+    cell_width = 22.0 / cols
+    cell_height = cell_width * cell_aspect
+    height = cell_height * rows
+    if height > 12.0:
+        height = 12.0
+        cell_height = height / rows
+        cell_width = cell_height / cell_aspect
+        width = cell_width * cols
+    else:
+        width = 22.0
+    return max(10.0, min(22.0, width)), max(6.0, min(12.0, height))
+
+
+def _cell_index_from_view(view: _AxisView, coordinate: float) -> int | None:
+    edges = _edges(view.centers, logarithmic=view.logarithmic and not view.positional)
+    if coordinate < edges[0] or coordinate > edges[-1]:
+        return None
+    index = int(np.searchsorted(edges, coordinate, side="right") - 1)
+    if index == len(view.centers) and coordinate == edges[-1]:
+        index -= 1
+    return index if 0 <= index < len(view.centers) else None
+
+
+def format_axis_value(value: Any) -> str:
+    """Format one exact coordinate without changing its stored value."""
+    if isinstance(value, (tuple, list)):
+        return "(" + ", ".join(format_axis_value(item) for item in value) + ")"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if not math.isfinite(number):
+        return "n/a"
+    return f"{number:.6g}"
+
+
+def format_metric_value(metric: str, value: Any) -> str:
+    """Use units that make fractions and price errors readable in the metrics window."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "n/a" if value is None else str(value)
+    if not math.isfinite(number):
+        return "n/a"
+    scale, suffix = _metric_scale_info(metric)
+    return f"{number * scale:.6g}{'%' if suffix else ''}"
+
+
+def _window_title(figure: Any, title: str) -> None:
+    manager = getattr(figure.canvas, "manager", None)
+    setter = getattr(manager, "set_window_title", None)
+    if callable(setter):
+        setter(title)
+
+
+def _metric_requires_mask(metric: str) -> bool:
+    return metric in MASKED_METRIC_SOURCES
+
+
+def _metric_scale_info(metric: str) -> tuple[float, str]:
+    key = metric.lower()
+    scale = (
+        1e-18
+        if metric in {"virtual_price", "xcp_profit", "price_scale", "D", "totalSupply"}
+        else 1.0
+    )
+    percent = (
+        key in {"vpminusone", "apy"}
+        or "apy" in key
+        or "tw_real_slippage" in key
+        or "geom_mean" in key
+        or "rel_price_diff" in key
+        or "pool_fee" in key
+        or "imbalance" in key
+        or "skew" in key
+    )
+    if percent:
+        scale *= 100.0
+    return scale, " (%)" if percent else ""
+
+
+def _finite_max(dataset: HeatmapDataset, metric: str, scale: float = 1.0) -> float | None:
+    raw = dataset.metrics.get(metric)
+    if raw is None:
+        return None
+    values = np.asarray(raw, dtype=float)
+    values = values[np.isfinite(values)]
+    if not values.size:
+        return None
+    maximum = float(np.nanmax(np.abs(values)) * scale)
+    return maximum if math.isfinite(maximum) else None
+
+
+def _mapping_id(value: Any) -> str:
+    if isinstance(value, Mapping):
+        return str(value.get("id") or value.get("policy_id") or "")
+    return str(value or "")
+
+
+def _template_frequency(template: Mapping[str, Any]) -> float | None:
+    pool = template.get("pool") if isinstance(template.get("pool"), Mapping) else template
+    if isinstance(template.get("pools"), Sequence) and template["pools"]:
+        first = template["pools"][0]
+        if isinstance(first, Mapping):
+            pool = first.get("pool", first)
+    if not isinstance(pool, Mapping):
+        return None
+    value = pool.get("donation_frequency")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
+
+
+def resolve_donation_frequency(
+    manifest: Mapping[str, Any],
+    *,
+    source_row: Any | None = None,
+    project_root: Path | None = None,
+    template: Mapping[str, Any] | None = None,
+) -> float | None:
+    """Resolve the cadence from attested replay data, pool overrides, or template.
+
+    Trace records do not carry this pool initialization field.  The order keeps
+    a selected row's attested override ahead of a scenario default and only
+    reads a template whose manifest digest was already checked by the caller.
+    """
+    resolved = manifest.get("resolved_spec", {})
+    plan = resolved.get("replay_plan", {}) if isinstance(resolved, Mapping) else {}
+    override_maps = []
+    if isinstance(plan, Mapping):
+        override_maps.append(plan.get("pool_overrides"))
+    if source_row is not None:
+        override_maps.append(getattr(source_row, "pool_overrides", None))
+    for overrides in override_maps:
+        if isinstance(overrides, Mapping):
+            try:
+                value = float(overrides.get("donation_frequency"))
+            except (TypeError, ValueError):
+                value = 0.0
+            if math.isfinite(value) and value > 0:
+                return value
+    if template is not None:
+        frequency = _template_frequency(template)
+        if frequency is not None:
+            return frequency
+    scenario = (
+        plan.get("scenario_spec")
+        if isinstance(plan, Mapping) and isinstance(plan.get("scenario_spec"), Mapping)
+        else resolved.get("scenario") if isinstance(resolved, Mapping) else None
+    )
+    if isinstance(scenario, Mapping):
+        inline = scenario.get("template")
+        if isinstance(inline, Mapping):
+            frequency = _template_frequency(inline)
+            if frequency is not None:
+                return frequency
+        path = scenario.get("template_path")
+        if project_root is not None and path:
+            template_path = (project_root.resolve() / str(path)).resolve()
+            if template_path.is_file():
+                try:
+                    from ..artifacts.io import sha256_path
+
+                    expected = scenario.get("template_sha256")
+                    if expected and sha256_path(template_path).lower() != str(expected).lower():
+                        return None
+                    parsed = json.loads(template_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, json.JSONDecodeError):
+                    return None
+                frequency = _template_frequency(parsed)
+                if frequency is not None:
+                    return frequency
+    return None
+
+
+def sparse_trace_interval(
+    manifest: Mapping[str, Any],
+    *,
+    target_points: int = _SPARSE_TRACE_POINTS,
+) -> int:
+    """Choose a deterministic inspect stride from the attested scenario span."""
+    if target_points <= 0:
+        raise ValueError("target_points must be positive")
+    resolved = manifest.get("resolved_spec", {})
+    scenario = resolved.get("scenario", {}) if isinstance(resolved, Mapping) else {}
+    if not isinstance(scenario, Mapping):
+        return 1
+    try:
+        candles = int(scenario.get("n_candles", 0) or 0)
+        start = int(scenario.get("start_time", 0) or 0)
+        end = int(scenario.get("end_time", 0) or 0)
+    except (TypeError, ValueError):
+        return 1
+    # The evaluator normally produces a market and arbitrage event per minute.
+    # This is only an observation stride; it never changes simulation decisions.
+    minutes = candles if candles > 0 else max(0, (end - start) // 60)
+    return max(1, (2 * minutes) // target_points)
+
+
+class HeatmapExplorer:
+    """Three-window heatmap, controls, and exact-cell metrics explorer."""
+
+    def __init__(
+        self,
+        data: EvaluationTable | HeatmapDataset,
+        *,
+        metrics: Sequence[str] | None = None,
+        ncol: int = 3,
+        log_axes: Sequence[str] = (),
+        x_axis: str | None = None,
+        y_axis: str | None = None,
+        max_pricethr: float | None = 100.0,
+        skewthr: float | None = None,
+        slipthr: float | None = 20.0,
+        slipthr_max: float | None = 100.0,
+        final_pdiffthr: float | None = None,
+        run_id: str | None = None,
+        run_dir: Path | None = None,
+        store: RunStore | None = None,
+        manifest: Mapping[str, Any] | None = None,
+        harness: Path | None = None,
+        site: str = "local",
+        blade: str | None = None,
+        on_replay: Callable[[SelectionRef, str], Any] | None = None,
+    ) -> None:
+        self.dataset = data if isinstance(data, HeatmapDataset) else HeatmapDataset.from_table(data)
+        available = tuple(self.dataset.metrics) + tuple(sorted(MASKED_METRIC_SOURCES))
+        self.metrics = tuple(metrics) if metrics is not None else tuple(self.dataset.metrics)
+        missing = [name for name in self.metrics if name not in available]
+        if missing:
+            raise ValueError(f"unknown explorer metric(s): {', '.join(missing)}")
+        if not self.metrics:
+            raise ValueError("explorer requires at least one metric")
+        if ncol < 1:
+            raise ValueError("ncol must be positive")
+        self.run_id = run_id or (str(manifest.get("run_id")) if manifest else "")
+        self.run_dir = run_dir.resolve() if run_dir is not None else None
+        self.store = store
+        self.manifest = manifest
+        self.harness = harness
+        self.site = site
+        self.blade = blade
+        self.on_replay = on_replay
+        self._updating_radios = False
+        self._replay_running = False
+        self.last_selection: HeatmapSelection | None = None
+        self._source_row = None
+        if isinstance(data, EvaluationTable):
+            self._source_row = {row.ordinal: row for row in data.rows}
+        mask = MaskSpec(
+            max_price_diff_bps=max_pricethr,
+            max_skew_percent=skewthr,
+            max_final_price_diff_bps=final_pdiffthr,
+            slippage_thr_bps=slipthr,
+            slippage_thr_max_bps=slipthr_max,
+        )
+        self.state = HeatmapTilesState.default(
+            self.dataset,
+            tiles=self.metrics,
+            ncol=ncol,
+            log_axes=log_axes,
+            x_axis=x_axis,
+            y_axis=y_axis,
+            mask=mask,
+        )
+        explicit_logs = set(log_axes)
+        self._axis_views = {
+            axis.key: _axis_view(self.dataset, axis, explicit_logs)
+            for axis in self.dataset.axes
+        }
+        self.state.log_axes = tuple(
+            axis.key for axis in self.dataset.axes if self._axis_views[axis.key].logarithmic
+        )
+        self._global_clims = self._compute_global_clims()
+        self.fig_main = plt.figure(figsize=(13.0, 8.0), layout="constrained", num="Heatmaps")
+        self.fig_controls = plt.figure(figsize=(3.2, 6.0), num="Controls")
+        self.fig_metrics = plt.figure(figsize=(6.5, 9.0), num="Metrics")
+        _window_title(self.fig_main, "Heatmaps")
+        _window_title(self.fig_controls, "Controls")
+        _window_title(self.fig_metrics, "Metrics")
+        self.meshes: list[Any] = []
+        self.colorbars: list[Any] = []
+        self.axes: list[Any] = []
+        self.sliders: list[tuple[str, Slider]] = []
+        self._threshold_sliders: dict[str, Slider] = {}
+        self._metric_axes: list[Any] = []
+        self._slider_value_texts: dict[str, Any] = {}
+        self._threshold_value_texts: dict[str, Any] = {}
+        self.fig_metrics.text(
+            0.02,
+            0.98,
+            "Metrics (left click a heatmap cell)",
+            ha="left",
+            va="top",
+            fontsize=10,
+            fontweight="bold",
+        )
+        self.metrics_text = self.fig_metrics.text(
+            0.02, 0.94, "Click a heatmap cell to inspect it.",
+            ha="left", va="top", family="monospace", fontsize=8,
+        )
+        self.fig_main.canvas.mpl_connect("button_press_event", self._on_click)
+        self._rebuild_controls()
+        self._draw_heatmaps()
+
+    def _compute_global_clims(self) -> dict[str, tuple[float, float]]:
+        clims: dict[str, tuple[float, float]] = {}
+        for metric in self.metrics:
+            source = MASKED_METRIC_SOURCES.get(metric, metric)
+            values = self.dataset.metric_array(source)
+            scale, _ = _metric_scale_info(metric)
+            clims[metric] = _finite_clim(values * scale)
+        return clims
+
+    def _get_slider_dims(self) -> list[tuple[int, str]]:
+        return [
+            (index, axis.key)
+            for index, axis in enumerate(self.dataset.axes)
+            if axis.key in self.state.slider_indices and not axis.is_singleton
+        ]
+
+    def _rebuild_controls(self) -> None:
+        self.fig_controls.clear()
+        _window_title(self.fig_controls, "Controls")
+        active_keys = [axis.key for axis in self.dataset.axes if not axis.is_singleton]
+        keys = active_keys if len(active_keys) >= 2 else list(self.dataset.axis_keys)
+        self._radio_keys = keys
+        radio_labels = [self._axis_views[key].name for key in keys]
+        self._radio_label_to_key = dict(zip(radio_labels, keys, strict=True))
+        selected = set(self.state.tiles)
+        threshold_count = sum(
+            (
+                bool(selected & set(MASKED_METRIC_SOURCES) and self._mask_source("max_7d_rel_price_diff", "max_rel_price_diff")),
+                bool(selected & set(SKEW_MASKED_METRICS) and "max_7d_skew" in self.dataset.metrics),
+                bool(selected & set(SLIPPAGE_APY_MASK_SOURCES) and any(source in self.dataset.metrics for source in SLIPPAGE_APY_MASK_SOURCES.values())),
+                bool(selected & set(SKEW_MASKED_METRICS) and "final_rel_price_diff" in self.dataset.metrics),
+            )
+        )
+        slider_count = len(self._get_slider_dims()) + threshold_count
+        radio_height = len(keys) * 0.03 + 0.01
+        content_height = 0.03 + 2 * (0.01 + radio_height + 0.02) + slider_count * 0.075 + 0.02
+        height_multiplier = 11.0 + max(0, len(keys) - 5) * 0.3
+        self.fig_controls.set_size_inches(3.2, max(6.0, content_height * height_multiplier + 1.0))
+        self.fig_controls.text(
+            0.5, 0.98, "Dimension Controls", ha="center", va="top", fontsize=10, fontweight="bold"
+        )
+        self.fig_controls.text(0.05, 0.95, "X axis:", ha="left", va="top", fontsize=9)
+        x_box_top = 0.94
+        x_box = self.fig_controls.add_axes((0.20, x_box_top - radio_height, 0.75, radio_height))
+        x_box.set_frame_on(False)
+        y_label_y = x_box_top - radio_height - 0.02
+        self.fig_controls.text(0.05, y_label_y, "Y axis:", ha="left", va="top", fontsize=9)
+        y_box_top = y_label_y - 0.01
+        y_box = self.fig_controls.add_axes((0.20, y_box_top - radio_height, 0.75, radio_height))
+        y_box.set_frame_on(False)
+        self.x_radio = RadioButtons(x_box, radio_labels, active=keys.index(self.state.x_axis))
+        self.y_radio = RadioButtons(y_box, radio_labels, active=keys.index(self.state.y_axis))
+        self.x_radio.on_clicked(self._on_x_changed)
+        self.y_radio.on_clicked(self._on_y_changed)
+        for radio in (self.x_radio, self.y_radio):
+            for label in radio.labels:
+                label.set_fontsize(8)
+        self.sliders = []
+        self._slider_value_texts = {}
+        y = y_box_top - radio_height - 0.02
+        for _, key in self._get_slider_dims():
+            axis = self.dataset.axis(key)
+            view = self._axis_views[key]
+            self.fig_controls.text(0.05, y + 0.015, f"{view.name}:", ha="left", va="bottom", fontsize=8)
+            control_ax = self.fig_controls.add_axes((0.20, y - 0.02, 0.62, 0.03))
+            slider = Slider(
+                control_ax, "", 0, len(axis.values) - 1,
+                valinit=self.state.slider_indices[key], valstep=1,
+            )
+            slider.valtext.set_visible(False)
+            self._slider_value_texts[key] = self.fig_controls.text(
+                0.20,
+                y - 0.035,
+                view.labels[self.state.slider_indices[key]],
+                ha="left",
+                va="top",
+                fontsize=8,
+            )
+            slider.on_changed(lambda value, name=key: self._on_dimension_slider(name, value))
+            self.sliders.append((key, slider))
+            y -= 0.075
+        self._threshold_sliders = {}
+        self._threshold_value_texts = {}
+        masked = selected & set(MASKED_METRIC_SOURCES)
+        if masked and self._mask_source("max_7d_rel_price_diff", "max_rel_price_diff"):
+            y = self._add_threshold_slider("max_pricethr", "max 7d pdiff thr (bps)", y, max_pricethr=self.state.mask.max_price_diff_bps)
+        if selected & set(SKEW_MASKED_METRICS) and "max_7d_skew" in self.dataset.metrics:
+            y = self._add_threshold_slider("skewthr", "7d skew max (%)", y, max_pricethr=self.state.mask.max_skew_percent, source="max_7d_skew", scale=100.0)
+        if selected & set(SLIPPAGE_APY_MASK_SOURCES) and any(source in self.dataset.metrics for source in SLIPPAGE_APY_MASK_SOURCES.values()):
+            y = self._add_threshold_slider("slipthr", "slippage thr (bps)", y, max_pricethr=self.state.mask.slippage_thr_bps, source="tw_real_slippage_1pct", scale=10_000.0, range_max=self.state.mask.slippage_thr_max_bps)
+        if selected & set(SKEW_MASKED_METRICS) and "final_rel_price_diff" in self.dataset.metrics:
+            y = self._add_threshold_slider("final_pdiffthr", "final pdiff thr (bps)", y, max_pricethr=self.state.mask.max_final_price_diff_bps, source="final_rel_price_diff", scale=10_000.0)
+        self.fig_controls.text(0.08, max(0.02, y - 0.02), "Shift+click / right-click: exact replay", fontsize=8)
+        self.fig_controls.canvas.draw_idle()
+
+    def _mask_source(self, *names: str) -> str | None:
+        return next((name for name in names if name in self.dataset.metrics), None)
+
+    def _add_threshold_slider(
+        self,
+        key: str,
+        label: str,
+        y: float,
+        *,
+        max_pricethr: float | None,
+        source: str | None = None,
+        scale: float = 1.0,
+        range_max: float | None = None,
+    ) -> float:
+        maximum = _finite_max(self.dataset, source, scale) if source else None
+        maximum = max(1.0, float(maximum or 0.0), float(max_pricethr or 0.0))
+        if range_max is not None:
+            maximum = max(1.0, float(range_max))
+        initial = maximum if max_pricethr is None else min(maximum, max(0.0, float(max_pricethr)))
+        self.fig_controls.text(0.05, y + 0.015, f"{label}:", ha="left", va="bottom", fontsize=8)
+        control_ax = self.fig_controls.add_axes((0.20, y - 0.02, 0.62, 0.03))
+        slider = Slider(control_ax, "", 0.0, maximum, valinit=initial)
+        slider.valtext.set_visible(False)
+        self._threshold_value_texts[key] = self.fig_controls.text(
+            0.20, y - 0.035, f"{initial:.4g}", ha="left", va="top", fontsize=8
+        )
+        slider.on_changed(lambda value, name=key: self._on_threshold_slider(name, value))
+        self._threshold_sliders[key] = slider
+        if key == "max_pricethr":
+            self.max_price_thr_slider = slider
+        elif key == "skewthr":
+            self.skew_thr_slider = slider
+        elif key == "slipthr":
+            self.slippage_thr_slider = slider
+        elif key == "final_pdiffthr":
+            self.final_price_thr_slider = slider
+        return y - 0.075
+
+    def _on_dimension_slider(self, key: str, value: float) -> None:
+        self.state.slider_indices[key] = int(value)
+        if key in self._slider_value_texts:
+            self._slider_value_texts[key].set_text(self._axis_views[key].labels[int(value)])
+        self._draw_heatmaps()
+
+    def _on_threshold_slider(self, key: str, value: float) -> None:
+        mask = self.state.mask
+        values = {
+            "max_price_diff_bps": mask.max_price_diff_bps,
+            "max_skew_percent": mask.max_skew_percent,
+            "max_final_price_diff_bps": mask.max_final_price_diff_bps,
+            "slippage_thr_bps": mask.slippage_thr_bps,
+            "slippage_thr_max_bps": mask.slippage_thr_max_bps,
+        }
+        values[
+            {
+                "max_pricethr": "max_price_diff_bps",
+                "skewthr": "max_skew_percent",
+                "slipthr": "slippage_thr_bps",
+                "final_pdiffthr": "max_final_price_diff_bps",
+            }[key]
+        ] = float(value)
+        self.state.mask = MaskSpec(**values)
+        if key in self._threshold_value_texts:
+            self._threshold_value_texts[key].set_text(f"{value:.4g}")
+        self._draw_heatmaps()
+
+    def _swap_axes(self, axis: str, value: str) -> None:
+        if self._updating_radios:
+            return
+        if value == (self.state.x_axis if axis == "x" else self.state.y_axis):
+            return
+        if axis == "x":
+            if value == self.state.y_axis:
+                old = self.state.x_axis
+                self.state.x_axis, self.state.y_axis = value, old
+                self._updating_radios = True
+                self.y_radio.set_active(self._radio_keys.index(old))
+                self._updating_radios = False
+            else:
+                self.state.x_axis = value
+        else:
+            if value == self.state.x_axis:
+                old = self.state.y_axis
+                self.state.y_axis, self.state.x_axis = value, old
+                self._updating_radios = True
+                self.x_radio.set_active(self._radio_keys.index(old))
+                self._updating_radios = False
+            else:
+                self.state.y_axis = value
+        old_indices = dict(self.state.slider_indices)
+        self.state.slider_indices = {
+            key: min(old_indices.get(key, 0), len(self.dataset.axis(key).values) - 1)
+            for key in self.dataset.axis_keys
+            if key not in {self.state.x_axis, self.state.y_axis}
+        }
+        self._rebuild_controls()
+        self._draw_heatmaps()
+
+    def _on_x_changed(self, value: str) -> None:
+        self._swap_axes("x", self._radio_label_to_key[value])
+
+    def _on_y_changed(self, value: str) -> None:
+        self._swap_axes("y", self._radio_label_to_key[value])
+
+    def _draw_heatmaps(self) -> None:
+        self.fig_main.clear()
+        _window_title(self.fig_main, "Heatmaps")
+        n = len(self.state.tiles)
+        cols = min(self.state.ncol, n)
+        rows = max(1, math.ceil(n / cols))
+        x_view = self._axis_views[self.state.x_axis]
+        y_view = self._axis_views[self.state.y_axis]
+        self.fig_main.set_size_inches(
+            *_main_figure_size(len(x_view.centers), len(y_view.centers), rows, cols)
+        )
+        self._metric_axes = [self.fig_main.add_subplot(rows, cols, i + 1) for i in range(n)]
+        self.axes = self._metric_axes
+        self.meshes = []
+        self.colorbars = []
+        x_axis = self.dataset.axis(self.state.x_axis)
+        y_axis = self.dataset.axis(self.state.y_axis)
+        x_edges = _edges(x_view.centers, logarithmic=x_view.logarithmic)
+        y_edges = _edges(y_view.centers, logarithmic=y_view.logarithmic)
+        x_tick_indices = _select_ticks(len(x_view.centers))
+        y_tick_indices = _select_ticks(len(y_view.centers))
+        tick_font = _auto_font_size(len(x_view.centers), len(y_view.centers))
+        label_font = max(8, tick_font + 2)
+        title_font = max(label_font, tick_font + 4)
+        for index, (axis, metric) in enumerate(zip(self._metric_axes, self.state.tiles, strict=True)):
+            tile_mask = self.state.mask if _metric_requires_mask(metric) else MaskSpec()
+            values = self.dataset.slice_metric(
+                metric,
+                x_axis=x_axis.key,
+                y_axis=y_axis.key,
+                fixed_indices=self.state.slider_indices,
+                mask=tile_mask,
+            )
+            metric_scale, metric_suffix = _metric_scale_info(metric)
+            display_values = np.ma.masked_invalid(values) * metric_scale
+            mesh = axis.pcolormesh(x_edges, y_edges, display_values, shading="auto", cmap="turbo")
+            mesh.set_clim(*self._global_clims[metric])
+            self.meshes.append(mesh)
+            if x_view.logarithmic:
+                axis.set_xscale("log")
+            if y_view.logarithmic:
+                axis.set_yscale("log")
+            ny, nx = display_values.shape
+            try:
+                axis.set_box_aspect(ny / nx)
+            except AttributeError:
+                axis.set_aspect("equal", adjustable="box")
+            _apply_fixed_ticks(
+                axis.xaxis,
+                [x_view.centers[i] for i in x_tick_indices],
+                [x_view.labels[i] for i in x_tick_indices],
+            )
+            axis.tick_params(axis="x", labelrotation=45, labelsize=tick_font)
+            for tick_label in axis.get_xticklabels():
+                tick_label.set_ha("right")
+            first_column = index % cols == 0
+            _apply_fixed_ticks(
+                axis.yaxis,
+                [y_view.centers[i] for i in y_tick_indices],
+                [y_view.labels[i] for i in y_tick_indices] if first_column else [],
+            )
+            axis.tick_params(axis="y", labelsize=tick_font)
+            axis.set_xlabel(x_view.name, fontsize=label_font)
+            if first_column:
+                axis.set_ylabel(y_view.name, fontsize=label_font)
+            axis.set_title(f"{metric}{metric_suffix}", fontsize=title_font)
+            colorbar = self.fig_main.colorbar(mesh, ax=axis, fraction=0.046, pad=0.04)
+            colorbar.set_label(f"{metric}{metric_suffix}", fontsize=tick_font)
+            colorbar.ax.tick_params(labelsize=tick_font)
+            colorbar.ax.yaxis.set_major_formatter(FormatStrFormatter("%.3g"))
+            self.colorbars.append(colorbar)
+            axis.format_coord = self._format_coord(metric)
+        for index in range(n, rows * cols):
+            self.fig_main.add_subplot(rows, cols, index + 1).axis("off")
+        self.fig_main.canvas.draw_idle()
+
+    def _format_coord(self, metric: str) -> Callable[[float, float], str]:
+        x_axis = self.dataset.axis(self.state.x_axis)
+        y_axis = self.dataset.axis(self.state.y_axis)
+        x_view = self._axis_views[x_axis.key]
+        y_view = self._axis_views[y_axis.key]
+
+        def format_coord(x: float, y: float) -> str:
+            xi = _cell_index_from_view(x_view, float(x))
+            yi = _cell_index_from_view(y_view, float(y))
+            if xi is None or yi is None:
+                return ""
+            indices = [self.state.slider_indices.get(axis.key, 0) for axis in self.dataset.axes]
+            indices[self.dataset.axis_index(x_axis.key)] = xi
+            indices[self.dataset.axis_index(y_axis.key)] = yi
+            try:
+                self.dataset.point(indices)
+            except ValueError:
+                return ""
+            tile_mask = self.state.mask if _metric_requires_mask(metric) else MaskSpec()
+            value = self.dataset.metric_array(metric, tile_mask)[tuple(indices)]
+            return (
+                f"x={x_view.labels[xi]}, y={y_view.labels[yi]}, "
+                f"{metric}={format_metric_value(metric, value)}"
+            )
+
+        return format_coord
+
+    def _selection_from_event(self, event: MouseEvent) -> HeatmapSelection | None:
+        if event.inaxes not in self._metric_axes or event.xdata is None or event.ydata is None:
+            return None
+        x_axis = self.dataset.axis(self.state.x_axis)
+        y_axis = self.dataset.axis(self.state.y_axis)
+        x_index = _cell_index_from_view(self._axis_views[x_axis.key], float(event.xdata))
+        y_index = _cell_index_from_view(self._axis_views[y_axis.key], float(event.ydata))
+        if x_index is None or y_index is None:
+            return None
+        indices = [self.state.slider_indices.get(axis.key, 0) for axis in self.dataset.axes]
+        indices[self.dataset.axis_index(x_axis.key)] = x_index
+        indices[self.dataset.axis_index(y_axis.key)] = y_index
+        try:
+            return self.dataset.point(indices)
+        except ValueError:
+            return None
+
+    def _on_click(self, event: MouseEvent) -> None:
+        selection = self._selection_from_event(event)
+        if selection is None:
+            return
+        self.last_selection = selection
+        self._update_metrics(selection)
+        key = str(getattr(event, "key", "") or "").lower()
+        right = event.button in {MouseButton.RIGHT, 3}
+        if right or (event.button in {MouseButton.LEFT, 1} and "shift" in key):
+            self.replay(selection, "shift" if "shift" in key else "right")
+
+    def _update_metrics(self, selection: HeatmapSelection) -> None:
+        lines = ["selection_ref:", json.dumps(selection.to_selection_ref(self.run_id).to_dict(), sort_keys=True), "", "coordinates:"]
+        lines.extend(f"  {name}: {format_axis_value(value)}" for name, value in selection.coordinates.items())
+        lines.append("")
+        lines.append("metrics:")
+        for metric in self.state.tiles:
+            tile_mask = self.state.mask if _metric_requires_mask(metric) else MaskSpec()
+            value = self.dataset.metric_array(metric, tile_mask)[selection.grid_indices]
+            lines.append(f"  {metric}: {format_metric_value(metric, value)}")
+        self.metrics_text.set_text("\n".join(lines))
+        self.fig_metrics.canvas.draw_idle()
+
+    def replay(self, selection: HeatmapSelection, mode: str = "shift") -> Any:
+        """Replay one attested candidate; all parameter extraction stays in normalize_selection."""
+        source_kind = "optimization" if self.manifest and self.manifest.get("run_kind") == "optimization" else "grid"
+        selection_ref = selection.to_selection_ref(self.run_id)
+        if source_kind == "optimization":
+            selection_ref = SelectionRef(self.run_id, "optimizer_winner", selection.ordinal, dict(selection.coordinates), selection.candidate_id, ("heatmap",))
+        if self.on_replay is not None:
+            return self.on_replay(selection_ref, mode)
+        if self.manifest is None or self.run_dir is None:
+            raise RuntimeError("exact replay requires a manifest-backed run directory")
+        if self._replay_running:
+            return None
+        artifact_path = self.run_dir / "evaluator_artifact"
+        artifact_selected = artifact_path.is_dir()
+        if self.site == "local" and artifact_selected and self.harness is not None:
+            raise RuntimeError("artifact-selected replay rejects --harness")
+        if self.site == "local" and not artifact_selected and self.harness is None:
+            raise RuntimeError("legacy exact replay requires --harness")
+        self._replay_running = True
+        try:
+            resolved = self.manifest.get("resolved_spec", {})
+            pair_id = _mapping_id(resolved.get("pair")) if isinstance(resolved, Mapping) else ""
+            scenario_id = _mapping_id(resolved.get("scenario")) if isinstance(resolved, Mapping) else ""
+            policy_id = _mapping_id(resolved.get("policy")) if isinstance(resolved, Mapping) else ""
+            policy_id = policy_id or str(self.manifest.get("core", {}).get("policy_id", ""))
+            replay_id = "view-" + re.sub(r"[^A-Za-z0-9_.-]+", "-", self.run_id) + "-" + secrets.token_hex(8)
+            source_yb = mode == "shift"
+            spec = ShiftclickSpec(
+                id=replay_id,
+                source_kind=source_kind,
+                source_run_id=self.run_id,
+                selection_kind="best" if source_kind == "optimization" else "candidate_id",
+                selection_value=None if source_kind == "optimization" else selection.candidate_id,
+                pair_id=pair_id,
+                scenario_id=scenario_id,
+                policy_id=policy_id,
+                trace_interval=(1 if source_yb else sparse_trace_interval(self.manifest)),
+                trace_actions=True,
+                tags=(
+                    "interactive",
+                    "observation:source-yb" if source_yb else "observation:yb-disabled",
+                ),
+            )
+            if self.store is None:
+                raise RuntimeError("exact replay requires an explicit project RunStore")
+            store = self.store
+            if self.site == "local":
+                from ..evaluation.client import SubprocessHarnessClient
+                from ..evaluation.selected import SelectedEvaluator
+                from ..shiftclick import run_shiftclick
+
+                binary = SelectedEvaluator.load(artifact_path).binary_path if artifact_selected else self.harness
+                client = SubprocessHarnessClient(
+                    binary,
+                    repository=store.root_dir,
+                    work_dir=store.runs_dir,
+                )
+                result = run_shiftclick(spec, store=store, client=client, selection=selection_ref)
+            else:
+                from ..execution.site import load_site_profile
+                from ..shiftclick import run_remote_shiftclick
+
+                profile = load_site_profile(self.site, root=store.root_dir)
+                blade = self.blade or (profile.cluster.blades[0] if profile.cluster.blades else None)
+                if blade is None:
+                    raise RuntimeError("remote replay requires a configured blade")
+                with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as stream:
+                    stream.write("[shiftclick]\n")
+                    for key, value in spec.to_dict().items():
+                        if isinstance(value, list):
+                            stream.write(f"{key} = {json.dumps(value)}\n")
+                        elif isinstance(value, bool):
+                            stream.write(f"{key} = {str(value).lower()}\n")
+                        elif value is not None:
+                            stream.write(f"{key} = {json.dumps(value)}\n")
+                    spec_path = Path(stream.name)
+                try:
+                    result = run_remote_shiftclick(spec, spec_path=spec_path, store=store, site=profile, blade=blade)
+                finally:
+                    spec_path.unlink(missing_ok=True)
+            self._show_replay(result, selection)
+            return result
+        finally:
+            self._replay_running = False
+
+    def _show_replay(self, result: Any, selection: HeatmapSelection) -> None:
+        from .shiftclick_view import render_shiftclick_figure
+
+        run_dir = Path(result.run_dir)
+        manifest = load_manifest(run_dir / "manifest.json", expected_kind="shiftclick")
+        trace = find_attested_artifact(manifest, run_dir=run_dir, kind="trace")
+        try:
+            actions = find_attested_artifact(manifest, run_dir=run_dir, kind="actions")
+        except Exception:
+            actions = None
+        source_row = self._source_row.get(selection.ordinal) if self._source_row else None
+        cadence = resolve_donation_frequency(
+            manifest,
+            source_row=source_row,
+            project_root=self.store.root_dir if self.store is not None else None,
+        )
+        figure = render_shiftclick_figure(trace, actions, title=run_dir.name, fee_source="both", donation_frequency=cadence)
+        _window_title(figure, "Shiftclick")
+        figure.canvas.draw_idle()
+
+    def save(self, output: Path | str, *, state_path: Path | str | None = None) -> tuple[Path, Path]:
+        image_path = Path(output)
+        sidecar = Path(state_path) if state_path is not None else image_path.with_suffix(".state.json")
+        if image_path.exists() or sidecar.exists():
+            raise FileExistsError("interactive explorer outputs are immutable")
+        image_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary_name = tempfile.mkstemp(prefix=f".{image_path.name}.", suffix=image_path.suffix, dir=image_path.parent)
+        os.close(fd)
+        try:
+            self.fig_main.savefig(temporary_name, format=image_path.suffix.lstrip("."), dpi=150, bbox_inches="tight")
+            os.replace(temporary_name, image_path)
+        finally:
+            Path(temporary_name).unlink(missing_ok=True)
+        payload = self.state.to_dict()
+        payload["explorer"] = {
+            "window_titles": ["Heatmaps", "Controls", "Metrics"],
+            "run_id": self.run_id,
+            "selection": self.last_selection.to_selection_ref(self.run_id).to_dict() if self.last_selection else None,
+        }
+        atomic_write_json(sidecar, payload)
+        return image_path, sidecar
+
+    def show(self, *, block: bool = True) -> None:
+        plt.show(block=block)
+
+    def close(self) -> None:
+        for figure in (self.fig_main, self.fig_controls, self.fig_metrics):
+            plt.close(figure)
+
+
+def open_explorer(run_dir: Path, **kwargs: Any) -> HeatmapExplorer:
+    """Load and verify one grid/optimization run before constructing the explorer."""
+    run_dir = Path(run_dir).resolve()
+    manifest = load_manifest(run_dir / "manifest.json")
+    from ..artifacts.attestation import load_attested_evaluation_table
+
+    table, table_path = load_attested_evaluation_table(manifest, run_dir=run_dir, verify_digest=True)
+    explorer = HeatmapExplorer(table, run_id=str(manifest["run_id"]), run_dir=run_dir, manifest=manifest, **kwargs)
+    explorer.state.source = table_path.name
+    return explorer
+
+
+__all__ = [
+    "HeatmapExplorer",
+    "format_axis_value",
+    "format_metric_value",
+    "open_explorer",
+    "resolve_donation_frequency",
+    "sparse_trace_interval",
+]

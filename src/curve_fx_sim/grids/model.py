@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import itertools
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
-from typing import Any, Mapping, Sequence
-from ..specs.grid import AxisSpec, GridSpec
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
+
+from ..specs.grid import AxisSpec, AxisTarget, GridSpec
 from ..specs.policy import PolicySpec
 from ..specs.parameters import ParameterDim
+
+if TYPE_CHECKING:
+    from ..evaluation.grouping import CompiledEvaluation
+    from ..evaluation.plans import CandidateCompiler, ScenarioKey
+    from ..specs.scenario import ScenarioClosure
 
 
 
@@ -154,21 +160,80 @@ class GridPoint:
     candidate_id: str
     coordinate_indices: tuple[int, ...]
     coordinates: Mapping[str, Any]
-    policy_params: tuple[int | float, ...]
-    pool_overrides: Mapping[str, Any]
+    legacy_policy_params: tuple[int | float, ...]
+    legacy_pool_overrides: Mapping[str, Any]
     coordinate_signature: str = ""
+    proposal: tuple[tuple[str, Any], ...] = ()
+    session_group_id: str = ""
+    evaluation: CompiledEvaluation | None = None
 
+    @property
+    def policy_params(self) -> tuple[object, ...]:
+        return (
+            self.evaluation.candidate.policy_params
+            if self.evaluation is not None
+            else self.legacy_policy_params
+        )
+
+    @property
+    def pool_overrides(self) -> Mapping[str, Any]:
+        return (
+            json.loads(self.evaluation.candidate.pool_overrides_json)
+            if self.evaluation is not None
+            else self.legacy_pool_overrides
+        )
+
+    @property
+    def proposal_dict(self) -> dict[str, Any]:
+        """Return named values; loaded manifest values are audit evidence only."""
+        return {name: _thaw_proposal_value(value) for name, value in self.proposal}
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "ordinal": self.ordinal,
             "candidate_id": self.candidate_id,
             "coordinate_indices": list(self.coordinate_indices),
             "coordinates": _exact_value(self.coordinates),
             "coordinate_signature": self.coordinate_signature,
-            "policy_params": _exact_value(self.policy_params),
-            "pool_overrides": _exact_value(self.pool_overrides),
         }
+        if self.evaluation is not None:
+            evaluation = self.evaluation
+            result.update(
+                proposal_evidence=_exact_value(self.proposal_dict),
+                candidate_sha256=evaluation.candidate.candidate_sha256,
+                candidate_json=evaluation.candidate.candidate_json.decode("utf-8"),
+                evaluation_id=evaluation.evaluation_id,
+                session_group_id=self.session_group_id,
+                observation_id=evaluation.observation_key.sha256,
+            )
+        else:
+            result.update(
+                policy_params=_exact_value(self.legacy_policy_params),
+                pool_overrides=_exact_value(self.legacy_pool_overrides),
+            )
+        return result
+
+
+def _freeze_proposal_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return tuple(
+            (str(key), _freeze_proposal_value(item))
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_proposal_value(item) for item in value)
+    return value
+
+
+def _thaw_proposal_value(value: Any) -> Any:
+    if isinstance(value, tuple):
+        if all(
+            isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str)
+            for item in value
+        ):
+            return {key: _thaw_proposal_value(item) for key, item in value}
+        return [_thaw_proposal_value(item) for item in value]
+    return value
 
 
 def _set_nested(target: dict[str, Any], path: Sequence[str], value: Any) -> None:
@@ -278,13 +343,195 @@ def _merge_axis_overrides(
     return merged
 
 
+def _named_axis_options(
+    axis: AxisSpec,
+    compiler: CandidateCompiler,
+) -> tuple[dict[str, Any], ...]:
+    """Build display coordinates and flat canonical proposal updates."""
+    from ..evaluation.plans import CandidatePlanError
+
+    values = axis.rows if axis.is_coupled else tuple((value,) for value in axis.values)
+    names = axis.names if axis.is_coupled else (axis.name,)
+    targets = axis.targets or tuple(
+        AxisTarget(path=tuple(name.split(".")))
+        for name in names
+    )
+    if len(targets) != len(names):
+        raise GridValidationError(
+            f"axis {axis.name!r} must declare one canonical target per coordinate value"
+        )
+    canonical_names: list[str] = []
+    for target in targets:
+        name = target.proposal_name
+        if not name:
+            raise GridValidationError(f"axis {axis.name!r} has an empty canonical target")
+        try:
+            compiler.schema.descriptor(name)
+        except CandidatePlanError as exc:
+            raise GridValidationError(
+                f"axis {axis.name!r} target {name!r} is not a canonical schema name"
+            ) from exc
+        canonical_names.append(name)
+
+    options: list[dict[str, Any]] = []
+    for index, row in enumerate(values):
+        display = {
+            name: _exact_value(value)
+            for name, value in zip(names, row, strict=True)
+        }
+        proposal = {
+            name: target.transform_proposal_value(value)
+            for name, target, value in zip(canonical_names, targets, row, strict=True)
+        }
+        options.append({"index": index, "display": display, "proposal": proposal})
+    return tuple(options)
+
+
+def compile_grid_points(
+    grid_spec: GridSpec,
+    *,
+    compiler: CandidateCompiler,
+    artifact_sha256: str,
+    open_session: Mapping[str, object],
+    scenario: ScenarioClosure | ScenarioKey,
+) -> tuple[GridPoint, ...]:
+    """Compile a canonical named grid through the evaluator's verified schema.
+
+    Axis transforms stop at semantic proposal values.  ``CandidateCompiler``
+    remains the sole authority for defaults, wire units, nesting, policy order,
+    candidate bytes, and scenario/session identity.
+    """
+    from ..evaluation.grouping import CompiledEvaluation, group_evaluations
+    from ..evaluation.plans import CandidatePlanError
+
+    if grid_spec.fee_equalize:
+        raise GridValidationError(
+            "fee_equalize is legacy-only; couple pool.mid_fee and pool.out_fee explicitly"
+        )
+    if not isinstance(grid_spec.static_overrides, Mapping) or any(
+        not isinstance(name, str) for name in grid_spec.static_overrides
+    ):
+        raise GridValidationError("schema-backed static_overrides must use canonical string names")
+    base_proposal = dict(grid_spec.static_overrides)
+    for name in base_proposal:
+        try:
+            compiler.schema.descriptor(name)
+        except CandidatePlanError as exc:
+            raise GridValidationError(
+                f"static override {name!r} is not a canonical schema name"
+            ) from exc
+
+    coordinate_names: set[str] = set()
+    controlled_names: set[str] = set()
+    axis_options: list[tuple[dict[str, Any], ...]] = []
+    for axis in grid_spec.axes:
+        names = axis.names if axis.is_coupled else (axis.name,)
+        duplicates = coordinate_names.intersection(names)
+        if duplicates:
+            raise GridValidationError(
+                "grid coordinate names are declared twice: " + ", ".join(sorted(duplicates))
+            )
+        coordinate_names.update(names)
+        options = _named_axis_options(axis, compiler)
+        if not options:
+            raise GridValidationError(f"axis {axis.name!r} has no finite values")
+        option_names = set(options[0]["proposal"])
+        duplicates = controlled_names.intersection(option_names)
+        if duplicates:
+            raise GridValidationError(
+                "canonical proposal names are controlled by multiple axes: "
+                + ", ".join(sorted(duplicates))
+            )
+        controlled_names.update(option_names)
+        axis_options.append(options)
+
+    points: list[GridPoint] = []
+    coordinate_keys: set[str] = set()
+    for ordinal, combination in enumerate(itertools.product(*axis_options)):
+        coordinates: dict[str, Any] = {}
+        proposal = dict(base_proposal)
+        indices: list[int] = []
+        for option in combination:
+            coordinates.update(option["display"])
+            proposal.update(option["proposal"])
+            indices.append(int(option["index"]))
+        signature = coordinate_signature(coordinates)
+        if signature in coordinate_keys:
+            raise GridValidationError(f"duplicate exact display coordinate at ordinal {ordinal}")
+        coordinate_keys.add(signature)
+        candidate_id = f"grid_{grid_spec.id}_p{ordinal:06d}"
+        observation_proposal = {
+            name: value
+            for name, value in proposal.items()
+            if compiler.schema.descriptor(name).lowering_path.startswith("evaluate_batch.")
+        }
+        candidate_proposal = {
+            name: value
+            for name, value in proposal.items()
+            if not compiler.schema.descriptor(name).lowering_path.startswith("evaluate_batch.")
+        }
+        try:
+            plan = compiler.compile(
+                candidate_proposal,
+                open_session=open_session,
+                scenario=scenario,
+            )
+            evaluation = CompiledEvaluation.from_plan(
+                plan,
+                compiler=compiler,
+                artifact_sha256=artifact_sha256,
+                observation=observation_proposal,
+                ordinal=ordinal,
+                evaluation_id=candidate_id,
+            )
+        except CandidatePlanError as exc:
+            raise GridValidationError(f"grid point {candidate_id} is invalid: {exc}") from exc
+        points.append(
+            GridPoint(
+                ordinal=ordinal,
+                candidate_id=candidate_id,
+                coordinate_indices=tuple(indices),
+                coordinates=_detach(coordinates),
+                legacy_policy_params=(),
+                legacy_pool_overrides={},
+                coordinate_signature=signature,
+                proposal=tuple(
+                    (name, _freeze_proposal_value(value))
+                    for name, value in sorted(proposal.items())
+                ),
+                evaluation=evaluation,
+            )
+        )
+    if len(points) != grid_spec.pool_count:
+        raise GridValidationError(
+            f"expanded {len(points)} points, expected {grid_spec.pool_count}"
+        )
+    groups = group_evaluations(
+        tuple(point.evaluation for point in points if point.evaluation is not None),
+        artifact_sha256=artifact_sha256,
+        parameter_schema=compiler.schema,
+    )
+    group_by_evaluation = {
+        evaluation.evaluation_id: group.key.sha256
+        for group in groups
+        for evaluation in group.evaluations
+    }
+    return tuple(
+        replace(
+            point,
+            session_group_id=group_by_evaluation[point.evaluation.evaluation_id],
+        )
+        for point in points
+    )
+
+
 def expand_grid(
     grid_spec: GridSpec,
     *,
     policy_spec: PolicySpec | None = None,
     registry: Mapping[str, ParameterDim] | None = None,
 ) -> tuple[GridPoint, ...]:
-    """Compile one exact declaration-order Cartesian product into protocol requests.
+    """Legacy raw/path-authoritative Cartesian expansion.
 
     When a compiled policy is supplied, its named defaults are the sole source
     of the dense request vector. Grid axes may overwrite declared policy
@@ -422,8 +669,8 @@ def expand_grid(
                 candidate_id=f"grid_{grid_spec.id}_p{ordinal:06d}",
                 coordinate_indices=tuple(indices),
                 coordinates=_detach(coordinates),
-                policy_params=policy_params,
-                pool_overrides=pool_overrides,
+                legacy_policy_params=policy_params,
+                legacy_pool_overrides=pool_overrides,
                 coordinate_signature=signature,
             )
         )

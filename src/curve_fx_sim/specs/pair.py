@@ -10,10 +10,9 @@ from typing import Any, Mapping
 
 from .common import (
     SpecError,
-    assert_contained_path,
     repository_relative,
-    repository_root,
 )
+from .registry import SpecRegistry
 
 
 @dataclass(frozen=True)
@@ -85,28 +84,12 @@ class PairSpec:
 def load_pair_spec(
     path_or_id: str | os.PathLike[str],
     *,
-    repository: Path | None = None,
+    repository: Path,
 ) -> PairSpec:
     """Load and validate a pair TOML file or search by id/alias."""
-    root = repository.resolve() if repository is not None else repository_root()
-    candidate = Path(path_or_id)
-
-    if not candidate.is_file():
-        search_paths = [
-            root / "configs" / "pairs" / f"{path_or_id}.toml",
-            root / "configs" / f"{path_or_id}.toml",
-            root / "data" / "pairs" / f"{path_or_id}.toml",
-        ]
-        found = None
-        for p in search_paths:
-            if p.is_file():
-                found = p
-                break
-        if found is None:
-            raise FileNotFoundError(f"Pair specification not found: {path_or_id}")
-        candidate = found
-
-    assert_contained_path(candidate, root, allow_symlinks=True)
+    registry = SpecRegistry.from_root(repository)
+    root = registry.context.project_root
+    candidate = registry.resolve("pair", path_or_id)
 
     with candidate.open("rb") as stream:
         raw_data = tomllib.load(stream)

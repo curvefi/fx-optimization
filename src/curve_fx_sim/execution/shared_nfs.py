@@ -72,24 +72,30 @@ def stage_run_directory_atomic(lease: SharedRunLease, local_run_dir: Path) -> Pu
     destination = lease.site.cluster.remote_run_root / lease.run_id
     staging = lease.site.cluster.remote_base / ".staging" / lease.token
     staged_run = staging / lease.run_id
+    artifact = local_run_dir / "evaluator_artifact"
+    inputs = [local_run_dir / "manifest.json"]
+    if artifact.exists():
+        inputs += [artifact / "artifact.json", artifact / "evaluator"]
+        if not all(path.is_file() for path in inputs):
+            raise SharedNFSError("grouped run requires exactly two evaluator artifact files")
     setup = lease.ssh.run_ssh(
         lease.site.cluster.coordinator,
         f"test ! -e {shlex.quote(str(destination))} && "
         f"mkdir -p {shlex.quote(str(staging.parent))} && "
-        f"mkdir {shlex.quote(str(staging))} && mkdir {shlex.quote(str(staged_run))}")
+        f"mkdir {shlex.quote(str(staging))} && mkdir {shlex.quote(str(staged_run))}" +
+        (f" && mkdir {shlex.quote(str(staged_run / 'evaluator_artifact'))}" if len(inputs) == 3 else ""))
     if not setup.ok:
         raise SharedNFSError(
             f"non-resume run destination already exists or staging failed: {setup.stderr}")
-    uploaded = lease.ssh.rsync_upload(
-        local_run_dir / "manifest.json", lease.site.cluster.coordinator,
-        str(staged_run / "manifest.json"))
-    if not uploaded.ok:
-        raise SharedNFSError(f"failed to stage immutable run inputs: {uploaded.stderr}")
-    expected = sha256_path(local_run_dir / "manifest.json")
+    staged = [staged_run / path.relative_to(local_run_dir).as_posix() for path in inputs]
+    for source, target in zip(inputs, staged, strict=True):
+        uploaded = lease.ssh.rsync_upload(source, lease.site.cluster.coordinator, str(target))
+        if not uploaded.ok: raise SharedNFSError(f"failed to stage immutable run inputs: {uploaded.stderr}")
+    checks = " && ".join(f"test \"$(sha256sum {shlex.quote(str(target))} | cut -d' ' -f1)\" = {sha256_path(source)}"
+                         for source, target in zip(inputs, staged, strict=True))
     publish = lease.ssh.run_ssh(
         lease.site.cluster.coordinator,
-        f"test \"$(sha256sum {shlex.quote(str(staged_run / 'manifest.json'))} | "
-        f"cut -d' ' -f1)\" = {expected} && test ! -e {shlex.quote(str(destination))} && "
+        f"{checks} && test ! -e {shlex.quote(str(destination))} && "
         f"mv {shlex.quote(str(staged_run))} {shlex.quote(str(destination))} && "
         f"rmdir {shlex.quote(str(staging))}")
     if not publish.ok:
@@ -135,21 +141,16 @@ def package_identity_sha256(root: Path) -> str:
         digest.update(relative.as_posix().encode() + b"\0"); digest.update(
             bytes.fromhex(sha256_path(root / relative)))
     return digest.hexdigest()
-def expected_worker_sha256(site: SiteProfile) -> str:
-    root = site.cluster.repository_root.parent
-    content = ("#!/bin/sh\n" f'exec "{root}/tools/steam-run/bin/steam-run" '
-               f'"{site.cluster.repository_root}/.venv/bin/fxsim" "$@"\n')
-    return hashlib.sha256(content.encode()).hexdigest()
-def execution_site_payload(site: SiteProfile, blades: Sequence[str]) -> dict[str, Any]:
-    return {
+def execution_site_payload(site: SiteProfile, blades: Sequence[str], *,
+                           artifact_selected: bool = False) -> dict[str, Any]:
+    payload = {
         "name": site.name, "transport": site.cluster.transport,
         "coordinator": site.cluster.coordinator, "blades": list(blades),
         "remote_base": str(site.cluster.remote_base), "remote_run_root": str(site.cluster.remote_run_root),
         "repository_root": str(site.cluster.repository_root), "worker_command": site.cluster.worker_command,
-        "harness_binary": str(site.harness.remote_binary_path or site.harness.binary_name),
         "ssh_user": site.ssh.user, "ssh_port": site.ssh.port, "ssh_options": list(site.ssh.options),
     }
-if __name__ == "__main__":
-    import sys
-    if len(sys.argv) != 2: raise SystemExit("usage: shared_nfs REPOSITORY")
-    print(package_identity_sha256(Path(sys.argv[1]).resolve()))
+    key, value = (("evaluator_source", "run_local_artifact") if artifact_selected else
+                  ("harness_binary", str(site.harness.remote_binary_path or site.harness.binary_name)))
+    payload[key] = value
+    return payload

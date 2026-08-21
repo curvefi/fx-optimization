@@ -10,11 +10,10 @@ from typing import Any, Mapping
 
 from .common import (
     SpecError,
-    assert_contained_path,
     repository_relative,
-    repository_root,
     serializable,
 )
+from .registry import SpecRegistry
 
 
 @dataclass(frozen=True)
@@ -73,28 +72,12 @@ class ShiftclickSpec:
 def load_shiftclick_spec(
     path_or_id: str | os.PathLike[str],
     *,
-    repository: Path | None = None,
+    repository: Path,
 ) -> ShiftclickSpec:
     """Load and validate a shiftclick TOML specification."""
-    root = repository.resolve() if repository is not None else repository_root()
-    candidate = Path(path_or_id)
-
-    if not candidate.is_file():
-        search_paths = [
-            root / "shiftclick" / "specs" / f"{path_or_id}.toml",
-            root / "configs" / "shiftclick" / f"{path_or_id}.toml",
-            root / "configs" / f"{path_or_id}.toml",
-        ]
-        found = None
-        for p in search_paths:
-            if p.is_file():
-                found = p
-                break
-        if found is None:
-            raise FileNotFoundError(f"Shiftclick specification not found: {path_or_id}")
-        candidate = found
-
-    assert_contained_path(candidate, root, allow_symlinks=True)
+    registry = SpecRegistry.from_root(repository)
+    root = registry.context.project_root
+    candidate = registry.resolve("shiftclick", path_or_id, explicit_only=True)
 
     with candidate.open("rb") as stream:
         raw_data = tomllib.load(stream)

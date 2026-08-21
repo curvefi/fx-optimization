@@ -11,7 +11,7 @@ uv_version=0.12.4
 python_version=3.12.6
 policy_id=native_policy_dual_ema_stale_cap_v1
 policy_header="$optimization_repo/policies/$policy_id.hpp"
-policy_sha256=2a73232c998b95cfe43e0cb96fe7542f06fd69594e1c55ea663c837dfb90bd9d
+policy_sha256=e00777e7cdcc2ca9de947e4539d5df184d5b32417f2b0894c09676f511f6cf6d
 
 for repo in "$pool_repo" "$harness_repo" "$optimization_repo"; do
     if [[ ! -d "$repo" ]]; then

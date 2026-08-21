@@ -18,22 +18,36 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Sequence
 
 from curve_fx_harness_client import EvaluatorClient
-from curve_fx_harness_client.models import BatchResultFrame, CandidateSpec
+from curve_fx_harness_client.models import BatchResultFrame, CandidateSpec, ObservationSpec
 
 from .adapter import LocalProcessAdapter, ProcessAdapter, SSHProcessAdapter
 from ..artifacts.manifest import load_manifest, write_manifest_atomic
+from ..artifacts.io import sha256_path
+from ..evaluation.grouping import (
+    LocalSessionGroupBinding,
+    SessionGroup,
+    bind_local_session_group,
+)
+from ..evaluation.selected import SelectedEvaluator
+from ..evaluation.session import LocalSessionMaterialization
+from ..specs.common import canonical_json_bytes
+from ..specs.scenario import ScenarioSpec
 from .collection import (
     CollectionError,
     _load_shard_records,
     _rows_checksum,
     collect_grid_results,
+    group_request_set_sha256,
     grid_request_set_sha256,
+    is_grouped_shard_complete,
     normalize_session_attestation,
     write_shard_result,
 )
+from .grouped import execute_local_groups
+from .grouped_grid import dispatch_grouped_grid
 from .evaluator_pool import EvaluatorRegistry
 from .sharding import ShardAssignment, make_assignments, write_ranges_file
-from .site import SiteProfile, load_site_profile
+from .site import RunnerConfig, SiteProfile
 from .shared_nfs import (
     SharedRunLease,
     fetch_authoritative_run,
@@ -47,6 +61,139 @@ from .staging import WorkBundle, prepare_work_bundle, remote_run_paths, validate
 
 class ExecutionBackendError(RuntimeError):
     """Raised when an execution or resume operation fails."""
+
+
+def _reject_artifact_bound_grid(manifest: Mapping[str, Any]) -> None:
+    resolved = manifest.get("resolved_spec")
+    if not isinstance(resolved, Mapping):
+        return
+    compilation = resolved.get("candidate_compilation")
+    if not isinstance(compilation, Mapping):
+        return
+    mode = compilation.get("mode")
+    if mode not in (None, ""):
+        raise ExecutionBackendError(
+            "artifact-bound named grid execution is not implemented by ExecutionBackend "
+            f"(candidate_compilation mode {mode!r})"
+        )
+
+
+_NAMED_GRID_MODE = "schema_grouped_v1"
+
+
+@dataclass(frozen=True, slots=True)
+class _NamedGridPreflight:
+    manifest: dict[str, Any]
+    selected: SelectedEvaluator
+    scenario: ScenarioSpec
+    points: tuple[Any, ...]
+    groups: tuple[SessionGroup, ...]
+
+
+def _artifact_selected_mode(manifest: Mapping[str, Any]) -> str | None:
+    resolved = manifest.get("resolved_spec")
+    compilation = resolved.get("candidate_compilation") if isinstance(resolved, Mapping) else None
+    if not isinstance(compilation, Mapping):
+        return None
+    mode = compilation.get("mode")
+    return str(mode) if mode not in (None, "") else None
+
+
+def _required_artifact_files(manifest: Mapping[str, Any], run_dir: Path) -> None:
+    required = {
+        "evaluator_artifact/artifact.json": "evaluator_artifact_receipt",
+        "evaluator_artifact/evaluator": "evaluator_binary",
+    }
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, Sequence) or isinstance(artifacts, (str, bytes)):
+        raise ExecutionBackendError("named grid manifest artifacts must be an array")
+    by_path = {
+        str(item.get("path")): item for item in artifacts if isinstance(item, Mapping)
+    }
+    for relative, kind in required.items():
+        descriptor = by_path.get(relative)
+        path = run_dir / relative
+        if not isinstance(descriptor, Mapping) or descriptor.get("kind") != kind:
+            raise ExecutionBackendError(f"named grid manifest does not list {relative}")
+        if (
+            not path.is_file()
+            or descriptor.get("sha256") != sha256_path(path)
+            or descriptor.get("bytes") != path.stat().st_size
+        ):
+            raise ExecutionBackendError(f"named grid artifact receipt does not match {relative}")
+
+
+def _preflight_named_grid(
+    manifest_file: Path,
+    *,
+    repository: Path,
+) -> _NamedGridPreflight:
+    if not repository.is_dir():
+        raise ExecutionBackendError(
+            f"artifact-selected repository directory not found: {repository}"
+        )
+    manifest = load_manifest(manifest_file, expected_kind="grid")
+    run_dir = manifest_file.parent
+    _required_artifact_files(manifest, run_dir)
+    try:
+        selected = SelectedEvaluator.load(run_dir / "evaluator_artifact")
+    except Exception as exc:
+        raise ExecutionBackendError(f"run-local SelectedEvaluator verification failed: {exc}") from exc
+    expected_core = selected.manifest_core(binary_override="evaluator_artifact/evaluator")
+    if manifest.get("core") != expected_core:
+        raise ExecutionBackendError("named grid core differs from its run-local evaluator")
+    resolved = manifest.get("resolved_spec")
+    if not isinstance(resolved, Mapping):
+        raise ExecutionBackendError("named grid resolved_spec must be an object")
+    if resolved.get("evaluator_artifact_selection") != selected.provenance:
+        raise ExecutionBackendError("named grid selection provenance differs from its artifact")
+    compilation = resolved.get("candidate_compilation")
+    if not isinstance(compilation, Mapping) or compilation.get("mode") != _NAMED_GRID_MODE:
+        raise ExecutionBackendError("named grid candidate compilation mode is unsupported")
+    policy = resolved.get("policy")
+    selected_policy = selected.policy_identity
+    if (
+        not isinstance(policy, Mapping)
+        or policy.get("id") != selected_policy["id"]
+        or policy.get("source_sha256") != selected_policy["source_sha256"]
+        or policy.get("policy_abi") != selected_policy["abi"]
+        or compilation.get("policy_id") != selected_policy["id"]
+        or compilation.get("parameter_schema_sha256") != selected.parameter_schema_sha256
+        or compilation.get("parameter_schema_version")
+        != selected.compiler.schema.schema_version
+    ):
+        raise ExecutionBackendError("named grid policy or parameter schema differs from its artifact")
+    raw_scenario = resolved.get("scenario")
+    if not isinstance(raw_scenario, Mapping):
+        raise ExecutionBackendError("named grid resolved scenario must be an object")
+    try:
+        from ..grids.runner import load_grouped_grid
+
+        scenario = ScenarioSpec.from_dict(raw_scenario)
+        if canonical_json_bytes(scenario.to_dict()) != canonical_json_bytes(raw_scenario):
+            raise ValueError("resolved scenario is not canonical")
+        points, groups = load_grouped_grid(
+            manifest,
+            parameter_schema=selected.compiler.schema,
+            artifact_sha256=selected.artifact_sha256,
+        )
+    except Exception as exc:
+        raise ExecutionBackendError(f"named grid candidate or scenario evidence is invalid: {exc}") from exc
+    if any(
+        point.evaluation is None
+        or not point.evaluation.candidate.candidate_sha256
+        for point in points
+    ):
+        raise ExecutionBackendError(
+            "named grid point is missing canonical candidate JSON or SHA-256 attestation"
+        )
+    return _NamedGridPreflight(
+        manifest=manifest,
+        selected=selected,
+        scenario=scenario,
+        points=points,
+        groups=groups,
+    )
 
 
 @dataclass(frozen=True)
@@ -133,6 +280,83 @@ def _is_shard_complete(
         and payload.get("request_set_sha256") == request_set_sha256
         and observed_attestation == dict(session_attestation)
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _GroupedShard:
+    shard_id: str
+    shard_index: int
+    ranges: tuple[tuple[int, int], ...]
+    total_pools: int
+    session_group_id: str
+    observation_id: str
+
+    @property
+    def ordinals(self) -> tuple[int, ...]:
+        return tuple(
+            value for start, end in self.ranges for value in range(start, end)
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "shard_id": self.shard_id,
+            "shard_index": self.shard_index,
+            "blade": "local",
+            "ranges": [list(value) for value in self.ranges],
+            "chunk_size": len(self.ordinals),
+            "total_pools": self.total_pools,
+            "assigned_pools": len(self.ordinals),
+            "session_group_id": self.session_group_id,
+            "observation_id": self.observation_id,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> _GroupedShard:
+        return cls(
+            str(value["shard_id"]),
+            int(value["shard_index"]),
+            tuple((int(item[0]), int(item[1])) for item in value["ranges"]),
+            int(value["total_pools"]),
+            str(value["session_group_id"]),
+            str(value["observation_id"]),
+        )
+
+
+def _ordinal_ranges(ordinals: Sequence[int]) -> tuple[tuple[int, int], ...]:
+    ranges: list[tuple[int, int]] = []
+    for value in ordinals:
+        if ranges and ranges[-1][1] == value:
+            ranges[-1] = (ranges[-1][0], value + 1)
+        else:
+            ranges.append((value, value + 1))
+    return tuple(ranges)
+
+
+def _make_grouped_shards(
+    points: Sequence[Any], chunk_size: int
+) -> tuple[_GroupedShard, ...]:
+    partitions: dict[tuple[str, str], list[int]] = {}
+    for point in points:
+        partitions.setdefault(
+            (point.session_group_id, point.evaluation.observation_key.sha256), []
+        ).append(point.ordinal)
+    shards: list[_GroupedShard] = []
+    total = len(points)
+    for (group_id, observation_id), ordinals in partitions.items():
+        for start in range(0, len(ordinals), chunk_size):
+            selected = ordinals[start : start + chunk_size]
+            index = len(shards)
+            shards.append(
+                _GroupedShard(
+                    f"shard_{index:03d}_{group_id[:8]}_{observation_id[:8]}",
+                    index,
+                    _ordinal_ranges(selected),
+                    total,
+                    group_id,
+                    observation_id,
+                )
+            )
+    return tuple(shards)
 
 
 def _extract_candidates_for_ranges(manifest: Mapping[str, Any], ranges: Sequence[tuple[int, int]]) -> list[dict[str, Any]]:
@@ -294,7 +518,12 @@ class ExecutionBackend:
         harness_binary: Path | str | None = None,
         client_factory: Callable[[str, str], EvaluatorClient] | None = None,
     ) -> None:
-        self.site = site_profile or load_site_profile("local")
+        self.site = site_profile or SiteProfile(
+            name="local",
+            site_type="local",
+            description="Built-in local execution profile",
+            runner=RunnerConfig(max_workers=1),
+        )
         self.site.validate()
         self.adapter = process_adapter or LocalProcessAdapter()
         self.harness_binary = Path(harness_binary) if harness_binary else None
@@ -485,6 +714,8 @@ class ExecutionBackend:
             bundle = manifest_or_bundle
         else:
             manifest_path = Path(manifest_or_bundle).resolve()
+            with manifest_path.open("r", encoding="utf-8") as handle:
+                _reject_artifact_bound_grid(json.load(handle))
             bundle = prepare_work_bundle(
                 manifest_path,
                 root=manifest_path.parent.parent,
@@ -493,6 +724,7 @@ class ExecutionBackend:
 
         with bundle.manifest_local.open("r", encoding="utf-8") as handle:
             manifest = json.load(handle)
+        _reject_artifact_bound_grid(manifest)
 
         resolved = manifest.get("resolved_spec", {})
         resolved_policy = resolved.get("policy", {}) if isinstance(resolved, Mapping) else {}
@@ -550,16 +782,53 @@ class ExecutionBackend:
         resume: bool = False,
         blades: Sequence[str] | None = None,
         chunk_size: int | None = None,
+        repository: Path | None = None,
     ) -> ExecutionSummary:
         manifest_file = Path(manifest_path).resolve()
+        if not manifest_file.is_file():
+            raise FileNotFoundError(f"manifest file not found at {manifest_file}")
+        manifest = load_manifest(manifest_file, expected_kind="grid")
+        named_mode = _artifact_selected_mode(manifest)
+        if named_mode is not None:
+            if named_mode != _NAMED_GRID_MODE:
+                _reject_artifact_bound_grid(manifest)
+            if repository is None:
+                raise ExecutionBackendError(
+                    "artifact-selected grid execution requires explicit repository context"
+                )
+            preflight = _preflight_named_grid(
+                manifest_file, repository=Path(repository).resolve()
+            )
+            is_cluster = self.site.site_type == "ssh" or bool(blades)
+            if is_cluster:
+                if self.site.cluster.transport != "shared_nfs":
+                    raise ExecutionBackendError("artifact-selected cluster grids require shared_nfs")
+                active = list(blades) if blades else list(self.site.cluster.blades)
+                self.site.validate_blades(active)
+                run_id = validate_run_id(str(manifest["run_id"]))
+                with shared_run_lease(self.site, run_id, adapter=self.adapter) as lease:
+                    if not self._shared_run_is_mounted(manifest_file):
+                        return self._run_grid_via_coordinator(
+                            manifest_file, resume=resume, blades=active,
+                            chunk_size=chunk_size, lease=lease,
+                        )
+                    return self._run_named_local_grid(
+                        manifest_file, preflight, repository=Path(repository).resolve(),
+                        resume=resume, chunk_size=chunk_size, cluster_blades=active,
+                    )
+            return self._run_named_local_grid(
+                manifest_file,
+                preflight,
+                repository=Path(repository).resolve(),
+                resume=resume,
+                chunk_size=chunk_size,
+            )
         if blades:
             self.site.validate_blades(blades)
         if self.site.cluster.transport != "shared_nfs":
             return self._run_grid_unlocked(
                 manifest_file, resume=resume, blades=blades, chunk_size=chunk_size
             )
-        if not manifest_file.is_file():
-            raise FileNotFoundError(f"manifest file not found at {manifest_file}")
         manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
         run_id = validate_run_id(str(manifest.get("run_id", manifest_file.parent.name)))
         with shared_run_lease(self.site, run_id, adapter=self.adapter) as lease:
@@ -574,6 +843,208 @@ class ExecutionBackend:
                 chunk_size=chunk_size,
                 lease=lease,
             )
+
+    def _run_named_local_grid(
+        self,
+        manifest_file: Path,
+        preflight: _NamedGridPreflight,
+        *,
+        repository: Path,
+        resume: bool,
+        chunk_size: int | None,
+        cluster_blades: Sequence[str] = (),
+    ) -> ExecutionSummary:
+        """Persist around the path-local grouped executor."""
+        manifest = preflight.manifest
+        run_dir = manifest_file.parent
+        run_id = validate_run_id(str(manifest["run_id"]))
+        is_cluster = bool(cluster_blades)
+        pool_count = len(preflight.points)
+        size = self.site.harness.chunk_size if chunk_size is None else int(chunk_size)
+        if size <= 0:
+            raise ExecutionBackendError(f"chunk_size must be >= 1, got {size}")
+
+        persisted = manifest["grid"].get("shards")
+        if resume and isinstance(persisted, list) and persisted:
+            try:
+                shards = tuple(_GroupedShard.from_dict(item) for item in persisted)
+                indices = [ordinal for shard in shards for ordinal in shard.ordinals]
+                by_ordinal = {point.ordinal: point for point in preflight.points}
+                if (
+                    len({shard.shard_id for shard in shards}) != len(shards)
+                    or sorted(indices) != list(range(pool_count))
+                    or any(
+                        shard.total_pools != pool_count
+                        or any(
+                            by_ordinal[ordinal].session_group_id != shard.session_group_id
+                            or by_ordinal[ordinal].evaluation.observation_key.sha256
+                            != shard.observation_id
+                            for ordinal in shard.ordinals
+                        )
+                        for shard in shards
+                    )
+                ):
+                    raise ValueError("persisted grouped shards are not canonical")
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ExecutionBackendError(
+                    "manifest contains invalid persisted grouped shards"
+                ) from exc
+        else:
+            shards = _make_grouped_shards(preflight.points, size)
+
+        results_dir = run_dir / "results"
+        shards_dir = run_dir / "shards"
+        results_dir.mkdir(parents=True, exist_ok=True)
+        shards_dir.mkdir(parents=True, exist_ok=True)
+        for shard in shards:
+            write_ranges_file(shards_dir / f"{shard.shard_id}.ranges", shard.ranges)
+        descriptors = [
+            shard.to_dict() | {"blade": cluster_blades[index % len(cluster_blades)]}
+            if is_cluster else shard.to_dict()
+            for index, shard in enumerate(shards)
+        ]
+        if resume and persisted != descriptors:
+            raise ExecutionBackendError("persisted grouped shards differ from canonical assignment")
+        manifest["grid"]["shards"] = descriptors
+        manifest["scope"] = "cluster" if is_cluster else "local"
+        if is_cluster:
+            manifest.update(remote_base=str(self.site.cluster.remote_base),
+                            remote_transport="shared_nfs",
+                            remote_coordinator=self.site.cluster.coordinator)
+        write_manifest_atomic(manifest_file, manifest, expected_kind="grid")
+
+        start_time = time.monotonic()
+        started_iso = now_utc_iso()
+        attempt_id = len(manifest.get("attempt_history", [])) + 1
+        skipped = 0
+        pending: list[_GroupedShard] = []
+        try:
+            bindings: dict[str, LocalSessionGroupBinding] = {}
+            if not is_cluster:
+                for group in preflight.groups:
+                    materialization = LocalSessionMaterialization.from_scenario(
+                        preflight.scenario, repository=repository,
+                        manifest_root=run_dir / "session_transport",
+                        session_id=f"sess_{run_id}_{group.key.sha256[:12]}",
+                    ).validated()
+                    bindings[group.key.sha256] = bind_local_session_group(group, materialization)
+
+            for shard in shards:
+                output = results_dir / f"{shard.shard_id}.json"
+                if resume and is_grouped_shard_complete(
+                    manifest, shard.to_dict(), output
+                ):
+                    skipped += 1
+                else:
+                    pending.append(shard)
+
+            requested_ordinals = sorted(
+                ordinal for shard in pending for ordinal in shard.ordinals
+            )
+            by_ordinal = {point.ordinal: point for point in preflight.points}
+            requested_ids = [
+                by_ordinal[ordinal].evaluation.evaluation_id
+                for ordinal in requested_ordinals
+            ]
+            if is_cluster:
+                pending_by_blade = {
+                    blade: [shard for shard, descriptor in zip(shards, descriptors, strict=True)
+                            if shard in pending and descriptor["blade"] == blade]
+                    for blade in cluster_blades
+                }
+                execution = dispatch_grouped_grid(
+                    run_root=run_dir, run_id=run_id, selected=preflight.selected,
+                    scenario=preflight.scenario, points=preflight.points,
+                    pending_by_blade=pending_by_blade, repository=repository, site=self.site,
+                    chunk_size=size, attempt_id=attempt_id,
+                    ssh=SSHProcessAdapter(ssh_config=self.site.ssh, process_runner=self.adapter),
+                )
+            else:
+                execution = execute_local_groups(
+                    preflight.selected, preflight.groups,
+                    lambda group: bindings[group.key.sha256], requested_ids,
+                    work_dir=run_dir, chunk_size=size,
+                    max_workers=self.site.runner.max_workers,
+                )
+            for shard in pending:
+                attestation = (
+                    execution.attestations_by_session_group_id[shard.session_group_id]
+                    if is_cluster else
+                    execution.receipts_by_session_group_id[shard.session_group_id].session_attestation
+                )
+                rows = [
+                    execution.results_by_evaluation_id[
+                        by_ordinal[ordinal].evaluation.evaluation_id
+                    ].model_dump()
+                    for ordinal in shard.ordinals
+                ]
+                request_sha256 = group_request_set_sha256(manifest, shard.ordinals, attestation)
+                write_shard_result(
+                    results_dir / f"{shard.shard_id}.json",
+                    run_id=run_id,
+                    shard_id=shard.shard_id,
+                    shard_index=shard.shard_index,
+                    ranges=shard.ranges,
+                    rows=rows,
+                    request_set_sha256=request_sha256,
+                    session_attestation=attestation,
+                )
+            output = collect_grid_results(
+                manifest_file, run_dir / "grid_results.npz", adapter=self.adapter
+            )
+            duration = time.monotonic() - start_time
+        except BaseException as exc:  # noqa: BLE001
+            _append_attempt(
+                manifest_file,
+                manifest,
+                {
+                    "attempt_id": attempt_id,
+                    "attempt_uid": uuid.uuid4().hex[:12],
+                    "scope": "cluster" if is_cluster else "local",
+                    "started_at": started_iso,
+                    "finished_at": now_utc_iso(),
+                    "status": "failed",
+                    "exit_code": 1,
+                    "blade": self.site.cluster.coordinator if is_cluster else "local",
+                    "topology_metadata": {"shards": len(shards)},
+                    "error_message": str(exc),
+                },
+            )
+            raise
+
+        _append_attempt(
+            manifest_file,
+            manifest,
+            {
+                "attempt_id": attempt_id,
+                "attempt_uid": uuid.uuid4().hex[:12],
+                "scope": "cluster" if is_cluster else "local",
+                "started_at": started_iso,
+                "finished_at": now_utc_iso(),
+                "status": "succeeded",
+                "exit_code": 0,
+                "blade": self.site.cluster.coordinator if is_cluster else "local",
+                "topology_metadata": {
+                    "workers": execution.requests if is_cluster else execution.workers,
+                    "shards": len(shards),
+                    "skipped_shards": skipped,
+                    "executed_shards": len(pending),
+                },
+                "error_message": None,
+            },
+        )
+        return ExecutionSummary(
+            run_id=run_id,
+            scope="cluster" if is_cluster else "local",
+            status="succeeded",
+            total_pools=pool_count,
+            duration_seconds=duration,
+            output_path=output,
+            manifest_path=manifest_file,
+            attempts_count=attempt_id,
+            skipped_shards=skipped,
+            executed_shards=len(pending),
+        )
 
     def _run_grid_unlocked(
         self,
@@ -1092,6 +1563,7 @@ class ExecutionBackend:
                 f"expected {expected_order!r}, got {actual_order!r}"
             )
         return [result.model_dump() for result in response.results]
+
 
     def close(self) -> None:
         """Close evaluator registry and release resources."""
