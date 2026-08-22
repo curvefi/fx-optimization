@@ -6,7 +6,7 @@ import json
 from click.testing import CliRunner
 
 from fxopt.cli import main
-from fxopt.results import read_results
+from fxopt.results import ArtifactPaths, read_results
 from fxopt.run import RunConfig, open_session_request, run_config
 
 
@@ -70,8 +70,14 @@ pool = {}
     )
     fake = FakeClient()
     output = tmp_path / "output"
+    progress: list[tuple[int, int]] = []
 
-    run_config(config, output, client_factory=lambda: fake)
+    run_config(
+        config,
+        output,
+        client_factory=lambda: fake,
+        progress_callback=lambda completed, total: progress.append((completed, total)),
+    )
     assert RunConfig.from_toml(config).workers == 3
 
     assert fake.events.count("start") == 1
@@ -82,6 +88,7 @@ pool = {}
     assert fake.events[-1] == "shutdown"
     assert [len(batch) for batch in fake.batches] == [2, 2]
     assert {path.name for path in output.iterdir()} == {"run.json", "results.npz"}
+    assert progress == [(0, 4), (2, 4), (4, 4)]
     run_payload = json.loads((output / "run.json").read_text())
     assert run_payload["candidate_count"] == 4
     assert "candidates" not in run_payload
@@ -190,3 +197,25 @@ def test_fxopt_help_exposes_only_run_surface() -> None:
     assert grid.candidate_at(0).payload["pool"]["A"] == 10_000
     assert grid.candidate_at(240).payload["pool"]["A"] == 2_000_000
     assert grid.candidate_at(0).payload["pool"]["out_fee"] == 0.0003
+
+
+def test_fxopt_run_cli_reports_progress(tmp_path, monkeypatch) -> None:
+    config = tmp_path / "run.toml"
+    config.write_text("[run]\n")
+    paths = ArtifactPaths(tmp_path / "run.json", tmp_path / "results.npz")
+
+    def fake_run_config(*_args, progress_callback=None, **_kwargs):
+        progress_callback(0, 4)
+        progress_callback(2, 4)
+        progress_callback(4, 4)
+        return paths
+
+    monkeypatch.setattr("fxopt.cli.run_config", fake_run_config)
+    result = CliRunner().invoke(main, ["run", str(config), "--output", str(tmp_path / "out")])
+
+    assert result.exit_code == 0, result.output
+    assert "run: 0/4 (0%)" in result.output
+    assert "run: 2/4 (50%)" in result.output
+    assert "run: 4/4 (100%)" in result.output
+    assert "pools/s" in result.output
+    assert "ETA" in result.output

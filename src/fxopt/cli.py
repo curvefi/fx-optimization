@@ -1,6 +1,7 @@
 """One small CLI for grids, optimization, heatmaps, and Shift-click replay."""
 
 from pathlib import Path
+import time
 
 import click
 
@@ -9,6 +10,40 @@ from .optimize import OptimizationError, optimize_config
 from .results import read_result_columns
 from .run import run_config
 from .shiftclick import trace_candidate
+
+
+def _progress_reporter(label: str):
+    started_at = time.monotonic()
+    last_completed = -1
+    last_printed_at = started_at
+
+    def report(completed: int, total: int) -> None:
+        nonlocal last_completed, last_printed_at
+        now = time.monotonic()
+        final = completed >= total
+        candidate_step = max(1, total // 10)
+        should_print = (
+            last_completed < 0
+            or final
+            or completed - last_completed >= candidate_step
+            or now - last_printed_at >= 2.0
+        )
+        if not should_print:
+            return
+        elapsed = max(0.0, now - started_at)
+        percent = min(100, int(completed * 100 / total)) if total else 100
+        rate = completed / elapsed if completed > 0 and elapsed > 0 else 0.0
+        eta = max(0, total - completed) / rate if rate > 0 else None
+        eta_text = "--" if eta is None else f"{eta:.1f}s"
+        click.echo(
+            f"{label}: {completed}/{total} ({percent}%) elapsed {elapsed:.1f}s "
+            f"pools/s {rate:.1f} ETA {eta_text}",
+            err=True,
+        )
+        last_completed = completed
+        last_printed_at = now
+
+    return report
 
 
 @click.group()
@@ -28,7 +63,7 @@ def main() -> None:
 def run_command(config: Path, output_dir: Path) -> None:
     """Run CONFIG as bounded local-or-SSH evaluator batches."""
     try:
-        paths = run_config(config, output_dir)
+        paths = run_config(config, output_dir, progress_callback=_progress_reporter("run"))
     except (ConfigError, OSError, TypeError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"wrote {paths.run_json} and {paths.results_npz}")
@@ -41,7 +76,9 @@ def run_command(config: Path, output_dir: Path) -> None:
 def optimize_command(config: Path, output_dir: Path) -> None:
     """Run Nevergrad from CONFIG through the same evaluator fleet."""
     try:
-        paths = optimize_config(config, output_dir)
+        paths = optimize_config(
+            config, output_dir, progress_callback=_progress_reporter("optimize")
+        )
     except (ConfigError, OptimizationError, OSError, TypeError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"wrote {paths.run_json} and {paths.results_npz}")

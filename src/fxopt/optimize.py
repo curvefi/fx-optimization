@@ -14,6 +14,7 @@ from .placement import EvaluatorFleet
 from .engine import ClientFactory
 from .results import ArtifactPaths, ResultWriter
 from .run import (
+    ProgressCallback,
     RunConfig,
     candidate_from_spec,
     open_session_request,
@@ -59,6 +60,7 @@ def optimize_config(
     output_dir: str | Path,
     *,
     client_factory: ClientFactory | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> ArtifactPaths:
     """Optimize discrete candidate axes locally or over configured SSH lanes."""
     config = RunConfig.from_toml(config_path)
@@ -86,6 +88,9 @@ def optimize_config(
     completed = 0
 
     with writer:
+        total = settings["budget"]
+        if progress_callback is not None:
+            progress_callback(0, total)
         with EvaluatorFleet(
             lanes,
             session_id=config.run_id,
@@ -115,6 +120,8 @@ def optimize_config(
                         best_ordinal = completed + index
                 writer.append(candidates, results)
                 completed += count
+                if progress_callback is not None:
+                    progress_callback(completed, total)
         writer.update_metadata(best_ordinal=best_ordinal,
                                best_metric_value=None if best_ordinal is None else best_value)
         return writer.finalize()

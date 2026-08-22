@@ -82,10 +82,17 @@ def test_heatmap_reads_the_two_file_result(tmp_path):
 def test_nevergrad_and_shiftclick_share_the_fleet(tmp_path):
     config = _config(tmp_path)
     factory = FakeClient
-    artifacts = optimize_config(config, tmp_path / "optimization", client_factory=factory)
+    progress = []
+    artifacts = optimize_config(
+        config,
+        tmp_path / "optimization",
+        client_factory=factory,
+        progress_callback=lambda completed, total: progress.append((completed, total)),
+    )
     bundle = read_results(artifacts.run_json.parent)
     assert len(bundle.results) == 4
     assert bundle.metadata["best_metric_value"] == 3.0
+    assert progress == [(0, 4), (2, 4), (4, 4)]
 
     candidate = bundle.candidates[1]
     summary = trace_candidate(config, candidate=candidate, ordinal=1, output_dir=tmp_path / "trace",

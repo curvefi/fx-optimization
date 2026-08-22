@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 import tomllib
@@ -25,6 +25,8 @@ _RUN_KEYS = frozenset({"id", "evaluator", "template", "batch_size", "workers"})
 _PLACEMENT_KEYS = frozenset({"hosts"})
 _CANDIDATE_KEYS = frozenset({"defaults", "axes"})
 _SCENARIO_KEYS = frozenset({"id", "market", "chainlink", "yb_mode"})
+
+ProgressCallback = Callable[[int, int], None]
 
 
 def _required_string(section: Mapping[str, Any], key: str, label: str) -> str:
@@ -252,6 +254,7 @@ def _run(
     output_dir: str | Path,
     *,
     client_factory: ClientFactory | None,
+    progress_callback: ProgressCallback | None,
 ) -> ArtifactPaths:
     lanes = placement_lanes(config, client_factory)
     candidate_grid = config.candidate.grid()
@@ -263,15 +266,22 @@ def _run(
     writer = ResultWriter(output_dir, run_id=config.run_id, metadata=metadata)
     open_session = open_session_request(config)
     with writer:
+        total = len(candidate_grid)
+        if progress_callback is not None:
+            progress_callback(0, total)
         with EvaluatorFleet(
             lanes,
             session_id=config.run_id,
             batch_size=effective_batch,
             open_session=open_session,
         ) as fleet:
+            completed = 0
             for specs in candidate_grid.iter_batches(lane_count * effective_batch):
                 batch = tuple(candidate_from_spec(spec) for spec in specs)
                 writer.append(batch, fleet.evaluate(batch))
+                completed += len(batch)
+                if progress_callback is not None:
+                    progress_callback(completed, total)
         return writer.finalize()
 
 
@@ -280,11 +290,17 @@ def run_config(
     output_dir: str | Path,
     *,
     client_factory: ClientFactory | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> ArtifactPaths:
     """Run every grid point in bounded batches and publish the two artifacts."""
     config = RunConfig.from_toml(config_path)
     output_path = Path(output_dir).expanduser().resolve()
-    return _run(config, output_path, client_factory=client_factory)
+    return _run(
+        config,
+        output_path,
+        client_factory=client_factory,
+        progress_callback=progress_callback,
+    )
 
 
 __all__ = [
@@ -292,6 +308,7 @@ __all__ = [
     "candidate_from_spec",
     "open_session_request",
     "placement_lanes",
+    "ProgressCallback",
     "run_config",
     "run_metadata",
 ]
