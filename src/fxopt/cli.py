@@ -21,11 +21,9 @@ def _progress_reporter(label: str):
         nonlocal last_completed, last_printed_at
         now = time.monotonic()
         final = completed >= total
-        candidate_step = max(1, total // 10)
         should_print = (
             last_completed < 0
             or final
-            or completed - last_completed >= candidate_step
             or now - last_printed_at >= 2.0
         )
         if not should_print:

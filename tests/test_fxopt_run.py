@@ -203,10 +203,13 @@ def test_fxopt_run_cli_reports_progress(tmp_path, monkeypatch) -> None:
     config = tmp_path / "run.toml"
     config.write_text("[run]\n")
     paths = ArtifactPaths(tmp_path / "run.json", tmp_path / "results.npz")
+    monotonic = iter((0.0, 0.1, 1.9, 2.1, 2.2))
+    monkeypatch.setattr("fxopt.cli.time.monotonic", lambda: next(monotonic))
 
     def fake_run_config(*_args, progress_callback=None, **_kwargs):
         progress_callback(0, 4)
         progress_callback(2, 4)
+        progress_callback(3, 4)
         progress_callback(4, 4)
         return paths
 
@@ -215,7 +218,8 @@ def test_fxopt_run_cli_reports_progress(tmp_path, monkeypatch) -> None:
 
     assert result.exit_code == 0, result.output
     assert "run: 0/4 (0%)" in result.output
-    assert "run: 2/4 (50%)" in result.output
+    assert "run: 2/4 (50%)" not in result.output
+    assert "run: 3/4 (75%)" in result.output
     assert "run: 4/4 (100%)" in result.output
     assert "pools/s" in result.output
     assert "ETA" in result.output
