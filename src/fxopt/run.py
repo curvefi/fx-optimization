@@ -28,6 +28,12 @@ _SCENARIO_KEYS = frozenset({"id", "market", "chainlink", "yb_mode"})
 
 ProgressCallback = Callable[[int, int], None]
 
+_AXIS_LABELS = {
+    "pool.A": "A",
+    "pool.donation_apy": "donation",
+    "pool.reserved_profit_fraction": "rpf",
+}
+
 
 def _required_string(section: Mapping[str, Any], key: str, label: str) -> str:
     value = section.get(key)
@@ -156,6 +162,34 @@ class RunConfig:
             session=dict(session),
             scenario=resolved_scenario,
         )
+
+
+def _display_value(value: object) -> str:
+    return f"{value:g}" if isinstance(value, float) else str(value)
+
+
+def grid_summary(config_path: str | Path) -> str:
+    """Describe the configured Cartesian axes in their operator-facing units."""
+    config = RunConfig.from_toml(config_path)
+    with config.path.open("rb") as stream:
+        raw_axes = tomllib.load(stream)["candidate"].get("axes", {})
+    parts = []
+    for name, values in config.candidate.axes.items():
+        raw = raw_axes[name]
+        displayed = raw.get("values") if isinstance(raw, Mapping) and "values" in raw else raw
+        if isinstance(raw, Mapping) and "start" in raw:
+            displayed = (raw["start"], raw["stop"])
+        endpoints = displayed if isinstance(displayed, list) else list(displayed)
+        if name == "pool.donation_apy":
+            endpoints = [float(value) * 100 for value in endpoints]
+        span = _display_value(endpoints[0])
+        if len(endpoints) > 1:
+            span += f"..{_display_value(endpoints[-1])}"
+        if name == "pool.donation_apy":
+            span += "%"
+        parts.append(f"{_AXIS_LABELS.get(name, name)} {span} ({len(values)} pts)")
+    suffix = f": {', '.join(parts)}" if parts else ""
+    return f"running {len(config.candidate.grid())} pools grid{suffix}"
 
 
 def candidate_from_spec(spec: CandidateSpec) -> Candidate:
@@ -306,6 +340,7 @@ def run_config(
 __all__ = [
     "RunConfig",
     "candidate_from_spec",
+    "grid_summary",
     "open_session_request",
     "placement_lanes",
     "ProgressCallback",

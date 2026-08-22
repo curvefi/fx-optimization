@@ -1,6 +1,7 @@
 """One small CLI for grids, optimization, heatmaps, and Shift-click replay."""
 
 from pathlib import Path
+import threading
 import time
 
 import click
@@ -8,40 +9,73 @@ import click
 from .config import ConfigError
 from .optimize import OptimizationError, optimize_config
 from .results import read_result_columns
-from .run import run_config
+from .run import grid_summary, run_config
 from .shiftclick import trace_candidate
 
 
-def _progress_reporter(label: str):
-    started_at = time.monotonic()
-    last_completed = -1
-    last_printed_at = started_at
+class _ProgressReporter:
+    def __init__(self, label: str, *, _interval: float = 2.0) -> None:
+        self.label = label
+        self.interval = _interval
+        self.started_at = time.monotonic()
+        self.latest: tuple[int, int] | None = None
+        self.last_reported_completed: int | None = None
+        self.initial_printed = False
+        self.finished = False
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._heartbeat, daemon=True)
 
-    def report(completed: int, total: int) -> None:
-        nonlocal last_completed, last_printed_at
+    def start(self) -> None:
+        self.started_at = time.monotonic()
+        self.thread.start()
+
+    def __call__(self, completed: int, total: int) -> None:
+        with self.lock:
+            self.latest = (completed, total)
+            final = completed >= total
+            if self.finished:
+                return
+            if (completed == 0 and not self.initial_printed) or final:
+                self._write(completed, total)
+                self.last_reported_completed = completed
+                self.initial_printed = True
+            self.finished = final
+
+    def _heartbeat(self) -> None:
+        while not self.stop_event.wait(self.interval):
+            with self.lock:
+                if self.latest is not None and not self.finished:
+                    completed, total = self.latest
+                    stale = completed == self.last_reported_completed
+                    self._write(completed, total, working=stale)
+                    if not stale:
+                        self.last_reported_completed = completed
+
+    def _write(self, completed: int, total: int, *, working: bool = False) -> None:
         now = time.monotonic()
-        final = completed >= total
-        should_print = (
-            last_completed < 0
-            or final
-            or now - last_printed_at >= 2.0
-        )
-        if not should_print:
-            return
-        elapsed = max(0.0, now - started_at)
+        elapsed = max(0.0, now - self.started_at)
         percent = min(100, int(completed * 100 / total)) if total else 100
+        if working:
+            click.echo(
+                f"{self.label}: working... {completed}/{total} complete ({percent}%) "
+                f"elapsed {elapsed:.1f}s",
+                err=True,
+            )
+            return
         rate = completed / elapsed if completed > 0 and elapsed > 0 else 0.0
         eta = max(0, total - completed) / rate if rate > 0 else None
         eta_text = "--" if eta is None else f"{eta:.1f}s"
         click.echo(
-            f"{label}: {completed}/{total} ({percent}%) elapsed {elapsed:.1f}s "
+            f"{self.label}: {completed}/{total} ({percent}%) elapsed {elapsed:.1f}s "
             f"pools/s {rate:.1f} ETA {eta_text}",
             err=True,
         )
-        last_completed = completed
-        last_printed_at = now
 
-    return report
+    def close(self) -> None:
+        self.stop_event.set()
+        if self.thread.is_alive():
+            self.thread.join()
 
 
 @click.group()
@@ -60,10 +94,15 @@ def main() -> None:
 )
 def run_command(config: Path, output_dir: Path) -> None:
     """Run CONFIG as bounded local-or-SSH evaluator batches."""
+    reporter = _ProgressReporter("run")
     try:
-        paths = run_config(config, output_dir, progress_callback=_progress_reporter("run"))
+        click.echo(grid_summary(config), err=True)
+        reporter.start()
+        paths = run_config(config, output_dir, progress_callback=reporter)
     except (ConfigError, OSError, TypeError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
+    finally:
+        reporter.close()
     click.echo(f"wrote {paths.run_json} and {paths.results_npz}")
 
 
@@ -73,12 +112,14 @@ def run_command(config: Path, output_dir: Path) -> None:
               type=click.Path(file_okay=False, path_type=Path))
 def optimize_command(config: Path, output_dir: Path) -> None:
     """Run Nevergrad from CONFIG through the same evaluator fleet."""
+    reporter = _ProgressReporter("optimize")
     try:
-        paths = optimize_config(
-            config, output_dir, progress_callback=_progress_reporter("optimize")
-        )
+        reporter.start()
+        paths = optimize_config(config, output_dir, progress_callback=reporter)
     except (ConfigError, OptimizationError, OSError, TypeError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
+    finally:
+        reporter.close()
     click.echo(f"wrote {paths.run_json} and {paths.results_npz}")
 
 

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import threading
 
 from click.testing import CliRunner
 
-from fxopt.cli import main
+from fxopt.cli import _ProgressReporter, main
 from fxopt.results import ArtifactPaths, read_results
 from fxopt.run import RunConfig, open_session_request, run_config
 
@@ -201,15 +202,47 @@ def test_fxopt_help_exposes_only_run_surface() -> None:
 
 def test_fxopt_run_cli_reports_progress(tmp_path, monkeypatch) -> None:
     config = tmp_path / "run.toml"
-    config.write_text("[run]\n")
+    config.write_text(
+        """
+[run]
+id = "test-run"
+evaluator = "evaluator"
+template = "template.json"
+batch_size = 4
+[scenario]
+id = "scenario-1"
+market = "market.json"
+[candidate.defaults]
+policy_params = []
+pool = {}
+[candidate.axes]
+"pool.A" = { start = 1, stop = 200, count = 8, multiply = 10000 }
+"pool.donation_apy" = { start = 0, stop = 0.10, count = 8 }
+"pool.reserved_profit_fraction" = { start = 0, stop = 1, count = 8 }
+"""
+    )
     paths = ArtifactPaths(tmp_path / "run.json", tmp_path / "results.npz")
-    monotonic = iter((0.0, 0.1, 1.9, 2.1, 2.2))
-    monkeypatch.setattr("fxopt.cli.time.monotonic", lambda: next(monotonic))
+    heartbeat_seen = threading.Event()
+    zero_reports = 0
+    original_write = _ProgressReporter._write
+
+    def observed_write(self, completed, total, **kwargs):
+        nonlocal zero_reports
+        original_write(self, completed, total, **kwargs)
+        if completed == 0 and kwargs.get("working"):
+            zero_reports += 1
+            heartbeat_seen.set()
+
+    monkeypatch.setattr(_ProgressReporter, "_write", observed_write)
+    monkeypatch.setattr(
+        "fxopt.cli._ProgressReporter",
+        lambda label: _ProgressReporter(label, _interval=0.01),
+    )
 
     def fake_run_config(*_args, progress_callback=None, **_kwargs):
         progress_callback(0, 4)
+        assert heartbeat_seen.wait(1.0)
         progress_callback(2, 4)
-        progress_callback(3, 4)
         progress_callback(4, 4)
         return paths
 
@@ -218,8 +251,14 @@ def test_fxopt_run_cli_reports_progress(tmp_path, monkeypatch) -> None:
 
     assert result.exit_code == 0, result.output
     assert "run: 0/4 (0%)" in result.output
-    assert "run: 2/4 (50%)" not in result.output
-    assert "run: 3/4 (75%)" in result.output
+    stale = next(line for line in result.output.splitlines() if "run: working..." in line)
+    assert "0/4 complete (0%)" in stale
+    assert "pools/s" not in stale
+    assert "ETA" not in stale
     assert "run: 4/4 (100%)" in result.output
+    assert (
+        "running 512 pools grid: A 1..200 (8 pts), donation 0..10% (8 pts), "
+        "rpf 0..1 (8 pts)"
+    ) in result.output
     assert "pools/s" in result.output
     assert "ETA" in result.output
