@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import tempfile
@@ -18,22 +19,41 @@ from matplotlib import rcsetup
 from matplotlib.backend_bases import MouseButton, MouseEvent
 from matplotlib.widgets import RadioButtons, Slider
 
-from ..artifacts.io import atomic_write_json
-from ..artifacts.tables import EvaluationTable
-from ..evaluation.selection import SelectionRef
-from ..grids.model import CartesianGridPlan
 from .masked_metrics import (
     MASKED_METRIC_SOURCES,
     SKEW_MASKED_METRICS,
     SLIPPAGE_APY_MASK_SOURCES,
 )
-from ..grids.analysis import (
-    GridAnalysisError,
-    dense_grid_axes,
-    dense_grid_indices,
-    first_numeric_metric,
-)
 from .theme import DEFAULT_THEME, PlotTheme, apply_theme
+
+@dataclass(frozen=True)
+class SelectionRef:
+    run_id: str
+    kind: str
+    index: int
+    coordinate: Mapping[str, Any]
+    candidate_id: str
+    tags: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id, "kind": self.kind, "index": self.index,
+            "coordinate": dict(self.coordinate), "candidate_id": self.candidate_id,
+            "tags": list(self.tags),
+        }
+
+
+def atomic_write_json(path: Path, value: object) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        temporary.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")))
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return path
 
 AxisScale = Literal["linear", "log", "categorical"]
 
@@ -335,12 +355,10 @@ class HeatmapSelection:
 class HeatmapDataset:
     axes: tuple[HeatmapAxis, ...]
     metrics: Mapping[str, np.ndarray]
-    candidate_ids: np.ndarray | None
-    ordinals: np.ndarray | None
-    coordinates: np.ndarray | None
+    candidate_ids: np.ndarray
+    ordinals: np.ndarray
     valid: np.ndarray
     metadata: Mapping[str, Any] = field(default_factory=dict)
-    plan: CartesianGridPlan | None = None
 
     def __post_init__(self) -> None:
         if len(self.axes) < 2:
@@ -355,9 +373,7 @@ class HeatmapDataset:
                     f"metric {name!r} has shape {values.shape}, expected {shape}"
                 )
         for name, raw in (("candidate_ids", self.candidate_ids),
-                          ("ordinals", self.ordinals), ("coordinates", self.coordinates)):
-            if self.plan is not None and raw is None:
-                continue
+                          ("ordinals", self.ordinals)):
             if np.asarray(raw).shape != shape:
                 raise HeatmapValidationError(f"{name} does not match heatmap shape {shape}")
         if np.asarray(self.valid).shape != shape:
@@ -476,13 +492,8 @@ class HeatmapDataset:
             if index < 0 or index >= len(axis.values):
                 raise HeatmapValidationError(f"point index is outside axis {axis.key!r}")
             coordinate.update(axis.coordinate(index))
-        if self.plan is not None:
-            ordinal = self.plan.ordinal_at(coordinate)
-            candidate_id = self.plan.candidate_id_at(ordinal)
-        else:
-            assert self.candidate_ids is not None and self.ordinals is not None
-            candidate_id = str(self.candidate_ids[location])
-            ordinal = int(self.ordinals[location])
+        candidate_id = str(self.candidate_ids[location])
+        ordinal = int(self.ordinals[location])
         if not candidate_id:
             raise HeatmapValidationError("selected heatmap cell has no exact candidate")
         if not bool(self.valid[location]):
@@ -499,131 +510,6 @@ class HeatmapDataset:
             grid_indices=location,
         )
 
-    @classmethod
-    def from_table(
-        cls, table: EvaluationTable, *, plan: CartesianGridPlan | None = None,
-        metrics: Sequence[str] | None = None,
-    ) -> "HeatmapDataset":
-        """Build the exact dense grid from declared metadata or row coordinates.
-
-        Tables with ``metadata["axes"]`` use the declared axes and exact
-        ``metadata["coordinate_indices"]``; bare NPZ tables (no axis metadata)
-        fall back to inferring the exact dense axes from the per-row
-        coordinates (coordinates_json) via ``grids.analysis``.
-        """
-        if table.is_columnar_grid:
-            if plan is None:
-                raise HeatmapValidationError("a columnar Cartesian table requires its grid plan")
-            if plan.pool_count != table.row_count or plan.plan_sha256 != table.plan_sha256:
-                raise HeatmapValidationError("grid plan identity differs from evaluation table")
-            axes = []
-            for options in plan.resolved_axes:
-                names = tuple(options[0])
-                values = tuple(
-                    tuple(option[name] for name in names) if len(names) > 1 else option[names[0]]
-                    for option in options
-                )
-                axes.append(HeatmapAxis(names, values,
-                    "categorical" if len(names) > 1 else _inferred_scale(values)))
-            names = tuple(metrics) if metrics is not None else table.metric_projection.fields
-            unknown = set(names) - set(table.metric_projection.fields)
-            if unknown:
-                raise HeatmapValidationError(f"unknown heatmap metrics: {sorted(unknown)!r}")
-            shape = plan.coordinate_shape
-            metric_arrays = {name: table.metric_array(name).reshape(shape) for name in names}
-            valid = np.fromiter(
-                (table.status_at(ordinal) == "ok" for ordinal in range(table.row_count)),
-                dtype=np.bool_, count=table.row_count,
-            ).reshape(shape)
-            return cls(tuple(axes), metric_arrays, None, None, None, valid,
-                       dict(table.metadata), plan)
-        axes_raw = table.metadata.get("axes")
-        if axes_raw is None or axes_raw == []:
-            return cls._from_coordinates(table)
-        if not isinstance(axes_raw, Sequence) or isinstance(axes_raw, (str, bytes, bytearray)):
-            raise HeatmapValidationError("evaluation table has no grid axis metadata")
-        if any(not isinstance(axis, Mapping) for axis in axes_raw):
-            raise HeatmapValidationError("evaluation table contains malformed grid axis metadata")
-        raw_indices = table.metadata.get("coordinate_indices")
-        if not isinstance(raw_indices, Mapping):
-            raise HeatmapValidationError("evaluation table has no exact coordinate indices")
-        axes = tuple(HeatmapAxis.from_metadata(axis) for axis in axes_raw)
-        return cls._from_axes(table, axes, raw_indices)
-
-    @classmethod
-    def _from_coordinates(cls, table: EvaluationTable) -> "HeatmapDataset":
-        try:
-            dense_axes = dense_grid_axes(table)
-            raw_indices = dense_grid_indices(table, dense_axes)
-        except GridAnalysisError as exc:
-            raise HeatmapValidationError(str(exc)) from exc
-        axes = tuple(
-            HeatmapAxis(
-                names=axis.names,
-                values=axis.values,
-                scale=_inferred_scale(axis.values),
-            )
-            for axis in dense_axes
-        )
-        return cls._from_axes(table, axes, raw_indices)
-
-    @classmethod
-    def _from_axes(
-        cls,
-        table: EvaluationTable,
-        axes: tuple[HeatmapAxis, ...],
-        raw_indices: Mapping[str, Any],
-    ) -> "HeatmapDataset":
-        shape = tuple(len(axis.values) for axis in axes)
-        if not shape or math.prod(shape) != len(table.rows):
-            raise HeatmapValidationError(
-                f"table row count {len(table.rows)} does not cover declared shape {shape}"
-            )
-        metric_names = (
-            table.metric_projection.fields
-            if table.metric_projection is not None
-            else tuple(sorted({name for row in table.rows for name in row.metrics}))
-        )
-        metrics = {name: np.full(shape, np.nan, dtype=float) for name in metric_names}
-        candidate_ids = np.full(shape, "", dtype=object)
-        ordinals = np.full(shape, -1, dtype=int)
-        coordinates = np.empty(shape, dtype=object)
-        valid = np.zeros(shape, dtype=bool)
-        populated = np.zeros(shape, dtype=bool)
-        for row in table.rows:
-            raw_location = raw_indices.get(row.candidate_id)
-            if not isinstance(raw_location, (tuple, list)):
-                raise HeatmapValidationError(f"candidate {row.candidate_id!r} has no grid location")
-            location = tuple(int(index) for index in raw_location)
-            if len(location) != len(shape) or any(
-                index < 0 or index >= size for index, size in zip(location, shape, strict=True)
-            ):
-                raise HeatmapValidationError(f"candidate {row.candidate_id!r} has invalid grid location")
-            if populated[location]:
-                raise HeatmapValidationError(f"duplicate grid location {location}")
-            populated[location] = True
-            candidate_ids[location] = row.candidate_id
-            ordinals[location] = row.ordinal
-            coordinates[location] = dict(row.coordinates or {})
-            valid[location] = row.status == "ok"
-            for name in metric_names:
-                raw_value = row.metrics.get(name)
-                try:
-                    value = float(raw_value)
-                except (TypeError, ValueError):
-                    value = math.nan
-                metrics[name][location] = value
-        if not bool(np.all(populated)):
-            raise HeatmapValidationError("evaluation table does not cover the full Cartesian grid")
-        return cls(
-            axes=axes,
-            metrics=metrics,
-            candidate_ids=candidate_ids,
-            ordinals=ordinals,
-            coordinates=coordinates,
-            valid=valid,
-            metadata=dict(table.metadata),
-        )
 
 
 @dataclass
@@ -668,7 +554,7 @@ class HeatmapState:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": "fxsim_heatmap_state_v1",
+            "schema_version": "fxopt_heatmap_state_v1",
             "metric": self.metric,
             "metrics": list(self.metrics),
             "x_axis": self.x_axis,
@@ -720,10 +606,9 @@ class HeatmapState:
         metrics = tuple(dataset.metrics)
         resolved_metric = metric
         if resolved_metric is None:
-            try:
-                resolved_metric = first_numeric_metric(dataset.metrics)
-            except GridAnalysisError as exc:
-                raise HeatmapValidationError(str(exc)) from exc
+            if not metrics:
+                raise HeatmapValidationError("heatmap has no metrics")
+            resolved_metric = metrics[0]
         return cls(
             axes=dataset.axes,
             metrics=metrics,
@@ -803,7 +688,7 @@ class HeatmapTilesState:
             "slider_indices": dict(self.slider_indices),
         }
         return {
-            "schema_version": "fxsim_heatmap_state_v1",
+            "schema_version": "fxopt_heatmap_state_v1",
             "metric": self.tiles[0],
             "metrics": list(self.metrics),
             "tiles": [
@@ -944,13 +829,13 @@ class MatplotlibHeatmapView:
 
     def __init__(
         self,
-        data: EvaluationTable | HeatmapDataset,
+        data: HeatmapDataset,
         state: HeatmapState | None = None,
         *,
         on_select: Callable[[HeatmapSelection], None] | None = None,
         theme: PlotTheme = DEFAULT_THEME,
     ) -> None:
-        self.dataset = data if isinstance(data, HeatmapDataset) else HeatmapDataset.from_table(data)
+        self.dataset = data
         self.state = state or HeatmapState.default(self.dataset)
         if self.state.axes != self.dataset.axes:
             raise HeatmapValidationError("heatmap state axes differ from the dataset")
@@ -1121,7 +1006,7 @@ class MatplotlibHeatmapView:
 
 
 def render_heatmap(
-    data: EvaluationTable | HeatmapDataset,
+    data: HeatmapDataset,
     output: Path | str,
     *,
     state: HeatmapState | None = None,
@@ -1140,7 +1025,7 @@ def render_heatmap(
     also want the interactive widget figure call ``show()`` themselves when
     :func:`interactive_backend_active` reports a display-capable backend.
     """
-    dataset = data if isinstance(data, HeatmapDataset) else HeatmapDataset.from_table(data)
+    dataset = data
     resolved_state = state or HeatmapState.default(
         dataset,
         metric=metric,
@@ -1171,7 +1056,7 @@ class MatplotlibHeatmapTilesView:
 
     def __init__(
         self,
-        data: EvaluationTable | HeatmapDataset,
+        data: HeatmapDataset,
         *,
         tiles: Sequence[str],
         x_axis: str | None = None,
@@ -1181,7 +1066,7 @@ class MatplotlibHeatmapTilesView:
         mask: MaskSpec = MaskSpec(),
         theme: PlotTheme = DEFAULT_THEME,
     ) -> None:
-        self.dataset = data if isinstance(data, HeatmapDataset) else HeatmapDataset.from_table(data)
+        self.dataset = data
         self.state = HeatmapTilesState.default(
             self.dataset,
             tiles=tiles,
@@ -1358,7 +1243,7 @@ class MatplotlibHeatmapTilesView:
 
 
 def render_heatmap_tiles(
-    data: EvaluationTable | HeatmapDataset,
+    data: HeatmapDataset,
     output: Path | str,
     *,
     tiles: Sequence[str],
@@ -1379,7 +1264,7 @@ def render_heatmap_tiles(
     interactive widget figure call ``show()`` themselves when
     :func:`interactive_backend_active` reports a display-capable backend.
     """
-    dataset = data if isinstance(data, HeatmapDataset) else HeatmapDataset.from_table(data)
+    dataset = data
     view = MatplotlibHeatmapTilesView(
         dataset,
         tiles=tiles,

@@ -72,7 +72,7 @@ class CandidateResult:
     status: str = "ok"
     metrics: Mapping[str, float] = MappingProxyType({})
     error: str | None = None
-    economic_fingerprint: str | None = None
+    artifacts: Mapping[str, Any] | None = None
     ordinal: int = 0
 
     def __post_init__(self) -> None:
@@ -87,6 +87,13 @@ class CandidateResult:
             for name, value in self.metrics.items()
         }
         object.__setattr__(self, "metrics", MappingProxyType(copied))
+        artifacts = self.artifacts
+        if artifacts is not None:
+            if hasattr(artifacts, "model_dump"):
+                artifacts = artifacts.model_dump(exclude_none=True)
+            if not isinstance(artifacts, Mapping):
+                raise TypeError("artifacts must be a mapping")
+            object.__setattr__(self, "artifacts", MappingProxyType(dict(artifacts)))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -94,7 +101,7 @@ class CandidateResult:
             "status": self.status,
             "metrics": dict(self.metrics),
             "error": self.error,
-            "economic_fingerprint": self.economic_fingerprint,
+            "artifacts": None if self.artifacts is None else dict(self.artifacts),
             "ordinal": self.ordinal,
         }
 

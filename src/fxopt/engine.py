@@ -40,7 +40,7 @@ def _normalize_result(value: Any, candidate: Candidate, ordinal: int) -> Candida
             status=value.status,
             metrics=value.metrics,
             error=value.error,
-            economic_fingerprint=value.economic_fingerprint,
+            artifacts=value.artifacts,
             ordinal=ordinal,
         )
     candidate_id = _response_field(value, "candidate_id")
@@ -57,7 +57,7 @@ def _normalize_result(value: Any, candidate: Candidate, ordinal: int) -> Candida
         status=status,
         metrics=metrics,
         error=_response_field(value, "error"),
-        economic_fingerprint=_response_field(value, "economic_fingerprint"),
+        artifacts=_response_field(value, "artifacts"),
         ordinal=ordinal,
     )
 

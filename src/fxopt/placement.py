@@ -144,6 +144,8 @@ class EvaluatorFleet:
         session_id: str,
         batch_size: int,
         open_session: Mapping[str, Any] | None = None,
+        metric_projection: str | None = None,
+        observation: Mapping[str, Any] | None = None,
     ) -> None:
         if not lanes:
             raise ValueError("fleet requires at least one lane")
@@ -162,6 +164,8 @@ class EvaluatorFleet:
                 lane.client_factory,
                 session_id=session_id,
                 open_session=open_session,
+                metric_projection=metric_projection,
+                observation=observation,
             )
             for lane in normalized
         )

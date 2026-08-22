@@ -36,9 +36,10 @@ class CartesianGrid:
     def __iter__(self) -> Iterator[CandidateSpec]:
         names = tuple(sorted(self.axes))
         values = tuple(self.axes[name] for name in names)
-        for point in product(*values):
+        for ordinal, point in enumerate(product(*values)):
             yield CandidateSpec.from_payload(
-                merge_payload(self.defaults, dict(zip(names, point, strict=True)))
+                merge_payload(self.defaults, dict(zip(names, point, strict=True))),
+                ordinal=ordinal,
             )
 
     def iter_batches(self, batch_size: int) -> Iterator[tuple[CandidateSpec, ...]]:
@@ -61,7 +62,8 @@ class CartesianGrid:
             remainder, index = divmod(remainder, len(values))
             coordinates.append(values[index])
         return CandidateSpec.from_payload(
-            merge_payload(self.defaults, dict(zip(names, reversed(coordinates), strict=True)))
+            merge_payload(self.defaults, dict(zip(names, reversed(coordinates), strict=True))),
+            ordinal=ordinal,
         )
 
 

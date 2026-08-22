@@ -1,8 +1,0 @@
-[pair]
-id = "zchfeure"
-name = "ZCHF / EURE (Frankencoin / Monerium EUR)"
-base_token = "ZCHF"
-quote_token = "EURE"
-base_decimals = 18
-quote_decimals = 18
-tags = ["production", "fx", "gnosis", "allowlisted"]

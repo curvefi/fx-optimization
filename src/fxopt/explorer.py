@@ -1,0 +1,130 @@
+"""Interactive mature heatmaps backed directly by fxopt's two result files."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Sequence
+
+import numpy as np
+
+from curve_fx_sim.plotting.explorer import HeatmapExplorer
+from curve_fx_sim.plotting.heatmap import HeatmapAxis, HeatmapDataset
+from curve_fx_sim.plotting.masked_metrics import (
+    MASKED_METRIC_SOURCES,
+    SKEW_MASKED_METRICS,
+    SLIPPAGE_APY_MASK_SOURCES,
+)
+from curve_fx_sim.plotting.shiftclick_view import render_shiftclick_figure
+
+from .results import ResultColumns, read_result_columns
+from .shiftclick import trace_candidate
+
+
+def _metric_columns(requested: Sequence[str], available: Sequence[str]) -> tuple[str, ...]:
+    available_set = set(available)
+    needed: set[str] = set()
+    for name in requested:
+        source = MASKED_METRIC_SOURCES.get(name, name)
+        needed.add(source)
+        if name not in MASKED_METRIC_SOURCES:
+            continue
+        price_diff = next(
+            (item for item in ("max_7d_rel_price_diff", "max_rel_price_diff")
+             if item in available_set),
+            None,
+        )
+        if price_diff is not None:
+            needed.add(price_diff)
+        if name in SKEW_MASKED_METRICS:
+            needed.update(available_set.intersection({"max_7d_skew", "final_rel_price_diff"}))
+        slippage = SLIPPAGE_APY_MASK_SOURCES.get(name)
+        if slippage is not None:
+            needed.add(slippage)
+    return tuple(name for name in available if name in needed)
+
+
+def _dataset(columns: ResultColumns) -> HeatmapDataset:
+    raw_axes = columns.metadata.get("axes")
+    raw_shape = columns.metadata.get("shape")
+    if not isinstance(raw_axes, dict) or not isinstance(raw_shape, list):
+        raise ValueError("run has no Cartesian axis metadata")
+    names = tuple(sorted(raw_axes))
+    axes = tuple(HeatmapAxis((name,), tuple(raw_axes[name])) for name in names)
+    shape = tuple(int(value) for value in raw_shape)
+    if shape != tuple(len(axis.values) for axis in axes):
+        raise ValueError("run axis metadata and shape disagree")
+    if int(np.prod(shape)) != columns.row_count:
+        raise ValueError("interactive heatmaps require a complete Cartesian grid")
+
+    metrics = {
+        name: np.asarray(values, dtype=float).reshape(shape)
+        for name, values in columns.metrics.items()
+    }
+    return HeatmapDataset(
+        axes=axes,
+        metrics=metrics,
+        candidate_ids=columns.candidate_ids.reshape(shape),
+        ordinals=columns.ordinals.reshape(shape),
+        valid=(columns.statuses == "ok").reshape(shape),
+        metadata=dict(columns.metadata),
+    )
+
+
+def open_fxopt_explorer(
+    run_dir: str | Path,
+    *,
+    metrics: Sequence[str],
+    x_axis: str | None = None,
+    y_axis: str | None = None,
+    max_price_diff_bps: float | None = 100.0,
+    max_skew_percent: float | None = None,
+    slippage_bps: float | None = 20.0,
+    final_price_diff_bps: float | None = None,
+) -> HeatmapExplorer:
+    """Open the interactive UI from columnar run results."""
+    root = Path(run_dir).expanduser().resolve()
+    metadata = read_result_columns(root, metrics=())
+    selected_columns = _metric_columns(metrics, metadata.available_metrics)
+    columns = read_result_columns(root, metrics=selected_columns)
+    config_path = columns.metadata.get("config")
+    if not isinstance(config_path, str):
+        raise ValueError("run metadata has no source config for Shift-click replay")
+
+    def replay(selection: Any, mode: str) -> Path:
+        ordinal = int(selection.index)
+        candidate = columns.candidate_at(ordinal)
+        if candidate.candidate_id != selection.candidate_id:
+            raise ValueError("selected candidate does not match the stored result row")
+        output = root / "inspections" / f"ordinal-{ordinal}"
+        summary = trace_candidate(
+            config_path,
+            candidate=candidate,
+            ordinal=ordinal,
+            output_dir=output,
+            trace_interval=200,
+            trace_actions=False,
+            yb_mode=None if mode == "shift" else "off",
+        )
+        import json
+        payload = json.loads(summary.read_text())
+        trace_path = payload["result"]["artifacts"]["trace_path"]
+        figure = render_shiftclick_figure(Path(trace_path), title=f"{columns.run_id}: {ordinal}")
+        figure.show()
+        return summary
+
+    return HeatmapExplorer(
+        _dataset(columns),
+        metrics=tuple(metrics),
+        x_axis=x_axis,
+        y_axis=y_axis,
+        max_pricethr=max_price_diff_bps,
+        skewthr=max_skew_percent,
+        slipthr=slippage_bps,
+        final_pdiffthr=final_price_diff_bps,
+        run_id=columns.run_id,
+        run_dir=root,
+        on_replay=replay,
+    )
+
+
+__all__ = ["open_fxopt_explorer"]

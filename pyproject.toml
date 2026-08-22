@@ -1,7 +1,7 @@
 [project]
-name = "curve-fx-sim"
+name = "curve-fx-optimization"
 version = "0.1.0"
-description = "Curve FX pool simulation orchestrator, grids, optimization, replay, and evaluation"
+description = "Curve FX optimization workflow and plotting tools"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -14,7 +14,6 @@ dependencies = [
 ]
 
 [project.scripts]
-fxsim = "curve_fx_sim.cli:main"
 fxopt = "fxopt.cli:main"
 
 [build-system]

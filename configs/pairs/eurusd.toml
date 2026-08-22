@@ -1,6 +1,0 @@
-[pair]
-id = "eurusd"
-name = "Euro / US dollar"
-base_token = "EUR"
-quote_token = "USD"
-tags = ["production", "fx", "allowlisted"]

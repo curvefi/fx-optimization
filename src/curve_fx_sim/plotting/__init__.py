@@ -10,8 +10,7 @@ from .heatmap import (
     MatplotlibHeatmapView,
     render_heatmap,
 )
-from .explorer import HeatmapExplorer, format_axis_value, format_metric_value, open_explorer
-from .trajectory import Trajectory, TrajectoryError, load_trajectory, render_trajectory
+from .explorer import HeatmapExplorer, format_axis_value, format_metric_value
 
 __all__ = [
     "HeatmapAxis",
@@ -22,12 +21,7 @@ __all__ = [
     "MaskSpec",
     "MatplotlibHeatmapView",
     "HeatmapExplorer",
-    "Trajectory",
-    "TrajectoryError",
-    "load_trajectory",
     "render_heatmap",
     "format_axis_value",
     "format_metric_value",
-    "open_explorer",
-    "render_trajectory",
 ]

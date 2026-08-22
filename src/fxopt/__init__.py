@@ -10,6 +10,8 @@ from .results import (
     write_results,
 )
 from .run import RunConfig, run_config
+from .optimize import optimize_config
+from .shiftclick import trace_candidate
 
 __all__ = [
     "ArtifactPaths",
@@ -24,4 +26,6 @@ __all__ = [
     "read_results",
     "write_results",
     "run_config",
+    "optimize_config",
+    "trace_candidate",
 ]

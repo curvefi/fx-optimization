@@ -1,6 +1,0 @@
-[pair]
-id = "audf"
-name = "Australian dollar / US dollar"
-base_token = "AUD"
-quote_token = "USD"
-tags = ["production", "fx", "allowlisted"]

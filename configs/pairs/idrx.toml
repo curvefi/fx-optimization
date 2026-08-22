@@ -1,6 +1,0 @@
-[pair]
-id = "idrx"
-name = "Indonesian rupiah / US dollar"
-base_token = "IDR"
-quote_token = "USD"
-tags = ["production", "fx", "allowlisted"]

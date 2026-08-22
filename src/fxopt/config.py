@@ -126,15 +126,11 @@ class CandidateConfig:
                 raise ConfigError("axis paths contain a collision")
             if any(other[:size] == path for other in paths[:index] for size in range(1, len(other) + 1)):
                 raise ConfigError("axis paths contain a collision")
-            if ".".join(path) in defaults:
-                raise ConfigError("axis path collides with a flat default")
-            cursor: object = defaults
-            for part in path[:-1]:
-                if not isinstance(cursor, Mapping) or part not in cursor:
-                    break
-                cursor = cursor[part]
-                if not isinstance(cursor, Mapping):
-                    raise ConfigError("axis path collides with a scalar default")
+        for name, values in axes.items():
+            try:
+                merge_payload(defaults, {name: values[0]})
+            except CandidateError as exc:
+                raise ConfigError(str(exc)) from exc
 
         return cls(dict(defaults), axes)
 

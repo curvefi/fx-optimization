@@ -1,3 +1,1 @@
-"""Curve FX simulation orchestrator package."""
-
-__version__ = "0.1.0"
+"""Shared plotting package for the Curve FX optimization workflow."""

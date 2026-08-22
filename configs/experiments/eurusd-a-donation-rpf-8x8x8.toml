@@ -1,5 +1,5 @@
 [run]
-id = "eurusd-a-donation-16x16"
+id = "eurusd-a-donation-rpf-8x8x8"
 evaluator = "../../../curve-fx-arb-harness/build/native/arb_evaluator_f64"
 template = "../templates/eurusd-2024-monorepo.json"
 batch_size = 256
@@ -23,8 +23,16 @@ yb_mode = "off"
 
 [candidate.defaults]
 policy_params = []
-pool = { reserved_profit_fraction = 0.5, mid_fee = 0.0003, out_fee = 0.0003 }
+pool = { mid_fee = 0.0003, out_fee = 0.0003 }
 
 [candidate.axes]
-"pool.A" = { start = 1, stop = 200, count = 16, multiply = 10000 }
-"pool.donation_apy" = { start = 0, stop = 0.10, count = 16 }
+"pool.A" = { start = 1, stop = 200, count = 8, multiply = 10000 }
+"pool.donation_apy" = { start = 0, stop = 0.10, count = 8 }
+"pool.reserved_profit_fraction" = { start = 0, stop = 1, count = 8 }
+
+[optimization]
+budget = 128
+batch_size = 32
+metric = "apy_net_gm"
+maximize = true
+seed = 42

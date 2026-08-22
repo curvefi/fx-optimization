@@ -16,7 +16,7 @@ import numpy as np
 from .contract import Candidate, CandidateResult
 
 
-SCHEMA_VERSION = "fxopt.results.v1"
+SCHEMA_VERSION = "fxopt.results.v2"
 RUN_FILENAME = "run.json"
 RESULTS_FILENAME = "results.npz"
 
@@ -47,6 +47,57 @@ class ResultBundle:
 class ArtifactPaths:
     run_json: Path
     results_npz: Path
+
+
+@dataclass(frozen=True, slots=True)
+class ResultColumns:
+    """Selected NumPy columns plus lazy access to one stored candidate."""
+
+    root: Path
+    run_id: str
+    metadata: Mapping[str, Any]
+    available_metrics: tuple[str, ...]
+    candidate_ids: np.ndarray
+    ordinals: np.ndarray
+    statuses: np.ndarray
+    metrics: Mapping[str, np.ndarray]
+    errors: np.ndarray
+    error_present: np.ndarray
+
+    @property
+    def row_count(self) -> int:
+        return int(self.ordinals.shape[0])
+
+    def row_for_ordinal(self, ordinal: int) -> int:
+        if not isinstance(ordinal, int) or ordinal < 0:
+            raise ValueError("ordinal must be a non-negative integer")
+        rows = np.flatnonzero(self.ordinals == ordinal)
+        if len(rows) != 1:
+            raise ValueError(f"result artifact has no unique row for ordinal {ordinal}")
+        return int(rows[0])
+
+    def candidate_at(self, ordinal: int) -> Candidate:
+        """Construct only the candidate selected by its stored result ordinal."""
+        return self._candidate_at_row(self.row_for_ordinal(ordinal))
+
+    def _candidate_at_row(self, row: int) -> Candidate:
+        try:
+            with np.load(self.root / RESULTS_FILENAME, allow_pickle=False) as archive:
+                offsets = archive["candidate_policy_offsets"]
+                values = archive["candidate_policy_values"]
+                overrides = archive["candidate_pool_overrides"]
+        except (OSError, KeyError, ValueError) as exc:
+            raise ValueError(f"invalid {RESULTS_FILENAME}") from exc
+        start, stop = int(offsets[row]), int(offsets[row + 1])
+        try:
+            pool_overrides = json.loads(str(overrides[row]))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid stored candidate pool overrides") from exc
+        return Candidate(
+            candidate_id=str(self.candidate_ids[row]),
+            policy_params=values[start:stop].tolist(),
+            pool_overrides=pool_overrides,
+        )
 
 
 def _canonical_json_bytes(value: Any) -> bytes:
@@ -86,139 +137,166 @@ def _atomic_npz(path: Path, arrays: Mapping[str, np.ndarray]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _artifact_paths(root: Path) -> ArtifactPaths:
+    return ArtifactPaths(root / RUN_FILENAME, root / RESULTS_FILENAME)
+
+
+def _require_unused_artifacts(root: Path) -> ArtifactPaths:
+    paths = _artifact_paths(root)
+    existing = [path.name for path in (paths.run_json, paths.results_npz) if path.exists()]
+    if existing:
+        raise FileExistsError(f"result artifacts already exist: {', '.join(existing)}")
+    return paths
+
+
+def _metric_key(column: int) -> str:
+    return f"metric_{column:04d}"
+
+
 def write_results(bundle: ResultBundle, directory: str | Path) -> ArtifactPaths:
     """Write exactly ``run.json`` and ``results.npz`` for one completed run."""
     if not isinstance(bundle, ResultBundle):
         raise TypeError("bundle must be a ResultBundle")
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
+    paths = _require_unused_artifacts(root)
     metric_names = sorted({name for result in bundle.results for name in result.metrics})
-    metric_values = np.zeros((len(bundle.results), len(metric_names)), dtype=np.float64)
-    metric_present = np.zeros(metric_values.shape, dtype=np.bool_)
+    metric_values = {
+        name: np.full(len(bundle.results), np.nan, dtype=np.float64)
+        for name in metric_names
+    }
     for row, result in enumerate(bundle.results):
-        for column, name in enumerate(metric_names):
-            if name in result.metrics:
-                metric_values[row, column] = result.metrics[name]
-                metric_present[row, column] = True
+        for name, value in result.metrics.items():
+            metric_values[name][row] = value
+
+    policy_lengths = np.asarray([len(candidate.policy_params) for candidate in bundle.candidates])
+    policy_offsets = np.empty(len(bundle.candidates) + 1, dtype=np.int64)
+    policy_offsets[0] = 0
+    np.cumsum(policy_lengths, out=policy_offsets[1:])
+    policy_values = np.asarray(
+        [value for candidate in bundle.candidates for value in candidate.policy_params],
+        dtype=np.float64,
+    )
 
     run_payload = {
         "schema_version": SCHEMA_VERSION,
         "run_id": bundle.run_id,
         "metric_names": metric_names,
-        "candidates": [
-            {
-                "candidate_id": candidate.candidate_id,
-                "policy_params": list(candidate.policy_params),
-                "pool_overrides": dict(candidate.pool_overrides),
-            }
-            for candidate in bundle.candidates
-        ],
+        "candidate_count": len(bundle.candidates),
         "metadata": dict(bundle.metadata),
     }
-    run_path = root / RUN_FILENAME
-    npz_path = root / RESULTS_FILENAME
-    _atomic_bytes(run_path, _canonical_json_bytes(run_payload))
-    _atomic_npz(
-        npz_path,
-        {
-            "candidate_ids": np.asarray([r.candidate_id for r in bundle.results], dtype=str),
-            "ordinals": np.asarray([r.ordinal for r in bundle.results], dtype=np.int64),
-            "statuses": np.asarray([r.status for r in bundle.results], dtype=str),
-            "metrics": metric_values,
-            "metric_present": metric_present,
-            "errors": np.asarray([r.error or "" for r in bundle.results], dtype=str),
-            "error_present": np.asarray([r.error is not None for r in bundle.results], dtype=np.bool_),
-            "economic_fingerprints": np.asarray(
-                [r.economic_fingerprint or "" for r in bundle.results], dtype=str
-            ),
-            "fingerprint_present": np.asarray(
-                [r.economic_fingerprint is not None for r in bundle.results], dtype=np.bool_
-            ),
+    arrays = {
+        "candidate_ids": np.asarray([r.candidate_id for r in bundle.results], dtype=str),
+        "candidate_policy_offsets": policy_offsets,
+        "candidate_policy_values": policy_values,
+        "candidate_pool_overrides": np.asarray([
+            _canonical_json_bytes(dict(candidate.pool_overrides)).decode()
+            for candidate in bundle.candidates
+        ], dtype=str),
+        "ordinals": np.asarray([r.ordinal for r in bundle.results], dtype=np.int64),
+        "statuses": np.asarray([r.status for r in bundle.results], dtype=str),
+        "errors": np.asarray([r.error or "" for r in bundle.results], dtype=str),
+        "error_present": np.asarray([r.error is not None for r in bundle.results], dtype=np.bool_),
+        **{
+            _metric_key(column): metric_values[name]
+            for column, name in enumerate(metric_names)
         },
+    }
+    _atomic_npz(
+        paths.results_npz,
+        arrays,
     )
-    return ArtifactPaths(run_json=run_path, results_npz=npz_path)
+    _atomic_bytes(paths.run_json, _canonical_json_bytes(run_payload))
+    return paths
 
 
-def read_results(directory: str | Path) -> ResultBundle:
-    """Read and validate the canonical two-file result artifact."""
+def read_result_columns(
+    directory: str | Path,
+    *,
+    metrics: Sequence[str] | None = None,
+) -> ResultColumns:
+    """Load base result arrays and only the requested metric columns."""
     root = Path(directory)
-    run_path, npz_path = root / RUN_FILENAME, root / RESULTS_FILENAME
+    run_path = root / RUN_FILENAME
     try:
         payload = json.loads(run_path.read_bytes())
         if payload.get("schema_version") != SCHEMA_VERSION:
             raise ValueError("unsupported result artifact schema")
         metric_names = tuple(payload["metric_names"])
+        if len(set(metric_names)) != len(metric_names) or not all(
+            isinstance(name, str) and name for name in metric_names
+        ):
+            raise ValueError("invalid metric names")
+        count = int(payload["candidate_count"])
         metadata = payload.get("metadata", {})
+        if not isinstance(metadata, Mapping):
+            raise ValueError("invalid metadata")
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError(f"invalid {RUN_FILENAME}") from exc
 
+    selected = metric_names if metrics is None else tuple(dict.fromkeys(metrics))
+    missing = [name for name in selected if name not in metric_names]
+    if missing:
+        raise ValueError(f"unknown result metrics: {', '.join(missing)}")
+    columns = {name: index for index, name in enumerate(metric_names)}
     try:
-        with np.load(npz_path, allow_pickle=False) as archive:
-            arrays = {name: archive[name] for name in archive.files}
-    except (OSError, ValueError) as exc:
+        with np.load(root / RESULTS_FILENAME, allow_pickle=False) as archive:
+            candidate_ids = archive["candidate_ids"]
+            ordinals = archive["ordinals"]
+            statuses = archive["statuses"]
+            errors = archive["errors"]
+            error_present = archive["error_present"]
+            selected_metrics = {
+                name: archive[_metric_key(columns[name])]
+                for name in selected
+            }
+    except (OSError, KeyError, ValueError) as exc:
         raise ValueError(f"invalid {RESULTS_FILENAME}") from exc
-
-    ids = [str(value) for value in arrays["candidate_ids"].tolist()]
-    if "candidates" in payload:
-        candidates = tuple(
-            Candidate(
-                candidate_id=item["candidate_id"],
-                policy_params=tuple(item.get("policy_params", ())),
-                pool_overrides=item.get("pool_overrides", {}),
-            )
-            for item in payload["candidates"]
-        )
-        if ids != [candidate.candidate_id for candidate in candidates]:
-            raise ValueError("result candidate IDs do not match run.json")
-    else:
-        count = int(payload["candidate_count"])
-        offsets = arrays["candidate_policy_offsets"]
-        if offsets.shape != (count + 1,):
-            raise ValueError("candidate policy offsets have the wrong shape")
-        candidates = tuple(
-            Candidate(
-                candidate_id=ids[row],
-                policy_params=arrays["candidate_policy_values"][offsets[row] : offsets[row + 1]].tolist(),
-                pool_overrides=json.loads(str(arrays["candidate_pool_overrides"][row])),
-            )
-            for row in range(count)
-        )
-    count = len(candidates)
-    if arrays["metrics"].shape != (count, len(metric_names)):
-        raise ValueError("result metric matrix has the wrong shape")
-    if arrays["metric_present"].shape != arrays["metrics"].shape:
-        raise ValueError("result metric presence matrix has the wrong shape")
-    if any(
-        array.shape[0] != count
-        for name, array in arrays.items()
-        if name not in {"metrics", "metric_present", "candidate_policy_values", "candidate_policy_offsets"}
-    ):
+    arrays = (candidate_ids, ordinals, statuses, errors, error_present, *selected_metrics.values())
+    if any(array.shape != (count,) for array in arrays):
         raise ValueError("result arrays have inconsistent lengths")
+    if len(set(int(value) for value in ordinals.tolist())) != count:
+        raise ValueError("result ordinals must be unique")
+    return ResultColumns(
+        root=root,
+        run_id=payload["run_id"],
+        metadata=dict(metadata),
+        available_metrics=metric_names,
+        candidate_ids=candidate_ids,
+        ordinals=ordinals,
+        statuses=statuses,
+        metrics=MappingProxyType(selected_metrics),
+        errors=errors,
+        error_present=error_present,
+    )
+
+
+def read_results(directory: str | Path) -> ResultBundle:
+    """Read and validate the canonical two-file result artifact."""
+    columns = read_result_columns(directory)
+    candidates = tuple(columns._candidate_at_row(row) for row in range(columns.row_count))
     results: list[CandidateResult] = []
-    for row in range(count):
+    for row in range(columns.row_count):
         metrics = {
-            str(name): float(arrays["metrics"][row, column])
-            for column, name in enumerate(metric_names)
-            if bool(arrays["metric_present"][row, column])
+            name: float(values[row])
+            for name, values in columns.metrics.items()
+            if np.isfinite(values[row])
         }
-        error = str(arrays["errors"][row]) if bool(arrays["error_present"][row]) else None
-        fingerprint = (
-            str(arrays["economic_fingerprints"][row])
-            if bool(arrays["fingerprint_present"][row])
-            else None
-        )
+        error = str(columns.errors[row]) if bool(columns.error_present[row]) else None
         results.append(
             CandidateResult(
-                candidate_id=ids[row],
-                status=str(arrays["statuses"][row]),
+                candidate_id=str(columns.candidate_ids[row]),
+                status=str(columns.statuses[row]),
                 metrics=metrics,
                 error=error,
-                economic_fingerprint=fingerprint,
-                ordinal=int(arrays["ordinals"][row]),
+                ordinal=int(columns.ordinals[row]),
             )
         )
     return ResultBundle(
-        run_id=payload["run_id"], candidates=candidates, results=tuple(results), metadata=metadata
+        run_id=columns.run_id,
+        candidates=candidates,
+        results=tuple(results),
+        metadata=columns.metadata,
     )
 
 
@@ -230,6 +308,7 @@ class ResultWriter:
             raise ValueError("run_id must be a non-empty string")
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
+        _require_unused_artifacts(self.directory)
         self._temporary = Path(tempfile.mkdtemp(prefix=".fxopt-", dir=self.directory))
         self._spool_path = self._temporary / "rows.jsonl"
         self._spool = self._spool_path.open("wb")
@@ -241,7 +320,6 @@ class ResultWriter:
             "max_id": 1,
             "max_status": 1,
             "max_error": 1,
-            "max_fp": 1,
             "max_overrides": 2,
             "params": 0,
         }
@@ -251,6 +329,12 @@ class ResultWriter:
     def retained_rows(self) -> int:
         """Always zero: rows live in the temporary spool, not in Python objects."""
         return 0
+
+    def update_metadata(self, **values: Any) -> None:
+        """Add small run-level facts before final publication."""
+        if self._closed:
+            raise RuntimeError("result writer is closed")
+        self._metadata.update(values)
 
     def append(self, candidates: Sequence[Candidate], results: Sequence[CandidateResult]) -> None:
         if self._closed:
@@ -268,7 +352,6 @@ class ResultWriter:
             self._stats["max_id"] = max(self._stats["max_id"], len(candidate_data["candidate_id"]))
             self._stats["max_status"] = max(self._stats["max_status"], len(result_data["status"]))
             self._stats["max_error"] = max(self._stats["max_error"], len(result_data.get("error") or ""))
-            self._stats["max_fp"] = max(self._stats["max_fp"], len(result_data.get("economic_fingerprint") or ""))
             overrides = _canonical_json_bytes(candidate_data.get("pool_overrides", {})).decode()
             self._stats["max_overrides"] = max(self._stats["max_overrides"], len(overrides))
             self._stats["params"] += len(candidate_data.get("policy_params", ()))
@@ -292,7 +375,6 @@ class ResultWriter:
             root = self.directory
             staging = Path(tempfile.mkdtemp(prefix=".fxopt-final-", dir=root))
             try:
-                shape = (self._count, len(metric_names))
                 arrays = {
                     "candidate_ids": np.lib.format.open_memmap(staging / "ids.npy", mode="w+", dtype=f"U{stats['max_id']}", shape=(self._count,)),
                     "candidate_policy_offsets": np.lib.format.open_memmap(staging / "offsets.npy", mode="w+", dtype=np.int64, shape=(self._count + 1,)),
@@ -300,15 +382,22 @@ class ResultWriter:
                     "candidate_pool_overrides": np.lib.format.open_memmap(staging / "overrides.npy", mode="w+", dtype=f"U{stats['max_overrides']}", shape=(self._count,)),
                     "ordinals": np.lib.format.open_memmap(staging / "ordinals.npy", mode="w+", dtype=np.int64, shape=(self._count,)),
                     "statuses": np.lib.format.open_memmap(staging / "statuses.npy", mode="w+", dtype=f"U{stats['max_status']}", shape=(self._count,)),
-                    "metrics": np.lib.format.open_memmap(staging / "metrics.npy", mode="w+", dtype=np.float64, shape=shape),
-                    "metric_present": np.lib.format.open_memmap(staging / "present.npy", mode="w+", dtype=np.bool_, shape=shape),
                     "errors": np.lib.format.open_memmap(staging / "errors.npy", mode="w+", dtype=f"U{stats['max_error']}", shape=(self._count,)),
                     "error_present": np.lib.format.open_memmap(staging / "error_present.npy", mode="w+", dtype=np.bool_, shape=(self._count,)),
-                    "economic_fingerprints": np.lib.format.open_memmap(staging / "fingerprints.npy", mode="w+", dtype=f"U{stats['max_fp']}", shape=(self._count,)),
-                    "fingerprint_present": np.lib.format.open_memmap(staging / "fp_present.npy", mode="w+", dtype=np.bool_, shape=(self._count,)),
+                    **{
+                        _metric_key(column): np.lib.format.open_memmap(
+                            staging / f"metric-{column}.npy",
+                            mode="w+",
+                            dtype=np.float64,
+                            shape=(self._count,),
+                        )
+                        for column, _name in enumerate(metric_names)
+                    },
                 }
                 offsets, param_at = arrays["candidate_policy_offsets"], 0
                 columns = {name: index for index, name in enumerate(metric_names)}
+                for column in columns.values():
+                    arrays[_metric_key(column)].fill(np.nan)
                 for index, row in enumerate(self._rows()):
                     candidate, result = row["candidate"], row["result"]
                     arrays["candidate_ids"][index] = candidate["candidate_id"]
@@ -318,12 +407,9 @@ class ResultWriter:
                     offsets[index + 1] = param_at
                     arrays["candidate_pool_overrides"][index] = _canonical_json_bytes(candidate.get("pool_overrides", {})).decode()
                     arrays["ordinals"][index], arrays["statuses"][index] = result["ordinal"], result["status"]
-                    arrays["metrics"][index] = 0.0
-                    arrays["metric_present"][index] = False
                     for name, value in result.get("metrics", {}).items():
-                        arrays["metrics"][index, columns[name]], arrays["metric_present"][index, columns[name]] = value, True
+                        arrays[_metric_key(columns[name])][index] = value
                     arrays["errors"][index], arrays["error_present"][index] = result.get("error") or "", result.get("error") is not None
-                    arrays["economic_fingerprints"][index], arrays["fingerprint_present"][index] = result.get("economic_fingerprint") or "", result.get("economic_fingerprint") is not None
                 arrays["candidate_policy_offsets"][0] = 0
                 for array in arrays.values():
                     array.flush()

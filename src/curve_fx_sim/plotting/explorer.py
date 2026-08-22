@@ -1,17 +1,10 @@
-"""Small interactive N-D heatmap explorer over the attested table API.
-
-The explorer deliberately keeps the table and manifest as its only sources of
-truth.  A cell click therefore carries a ``SelectionRef`` rather than
-reconstructing pool parameters from displayed axis values.
-"""
+"""Interactive N-D heatmap explorer over a prepared :class:`HeatmapDataset`."""
 
 from __future__ import annotations
 
 import json
 import math
 import os
-import re
-import secrets
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -30,24 +23,18 @@ from matplotlib.ticker import (
 )
 from matplotlib.widgets import RadioButtons, Slider
 
-from ..artifacts.attestation import find_attested_artifact
-from ..artifacts.io import atomic_write_json
-from ..artifacts.manifest import load_manifest
-from ..artifacts.store import RunStore
-from ..artifacts.tables import EvaluationTable
-from ..grids.model import CartesianGridPlan
-from ..evaluation.selection import SelectionRef
-from ..grids.model import coordinate_signature
-from ..specs.shiftclick import ShiftclickSpec
 from .heatmap import (
     HeatmapAxis,
     HeatmapDataset,
     HeatmapSelection,
     HeatmapTilesState,
     MaskSpec,
+    SelectionRef,
+    atomic_write_json,
     _auto_log,
     _edges,
 )
+
 from .masked_metrics import (
     MASKED_METRIC_SOURCES,
     SKEW_MASKED_METRICS,
@@ -56,7 +43,6 @@ from .masked_metrics import (
 
 _LN2 = math.log(2.0)
 _MAX_TICKS = 12
-_SPARSE_TRACE_POINTS = 10_000
 
 
 @dataclass(frozen=True)
@@ -350,120 +336,12 @@ def _finite_max(dataset: HeatmapDataset, metric: str, scale: float = 1.0) -> flo
     return maximum if math.isfinite(maximum) else None
 
 
-def _mapping_id(value: Any) -> str:
-    if isinstance(value, Mapping):
-        return str(value.get("id") or value.get("policy_id") or "")
-    return str(value or "")
-
-
-def _template_frequency(template: Mapping[str, Any]) -> float | None:
-    pool = template.get("pool") if isinstance(template.get("pool"), Mapping) else template
-    if isinstance(template.get("pools"), Sequence) and template["pools"]:
-        first = template["pools"][0]
-        if isinstance(first, Mapping):
-            pool = first.get("pool", first)
-    if not isinstance(pool, Mapping):
-        return None
-    value = pool.get("donation_frequency")
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if math.isfinite(number) and number > 0 else None
-
-
-def resolve_donation_frequency(
-    manifest: Mapping[str, Any],
-    *,
-    source_row: Any | None = None,
-    project_root: Path | None = None,
-    template: Mapping[str, Any] | None = None,
-) -> float | None:
-    """Resolve the cadence from attested replay data, pool overrides, or template.
-
-    Trace records do not carry this pool initialization field.  The order keeps
-    a selected row's attested override ahead of a scenario default and only
-    reads a template whose manifest digest was already checked by the caller.
-    """
-    resolved = manifest.get("resolved_spec", {})
-    plan = resolved.get("replay_plan", {}) if isinstance(resolved, Mapping) else {}
-    override_maps = []
-    if isinstance(plan, Mapping):
-        override_maps.append(plan.get("pool_overrides"))
-    if source_row is not None:
-        override_maps.append(getattr(source_row, "pool_overrides", None))
-    for overrides in override_maps:
-        if isinstance(overrides, Mapping):
-            try:
-                value = float(overrides.get("donation_frequency"))
-            except (TypeError, ValueError):
-                value = 0.0
-            if math.isfinite(value) and value > 0:
-                return value
-    if template is not None:
-        frequency = _template_frequency(template)
-        if frequency is not None:
-            return frequency
-    scenario = (
-        plan.get("scenario_spec")
-        if isinstance(plan, Mapping) and isinstance(plan.get("scenario_spec"), Mapping)
-        else resolved.get("scenario") if isinstance(resolved, Mapping) else None
-    )
-    if isinstance(scenario, Mapping):
-        inline = scenario.get("template")
-        if isinstance(inline, Mapping):
-            frequency = _template_frequency(inline)
-            if frequency is not None:
-                return frequency
-        path = scenario.get("template_path")
-        if project_root is not None and path:
-            template_path = (project_root.resolve() / str(path)).resolve()
-            if template_path.is_file():
-                try:
-                    from ..artifacts.io import sha256_path
-
-                    expected = scenario.get("template_sha256")
-                    if expected and sha256_path(template_path).lower() != str(expected).lower():
-                        return None
-                    parsed = json.loads(template_path.read_text(encoding="utf-8"))
-                except (OSError, ValueError, json.JSONDecodeError):
-                    return None
-                frequency = _template_frequency(parsed)
-                if frequency is not None:
-                    return frequency
-    return None
-
-
-def sparse_trace_interval(
-    manifest: Mapping[str, Any],
-    *,
-    target_points: int = _SPARSE_TRACE_POINTS,
-) -> int:
-    """Choose a deterministic inspect stride from the attested scenario span."""
-    if target_points <= 0:
-        raise ValueError("target_points must be positive")
-    resolved = manifest.get("resolved_spec", {})
-    scenario = resolved.get("scenario", {}) if isinstance(resolved, Mapping) else {}
-    if not isinstance(scenario, Mapping):
-        return 1
-    try:
-        candles = int(scenario.get("n_candles", 0) or 0)
-        start = int(scenario.get("start_time", 0) or 0)
-        end = int(scenario.get("end_time", 0) or 0)
-    except (TypeError, ValueError):
-        return 1
-    # The evaluator normally produces a market and arbitrage event per minute.
-    # This is only an observation stride; it never changes simulation decisions.
-    minutes = candles if candles > 0 else max(0, (end - start) // 60)
-    return max(1, (2 * minutes) // target_points)
-
-
 class HeatmapExplorer:
     """Three-window heatmap, controls, and exact-cell metrics explorer."""
 
     def __init__(
         self,
-        data: EvaluationTable | HeatmapDataset,
+        data: HeatmapDataset,
         *,
         metrics: Sequence[str] | None = None,
         ncol: int = 3,
@@ -477,26 +355,11 @@ class HeatmapExplorer:
         final_pdiffthr: float | None = None,
         run_id: str | None = None,
         run_dir: Path | None = None,
-        store: RunStore | None = None,
-        manifest: Mapping[str, Any] | None = None,
-        site: str = "local",
-        blade: str | None = None,
         on_replay: Callable[[SelectionRef, str], Any] | None = None,
-        plan: CartesianGridPlan | None = None,
     ) -> None:
-        requested = tuple(metrics) if metrics is not None else None
-        load_metrics = requested
-        if isinstance(data, EvaluationTable) and data.is_columnar_grid and requested is not None:
-            projected = set(data.metric_projection.fields)
-            needed = {MASKED_METRIC_SOURCES.get(name, name) for name in requested}
-            if any(name in MASKED_METRIC_SOURCES for name in requested):
-                needed.update(projected.intersection({
-                    "max_7d_rel_price_diff", "max_rel_price_diff", "max_7d_skew",
-                    "final_rel_price_diff", *SLIPPAGE_APY_MASK_SOURCES.values(),
-                }))
-            load_metrics = tuple(name for name in data.metric_projection.fields if name in needed)
-        self.dataset = data if isinstance(data, HeatmapDataset) else HeatmapDataset.from_table(
-            data, plan=plan, metrics=load_metrics)
+        if not isinstance(data, HeatmapDataset):
+            raise TypeError("HeatmapExplorer requires a HeatmapDataset")
+        self.dataset = data
         available = tuple(self.dataset.metrics) + tuple(sorted(MASKED_METRIC_SOURCES))
         self.metrics = tuple(metrics) if metrics is not None else tuple(self.dataset.metrics)
         missing = [name for name in self.metrics if name not in available]
@@ -506,25 +369,10 @@ class HeatmapExplorer:
             raise ValueError("explorer requires at least one metric")
         if ncol < 1:
             raise ValueError("ncol must be positive")
-        self.run_id = run_id or (str(manifest.get("run_id")) if manifest else "")
-        self.run_dir = run_dir.resolve() if run_dir is not None else None
-        self.store = store
-        self.manifest = manifest
-        self.site = site
-        self.blade = blade
+        self.run_id = run_id or ""
         self.on_replay = on_replay
-        self.plan = plan or self.dataset.plan
         self._updating_radios = False
-        self._replay_running = False
         self.last_selection: HeatmapSelection | None = None
-        self._source_row = None
-        self._source_table = data if isinstance(data, EvaluationTable) else None
-        if isinstance(data, EvaluationTable) and not data.is_columnar_grid:
-            keys = [(row.candidate_id, row.ordinal, coordinate_signature(row.coordinates or {}))
-                    for row in data.rows]
-            if len(keys) != len(set(keys)):
-                raise ValueError("evaluation table duplicates an exact source-row identity")
-            self._source_row = dict(zip(keys, data.rows, strict=True))
         mask = MaskSpec(
             max_price_diff_bps=max_pricethr,
             max_skew_percent=skewthr,
@@ -598,6 +446,14 @@ class HeatmapExplorer:
         ]
 
     def _rebuild_controls(self) -> None:
+        for widget in (
+            getattr(self, "x_radio", None),
+            getattr(self, "y_radio", None),
+            *(slider for _, slider in getattr(self, "sliders", ())),
+            *getattr(self, "_threshold_sliders", {}).values(),
+        ):
+            if widget is not None:
+                widget.disconnect_events()
         self.fig_controls.clear()
         _window_title(self.fig_controls, "Controls")
         active_keys = [axis.key for axis in self.dataset.axes if not axis.is_singleton]
@@ -924,104 +780,11 @@ class HeatmapExplorer:
         self.fig_metrics.canvas.draw_idle()
 
     def replay(self, selection: HeatmapSelection, mode: str = "shift") -> Any:
-        """Replay one attested candidate; all parameter extraction stays in normalize_selection."""
-        source_kind = "optimization" if self.manifest and self.manifest.get("run_kind") == "optimization" else "grid"
+        """Forward an exact selection to the caller's local replay callback."""
         selection_ref = selection.to_selection_ref(self.run_id)
-        if source_kind == "optimization":
-            selection_ref = SelectionRef(self.run_id, "optimizer_winner", selection.ordinal, dict(selection.coordinates), selection.candidate_id, ("heatmap",))
         if self.on_replay is not None:
             return self.on_replay(selection_ref, mode)
-        if self.manifest is None or self.run_dir is None:
-            raise RuntimeError("exact replay requires a manifest-backed run directory")
-        if self._replay_running:
-            return None
-        artifact_path = self.run_dir / "evaluator_artifact"
-        artifact_selected = artifact_path.is_dir()
-        if not artifact_selected:
-            raise RuntimeError("exact replay requires the source evaluator artifact")
-        self._replay_running = True
-        try:
-            resolved = self.manifest.get("resolved_spec", {})
-            pair_id = _mapping_id(resolved.get("pair")) if isinstance(resolved, Mapping) else ""
-            scenario_id = _mapping_id(resolved.get("scenario")) if isinstance(resolved, Mapping) else ""
-            policy_id = _mapping_id(resolved.get("policy")) if isinstance(resolved, Mapping) else ""
-            policy_id = policy_id or str(self.manifest.get("core", {}).get("policy_id", ""))
-            replay_id = "view-" + re.sub(r"[^A-Za-z0-9_.-]+", "-", self.run_id) + "-" + secrets.token_hex(8)
-            source_yb = mode == "shift"
-            spec = ShiftclickSpec(
-                id=replay_id,
-                source_kind=source_kind,
-                source_run_id=self.run_id,
-                selection_kind="best" if source_kind == "optimization" else "candidate_id",
-                selection_value=None if source_kind == "optimization" else selection.candidate_id,
-                pair_id=pair_id,
-                scenario_id=scenario_id,
-                policy_id=policy_id,
-                trace_interval=(1 if source_yb else sparse_trace_interval(self.manifest)),
-                trace_actions=True,
-                tags=(
-                    "interactive",
-                    "observation:source-yb" if source_yb else "observation:yb-disabled",
-                ),
-            )
-            if self.store is None:
-                raise RuntimeError("exact replay requires an explicit project RunStore")
-            store = self.store
-            if self.site == "local":
-                from ..shiftclick import run_shiftclick
-
-                result = run_shiftclick(spec, store=store, selection=selection_ref)
-            else:
-                from ..execution.site import load_site_profile
-                from ..shiftclick import run_remote_shiftclick
-
-                profile = load_site_profile(self.site, root=store.root_dir)
-                blade = self.blade or (profile.cluster.blades[0] if profile.cluster.blades else None)
-                if blade is None:
-                    raise RuntimeError("remote replay requires a configured blade")
-                with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as stream:
-                    stream.write("[shiftclick]\n")
-                    for key, value in spec.to_dict().items():
-                        if isinstance(value, list):
-                            stream.write(f"{key} = {json.dumps(value)}\n")
-                        elif isinstance(value, bool):
-                            stream.write(f"{key} = {str(value).lower()}\n")
-                        elif value is not None:
-                            stream.write(f"{key} = {json.dumps(value)}\n")
-                    spec_path = Path(stream.name)
-                try:
-                    result = run_remote_shiftclick(spec, spec_path=spec_path, store=store, site=profile, blade=blade)
-                finally:
-                    spec_path.unlink(missing_ok=True)
-            self._show_replay(result, selection)
-            return result
-        finally:
-            self._replay_running = False
-
-    def _show_replay(self, result: Any, selection: HeatmapSelection) -> None:
-        from .shiftclick_view import render_shiftclick_figure
-
-        run_dir = Path(result.run_dir)
-        manifest = load_manifest(run_dir / "manifest.json", expected_kind="shiftclick")
-        trace = find_attested_artifact(
-            manifest, run_dir=run_dir, kind="replay_trace_npz", verify_digest=True)
-        companion = find_attested_artifact(
-            manifest, run_dir=run_dir, kind="replay_trace_companion", verify_digest=True)
-        key = (selection.candidate_id, selection.ordinal,
-               coordinate_signature(selection.coordinates))
-        source_row = self._source_row.get(key) if self._source_row else None
-        if source_row is None and self._source_table is not None and self.plan is not None:
-            source_row = self._source_table.row_at(selection.ordinal, self.plan)
-        cadence = resolve_donation_frequency(
-            manifest,
-            source_row=source_row,
-            project_root=self.store.root_dir if self.store is not None else None,
-        )
-        figure = render_shiftclick_figure(
-            trace, companion_path=companion, title=run_dir.name,
-            fee_source="both", donation_frequency=cadence)
-        _window_title(figure, "Shiftclick")
-        figure.canvas.draw_idle()
+        raise RuntimeError("replay requires an on_replay callback")
 
     def save(self, output: Path | str, *, state_path: Path | str | None = None) -> tuple[Path, Path]:
         image_path = Path(output)
@@ -1053,34 +816,8 @@ class HeatmapExplorer:
             plt.close(figure)
 
 
-def open_explorer(run_dir: Path, **kwargs: Any) -> HeatmapExplorer:
-    """Load and verify one grid/optimization run before constructing the explorer."""
-    run_dir = Path(run_dir).resolve()
-    manifest = load_manifest(run_dir / "manifest.json")
-    from ..artifacts.attestation import load_attested_evaluation_table
-
-    table, table_path = load_attested_evaluation_table(manifest, run_dir=run_dir, verify_digest=True)
-    plan = None
-    if table.is_columnar_grid:
-        from ..evaluation.plans import ScenarioKey
-        from ..evaluation.selected import SelectedEvaluator
-        from ..grids.runner import load_grid_plan
-
-        selected = SelectedEvaluator.load(run_dir / "evaluator_artifact")
-        raw = manifest["grid"]["plan"]["scenario_key"]
-        scenario = ScenarioKey(str(raw["identity_json"]).encode(), str(raw["sha256"])).validated()
-        plan = load_grid_plan(manifest, selected_evaluator=selected, scenario=scenario)
-    explorer = HeatmapExplorer(table, plan=plan, run_id=str(manifest["run_id"]),
-                               run_dir=run_dir, manifest=manifest, **kwargs)
-    explorer.state.source = table_path.name
-    return explorer
-
-
 __all__ = [
     "HeatmapExplorer",
     "format_axis_value",
     "format_metric_value",
-    "open_explorer",
-    "resolve_donation_frequency",
-    "sparse_trace_interval",
 ]

@@ -151,7 +151,7 @@ provides-extras = ["dev"]
 dev = [{ name = "pytest", specifier = ">=8.0.0" }]
 
 [[package]]
-name = "curve-fx-sim"
+name = "curve-fx-optimization"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

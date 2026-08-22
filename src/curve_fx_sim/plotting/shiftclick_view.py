@@ -3,11 +3,12 @@
 Renders the exact legacy look: stacked shared-x panels for prices, rolling
 90d annualized LP net APY with GM floor shading, YB releverage APY + balance
 sheet, pool skew with binned pool fee, and 1% TVL slippage, over a datetime
-axis. Input is the attested candidate-wide replay NPZ produced by Shift-click.
+axis. Input is the raw evaluator JSON trace produced by Shift-click.
 """
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -15,8 +16,6 @@ from typing import Any, Mapping, Sequence
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
-
-from .trajectory import load_replay_records
 
 SEC_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
 ROLLING_APY_WINDOW_DAYS = 90
@@ -267,95 +266,6 @@ def _load_embedded_yb_balance_path(detailed: Mapping[str, np.ndarray], max_point
     return result
 
 
-def _load_executed_fee_actions(path: Path, companion: Path, scenario_index: int) -> dict[str, np.ndarray] | None:
-    actions = load_replay_records(path, companion_path=companion, kind="exchange", scenario_index=scenario_index)
-    rows = []
-    for action in actions:
-        if not isinstance(action, dict) or action.get("type") != "exchange":
-            continue
-        ts = action.get("ts")
-        dy_after_fee = action.get("dy_after_fee")
-        fee_tokens = action.get("fee_tokens")
-        if ts is None or dy_after_fee is None or fee_tokens is None:
-            continue
-        dy_after_fee = float(dy_after_fee)
-        fee_tokens = float(fee_tokens)
-        gross = dy_after_fee + fee_tokens
-        if not (gross > 0.0):
-            continue
-        rows.append((float(ts), fee_tokens / gross))
-    if not rows:
-        return None
-    rows.sort(key=lambda item: item[0])
-    return {
-        "timestamps": np.array([row[0] for row in rows], dtype=np.float64),
-        "fee": np.array([row[1] for row in rows], dtype=np.float64),
-    }
-
-
-def _infer_donation_frequency(path: Path, companion: Path, scenario_index: int) -> float:
-    """Infer cadence only when donation action metadata is unambiguous."""
-    try:
-        donations = load_replay_records(path, companion_path=companion, kind="donation", scenario_index=scenario_index)
-    except (OSError, TypeError, ValueError):
-        return 0.0
-    if len(donations) < 2:
-        return 0.0
-
-    frequencies = []
-    for action in donations:
-        try:
-            frequency = float(action.get("freq_s", 0.0))
-        except (TypeError, ValueError):
-            continue
-        if np.isfinite(frequency) and frequency > 0.0:
-            frequencies.append(frequency)
-    if len(frequencies) >= 2:
-        cadence = frequencies[0]
-        return cadence if all(
-            np.isclose(frequency, cadence, rtol=0.0, atol=1e-6) for frequency in frequencies
-        ) else 0.0
-
-    timestamps = []
-    for action in donations:
-        try:
-            timestamp = float(action["ts"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if np.isfinite(timestamp):
-            timestamps.append(timestamp)
-    if len(timestamps) < 2:
-        return 0.0
-    deltas = np.diff(sorted(timestamps))
-    cadence = float(deltas[0])
-    if cadence <= 0.0 or not np.all(np.isclose(deltas, cadence, rtol=0.0, atol=1e-6)):
-        return 0.0
-    return cadence
-
-
-def _plot_executed_fee_axis(ax, executed_fee, *, max_points: int = 5000, spine_offset=None):
-    if executed_fee is None:
-        return None
-    if spine_offset is not None:
-        ax.spines["right"].set_position(("axes", spine_offset))
-        ax.spines["right"].set_visible(True)
-    t = executed_fee["timestamps"]
-    fee = executed_fee["fee"]
-    if len(t) == 0:
-        return None
-    if max_points > 0 and len(t) > max_points:
-        idx = np.linspace(0, len(t) - 1, max_points, dtype=int)
-        t = t[idx]
-        fee = fee[idx]
-    dates = [datetime.fromtimestamp(ts, timezone.utc) for ts in t]
-    fee_pct = fee * 100.0
-    ax.plot(dates, fee_pct, linewidth=0.75, color="tab:green", alpha=0.8, label="Executed pool fee")
-    ax.set_ylabel("Pool fee (%)", color="tab:green")
-    ax.tick_params(axis="y", labelcolor="tab:green")
-    ax.legend(loc="lower right")
-    return ax
-
-
 def _plot_yb_axis(ax, yb_path):
     yb_dates = [datetime.fromtimestamp(t, timezone.utc) for t in yb_path["t"]]
     growth_pct = (yb_path["growth"] - 1.0) * 100.0
@@ -563,8 +473,6 @@ def _plot_pool_skew_axis(ax, dates, pool_skew):
 def render_shiftclick_figure(
     trace_path: Path,
     *,
-    companion_path: Path,
-    scenario_index: int = 0,
     title: str | None = None,
     fee_source: str = "sampled",
     bin_hours: float = 6.0,
@@ -572,8 +480,11 @@ def render_shiftclick_figure(
     max_points: int = DEFAULT_MAX_POINTS,
     donation_frequency: float | None = None,
 ):
-    """Build the legacy multi-panel view from one replay-archive scenario."""
-    records = load_replay_records(trace_path, companion_path=companion_path, scenario_index=scenario_index)
+    """Build the multi-panel view from a raw evaluator trace."""
+    payload = json.loads(Path(trace_path).read_text(encoding="utf-8"))
+    if not isinstance(payload, list) or any(not isinstance(row, Mapping) for row in payload):
+        raise ValueError("raw evaluator trace must be an array of objects")
+    records = tuple(payload)
     detailed = _trace_to_detailed(records)
     timestamps = detailed["timestamps"]
     price_scale = detailed["price_scale"]
@@ -591,7 +502,7 @@ def render_shiftclick_figure(
     lp_xcp_profit = detailed["lp_xcp_profit"]
     donation_apy = detailed["donation_apy"]
     if donation_frequency is None:
-        donation_frequency = _infer_donation_frequency(trace_path, companion_path, scenario_index)
+        donation_frequency = 0.0
     else:
         try:
             donation_frequency = float(donation_frequency)
@@ -634,12 +545,6 @@ def render_shiftclick_figure(
 
     yb_path = _load_embedded_yb_path(detailed, max_points)
     yb_balance_path = _load_embedded_yb_balance_path(detailed, max_points)
-    executed_fee = (
-        _load_executed_fee_actions(trace_path, companion_path, scenario_index)
-        if fee_source in ("executed", "both")
-        else None
-    )
-
     if yb_path is not None and yb_balance_path is not None and have_slippage_panel:
         fig, (ax1, ax_apy, ax2, ax_yb_balance, ax_skew, ax_slippage) = plt.subplots(
             6, 1, figsize=(14, 18), sharex=True
@@ -716,7 +621,7 @@ def render_shiftclick_figure(
         if fee_source != "none":
             fee_axis = ax_skew.twinx()
             fee_plotted = False
-            if fee_source in ("sampled", "both"):
+            if fee_source == "sampled":
                 fee_plotted = (
                     _plot_binned_pool_fee_axis(
                         fee_axis,
@@ -728,8 +633,6 @@ def render_shiftclick_figure(
                 )
             elif fee_source == "sampled-raw":
                 fee_plotted = _plot_pool_fee_axis(fee_axis, dates, pool_fee) is not None
-            if executed_fee is not None:
-                fee_plotted = _plot_executed_fee_axis(fee_axis, executed_fee) is not None or fee_plotted
             if not fee_plotted:
                 fee_axis.remove()
     else:
@@ -753,7 +656,7 @@ def render_shiftclick_figure(
         if fee_source != "none":
             fee_axis = ax2.twinx()
             fee_plotted = False
-            if fee_source in ("sampled", "both"):
+            if fee_source == "sampled":
                 fee_plotted = (
                     _plot_binned_pool_fee_axis(
                         fee_axis,
@@ -769,11 +672,6 @@ def render_shiftclick_figure(
                     _plot_pool_fee_axis(fee_axis, dates, pool_fee, spine_offset=1.08)
                     is not None
                 )
-            if executed_fee is not None:
-                fee_plotted = (
-                    _plot_executed_fee_axis(fee_axis, executed_fee, spine_offset=1.08)
-                    is not None
-                ) or fee_plotted
             if not fee_plotted:
                 fee_axis.remove()
 

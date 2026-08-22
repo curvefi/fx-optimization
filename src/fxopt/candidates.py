@@ -6,8 +6,6 @@ from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-import hashlib
-import json
 from typing import Any
 
 
@@ -31,23 +29,30 @@ def merge_payload(defaults: Mapping[str, Any], updates: Mapping[str, Any]) -> di
         if len(parts) == 1:
             result[key] = deepcopy(value)
             continue
-        cursor: dict[str, Any] = result
-        for part in parts[:-1]:
-            if part not in cursor:
-                current = {}
-                cursor[part] = current
+        cursor: Any = result
+        for index, part in enumerate(parts[:-1]):
+            next_part = parts[index + 1]
+            if isinstance(cursor, dict):
+                if part not in cursor:
+                    cursor[part] = [] if next_part.isdigit() else {}
+                cursor = cursor[part]
+            elif isinstance(cursor, list) and part.isdigit():
+                position = int(part)
+                if position >= len(cursor):
+                    raise CandidateError(f"list index out of range in {key!r}")
+                cursor = cursor[position]
             else:
-                current = cursor[part]
-            if not isinstance(current, Mapping):
                 raise CandidateError(f"dotted path collides at {part!r} in {key!r}")
-            if not isinstance(current, dict):
-                current = dict(current)
-                cursor[part] = current
-            cursor = current
         leaf = parts[-1]
-        if leaf in cursor and isinstance(cursor[leaf], Mapping) != isinstance(value, Mapping):
+        if isinstance(cursor, dict):
+            cursor[leaf] = deepcopy(value)
+        elif isinstance(cursor, list) and leaf.isdigit():
+            position = int(leaf)
+            if position >= len(cursor):
+                raise CandidateError(f"list index out of range in {key!r}")
+            cursor[position] = deepcopy(value)
+        else:
             raise CandidateError(f"dotted path collides at {key!r}")
-        cursor[leaf] = deepcopy(value)
     return result
 
 
@@ -94,10 +99,11 @@ def canonical_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
-def candidate_id(payload: Mapping[str, Any]) -> str:
-    """Return the ID derived solely from canonical semantic payload content."""
-    encoded = json.dumps(_canonical(payload), separators=(",", ":"), ensure_ascii=False).encode()
-    return hashlib.sha256(encoded).hexdigest()
+def candidate_id(ordinal: int) -> str:
+    """Return one readable run-local ordinal ID."""
+    if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0:
+        raise CandidateError("candidate ordinal must be a non-negative integer")
+    return f"p{ordinal:08d}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,9 +114,9 @@ class CandidateSpec:
     payload: Mapping[str, Any]
 
     @classmethod
-    def from_payload(cls, payload: Mapping[str, Any]) -> "CandidateSpec":
+    def from_payload(cls, payload: Mapping[str, Any], *, ordinal: int = 0) -> "CandidateSpec":
         copied = canonical_payload(payload)
-        return cls(candidate_id(copied), copied)
+        return cls(candidate_id(ordinal), copied)
 
     def to_dict(self) -> dict[str, Any]:
         return {"candidate_id": self.candidate_id, "payload": dict(self.payload)}
@@ -128,10 +134,10 @@ def compile_batch(
     """
     base = {} if defaults is None else canonical_payload(defaults)
     result: list[CandidateSpec] = []
-    for proposal in proposals:
+    for ordinal, proposal in enumerate(proposals):
         if not isinstance(proposal, Mapping):
             raise CandidateError("each proposal must be a mapping")
-        result.append(CandidateSpec.from_payload(merge_payload(base, proposal)))
+        result.append(CandidateSpec.from_payload(merge_payload(base, proposal), ordinal=ordinal))
     return tuple(result)
 
 

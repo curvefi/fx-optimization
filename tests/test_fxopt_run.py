@@ -7,7 +7,7 @@ from click.testing import CliRunner
 
 from fxopt.cli import main
 from fxopt.results import read_results
-from fxopt.run import RunConfig, run_config
+from fxopt.run import RunConfig, open_session_request, run_config
 
 
 class FakeClient:
@@ -21,11 +21,8 @@ class FakeClient:
 
     def open_session(self, session_id: str, **request: object) -> None:
         self.events.append(("open", session_id, request))
-        manifest = Path(str(request["manifest_path"]))
-        payload = json.loads(manifest.read_text())
-        assert payload["schema_version"] == "fxsim_manifest_v1"
-        assert payload["resolved_spec"]["scenario"]["id"] == "scenario-1"
-        assert payload["resolved_spec"]["scenario"]["market_files"][0]["path"].endswith("market.json")
+        assert request["scenario_id"] == "scenario-1"
+        assert str(request["market_path"]).endswith("market.json")
 
     def evaluate_batch(self, candidates: list[dict[str, object]], **request: object) -> dict[str, object]:
         self.events.append("evaluate")
@@ -63,7 +60,6 @@ n_candles = 3
 [scenario]
 id = "scenario-1"
 market = "market.json"
-market_sha256 = "abc"
 [candidate.defaults]
 policy_params = [0.5, 0.0003]
 pool = {}
@@ -92,7 +88,7 @@ pool = {}
     assert len(read_results(output).results) == 4
 
 
-def test_run_uses_two_placement_lanes_and_cleans_session_manifest(
+def test_run_uses_two_placement_lanes_with_direct_open_session(
     tmp_path: Path, monkeypatch
 ) -> None:
     config = tmp_path / "run.toml"
@@ -111,7 +107,6 @@ n_candles = 1
 [scenario]
 id = "scenario-1"
 market = "market.json"
-market_sha256 = "abc"
 [candidate.defaults]
 policy_params = []
 pool = {}
@@ -137,12 +132,51 @@ pool = {}
     assert calls == [("blade-b6", False), ("blade-b7", False)]
     assert sorted(len(batch) for client in clients.values() for batch in client.batches) == [128, 128]
     assert {path.name for path in output.iterdir()} == {"run.json", "results.npz"}
-    assert not any(path.name.startswith(".fxopt-session-") for path in output.iterdir())
     metadata = json.loads((output / "run.json").read_text())["metadata"]
     assert metadata["placement"] == "ssh"
     assert metadata["hosts"] == ["blade-b6", "blade-b7"]
     assert metadata["batch_size"] == 256
     assert metadata["effective_batch_size"] == 128
+
+
+def test_run_config_preserves_absolute_inputs_and_anchors_relative_market(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "run.toml"
+    config.write_text(
+        """
+[run]
+id = "path-run"
+evaluator = "/home/heswithme/evaluator"
+template = "/home/heswithme/template.json"
+batch_size = 1
+[scenario]
+id = "scenario-1"
+market = "/home/heswithme/market.json"
+chainlink = "/home/heswithme/chainlink.json"
+[candidate.defaults]
+policy_params = []
+pool = {}
+[candidate.axes]
+"pool.A" = [1]
+"pool.donation_apy" = [0.0]
+"""
+    )
+
+    absolute = RunConfig.from_toml(config)
+    assert str(absolute.evaluator) == "/home/heswithme/evaluator"
+    assert str(absolute.template) == "/home/heswithme/template.json"
+    assert absolute.scenario["market"] == "/home/heswithme/market.json"
+    assert absolute.scenario["chainlink"] == "/home/heswithme/chainlink.json"
+    request = open_session_request(absolute)
+    assert request["market_path"] == "/home/heswithme/market.json"
+    assert request["chainlink_path"] == "/home/heswithme/chainlink.json"
+
+    config.write_text(config.read_text().replace(
+        'market = "/home/heswithme/market.json"', 'market = "market.json"'
+    ))
+    relative = RunConfig.from_toml(config)
+    assert relative.scenario["market"] == str(tmp_path / "market.json")
 
 
 def test_fxopt_help_exposes_only_run_surface() -> None:

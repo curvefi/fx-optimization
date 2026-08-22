@@ -1,7 +1,10 @@
 import json
 
+import numpy as np
+import pytest
+
 from fxopt import Candidate, CandidateResult, ResultBundle, read_results, write_results
-from fxopt.results import ResultWriter
+from fxopt.results import ResultWriter, read_result_columns
 
 
 def test_results_round_trip_is_exactly_two_canonical_files(tmp_path):
@@ -29,7 +32,9 @@ def test_result_writer_appends_batches_without_retaining_rows(tmp_path):
     writer = ResultWriter(tmp_path, run_id="stream-1", metadata={"kind": "adaptive"})
     for index in range(3):
         candidate = Candidate(f"c{index}", [float(index)])
-        writer.append([candidate], [CandidateResult(candidate.candidate_id, metrics={"score": float(index)})])
+        writer.append([candidate], [CandidateResult(
+            candidate.candidate_id, metrics={"score": float(index)}, ordinal=index
+        )])
         assert writer.retained_rows == 0
     paths = writer.finalize()
     loaded = read_results(tmp_path)
@@ -58,3 +63,44 @@ def test_result_writer_finalize_reads_spool_once(tmp_path):
     writer.finalize()
 
     assert calls == 1
+
+
+def test_column_reader_selects_metrics_and_one_candidate(tmp_path):
+    candidates = tuple(
+        Candidate(f"c{index}", [float(index), float(index + 1)], {"A": index})
+        for index in range(128)
+    )
+    results = tuple(
+        CandidateResult(
+            candidate.candidate_id,
+            metrics={"wanted": float(index), "unused_a": 1.0, "unused_b": 2.0},
+            ordinal=index,
+        )
+        for index, candidate in enumerate(candidates)
+    )
+    write_results(ResultBundle("columns", candidates, results), tmp_path)
+
+    columns = read_result_columns(tmp_path, metrics=("wanted",))
+
+    assert tuple(columns.metrics) == ("wanted",)
+    assert columns.metrics["wanted"].shape == (128,)
+    assert not hasattr(columns, "candidates") and not hasattr(columns, "results")
+    assert columns.candidate_at(73) == candidates[73]
+    with np.load(tmp_path / "results.npz", allow_pickle=False) as archive:
+        assert len([name for name in archive.files if name.startswith("metric_")]) == 3
+
+
+@pytest.mark.parametrize("existing", ["run.json", "results.npz"])
+def test_result_writers_refuse_either_existing_canonical_artifact(tmp_path, existing):
+    (tmp_path / existing).write_bytes(b"occupied")
+    bundle = ResultBundle(
+        "immutable",
+        (Candidate("c0"),),
+        (CandidateResult("c0"),),
+    )
+
+    with pytest.raises(FileExistsError):
+        write_results(bundle, tmp_path)
+    with pytest.raises(FileExistsError):
+        ResultWriter(tmp_path, run_id="immutable")
+    assert {path.name for path in tmp_path.iterdir()} == {existing}

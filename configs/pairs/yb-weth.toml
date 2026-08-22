@@ -1,8 +1,0 @@
-[pair]
-id = "yb-weth"
-name = "Wrapped Ether / YieldBasis"
-base_token = "WETH"
-quote_token = "YB"
-base_decimals = 18
-quote_decimals = 18
-tags = ["production", "crypto", "yieldbasis", "allowlisted"]

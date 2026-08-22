@@ -4,9 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-import json
 from pathlib import Path
-from tempfile import TemporaryDirectory
 import tomllib
 from typing import Any
 
@@ -23,12 +21,10 @@ from .placement import (
 from .results import ArtifactPaths, ResultWriter
 
 
-_RUN_KEYS = frozenset({"id", "evaluator", "template", "manifest", "batch_size", "workers"})
+_RUN_KEYS = frozenset({"id", "evaluator", "template", "batch_size", "workers"})
 _PLACEMENT_KEYS = frozenset({"hosts"})
 _CANDIDATE_KEYS = frozenset({"defaults", "axes"})
-_SCENARIO_KEYS = frozenset(
-    {"id", "market", "market_sha256", "chainlink", "chainlink_sha256", "yb_mode"}
-)
+_SCENARIO_KEYS = frozenset({"id", "market", "chainlink", "yb_mode"})
 
 
 def _required_string(section: Mapping[str, Any], key: str, label: str) -> str:
@@ -51,7 +47,6 @@ class RunConfig:
     run_id: str
     evaluator: Path
     template: Path
-    manifest: Path | None
     batch_size: int
     workers: int
     hosts: tuple[str, ...]
@@ -105,7 +100,9 @@ class RunConfig:
         session = raw.get("session", {})
         if not isinstance(session, Mapping):
             raise ConfigError("[session] must be a mapping")
-        forbidden_session = {"session_id", "template_path", "manifest_path"} & set(session)
+        forbidden_session = {
+            "session_id", "template_path", "scenario_id", "market_path", "chainlink_path"
+        } & set(session)
         if forbidden_session:
             raise ConfigError(
                 "[session] cannot set " + ", ".join(sorted(forbidden_session))
@@ -118,77 +115,48 @@ class RunConfig:
         if unknown_candidate:
             raise ConfigError(f"unknown [candidate] keys: {sorted(unknown_candidate)}")
 
-        manifest_value = run.get("manifest")
-        manifest = (
-            _resolve_path(manifest_value, config_path.parent)
-            if isinstance(manifest_value, str) and manifest_value.strip()
-            else None
-        )
-        if manifest_value is not None and manifest is None:
-            raise ConfigError("run.manifest must be a non-empty string")
         scenario = raw.get("scenario")
-        if manifest is None and not isinstance(scenario, Mapping):
-            raise ConfigError("config without run.manifest requires a [scenario] table")
-        scenario = dict(scenario) if isinstance(scenario, Mapping) else {}
+        if not isinstance(scenario, Mapping):
+            raise ConfigError("config requires a [scenario] table")
+        unknown_scenario = set(scenario) - _SCENARIO_KEYS
+        if unknown_scenario:
+            raise ConfigError(f"unknown [scenario] keys: {sorted(unknown_scenario)}")
+        scenario_id = _required_string(scenario, "id", "scenario")
+        market = _resolve_path(
+            _required_string(scenario, "market", "scenario"), config_path.parent
+        )
+        resolved_scenario: dict[str, Any] = {
+            "id": scenario_id,
+            "market": str(market),
+        }
+        chainlink = scenario.get("chainlink")
+        if chainlink is not None:
+            if not isinstance(chainlink, str) or not chainlink.strip():
+                raise ConfigError("scenario.chainlink must be a non-empty string")
+            resolved_scenario["chainlink"] = str(
+                _resolve_path(chainlink, config_path.parent)
+            )
         scenario_yb_mode = scenario.get("yb_mode")
         if scenario_yb_mode is not None and not isinstance(scenario_yb_mode, str):
             raise ConfigError("scenario.yb_mode must be a string")
+        if scenario_yb_mode is not None:
+            resolved_scenario["yb_mode"] = scenario_yb_mode
         base = config_path.parent
         return cls(
             path=config_path,
             run_id=_required_string(run, "id", "run"),
             evaluator=_resolve_path(_required_string(run, "evaluator", "run"), base),
             template=_resolve_path(_required_string(run, "template", "run"), base),
-            manifest=manifest,
             batch_size=batch_size,
             workers=workers,
             hosts=tuple(hosts),
             candidate=CandidateConfig.from_mapping(candidate),
             session=dict(session),
-            scenario=scenario,
+            scenario=resolved_scenario,
         )
 
 
-def _session_manifest(config: RunConfig, directory: Path) -> Path:
-    """Materialize the evaluator's narrow session manifest only for this run."""
-    scenario = config.scenario
-    if not scenario:
-        raise ConfigError("config without run.manifest requires a [scenario] table")
-    unknown = set(scenario) - _SCENARIO_KEYS
-    if unknown:
-        raise ConfigError(f"unknown [scenario] keys: {sorted(unknown)}")
-    scenario_id = _required_string(scenario, "id", "scenario")
-    market = _required_string(scenario, "market", "scenario")
-    market_sha256 = _required_string(scenario, "market_sha256", "scenario")
-    files = [{"path": str(_resolve_path(market, config.path.parent).resolve()), "kind": "market", "sha256": market_sha256}]
-    chainlink = scenario.get("chainlink")
-    chainlink_sha256 = scenario.get("chainlink_sha256")
-    if chainlink is not None or chainlink_sha256 is not None:
-        if not isinstance(chainlink, str) or not chainlink.strip() or not isinstance(chainlink_sha256, str) or not chainlink_sha256.strip():
-            raise ConfigError("scenario.chainlink and scenario.chainlink_sha256 must be supplied together")
-        files.append({"path": str(_resolve_path(chainlink, config.path.parent).resolve()), "kind": "chainlink", "sha256": chainlink_sha256})
-    session = config.session
-    payload = {
-        "schema_version": "fxsim_manifest_v1",
-        "run_kind": "session",
-        "run_id": f"session-{scenario_id}",
-        "resolved_spec": {
-            "scenario": {
-                "id": scenario_id,
-                "start_time": session.get("start_time", 0),
-                "end_time": session.get("end_time", 0),
-                "n_candles": session.get("n_candles", 0),
-                "candle_filter": session.get("candle_filter", 99.0),
-                "market_files": files,
-            }
-        },
-    }
-    path = directory / "session.json"
-    path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")))
-    return path
-
-
-def _candidate(spec: CandidateSpec) -> Candidate:
+def candidate_from_spec(spec: CandidateSpec) -> Candidate:
     payload = spec.payload
     expected = {"policy_params", "pool"}
     unknown = set(payload) - expected
@@ -217,17 +185,15 @@ def _candidate(spec: CandidateSpec) -> Candidate:
     )
 
 
-def _run_with_manifest(
+def placement_lanes(
     config: RunConfig,
-    output_dir: str | Path,
-    manifest: Path,
-    *,
-    client_factory: ClientFactory | None,
-) -> ArtifactPaths:
+    client_factory: ClientFactory | None = None,
+) -> tuple[PlacementLane, ...]:
+    """Resolve local, injected, or SSH evaluator lanes once for every workflow."""
     if client_factory is not None:
-        lanes = (PlacementLane("injected", client_factory),)
-    elif config.hosts:
-        lanes = tuple(
+        return (PlacementLane("injected", client_factory),)
+    if config.hosts:
+        return tuple(
             PlacementLane(
                 host,
                 ssh_client_factory(
@@ -239,39 +205,63 @@ def _run_with_manifest(
             )
             for host in config.hosts
         )
-    else:
-        lanes = (
-            PlacementLane(
-                "local",
-                local_client_factory(
-                    config.evaluator,
-                    work_dir=config.path.parent,
-                    workers=config.workers,
-                ),
+    return (
+        PlacementLane(
+            "local",
+            local_client_factory(
+                config.evaluator,
+                work_dir=config.path.parent,
+                workers=config.workers,
             ),
-        )
-    candidate_grid = config.candidate.grid()
-    lane_count = len(lanes)
-    effective_batch = min(config.batch_size, (len(candidate_grid) + lane_count - 1) // lane_count)
-    metadata = {
+        ),
+    )
+
+
+def open_session_request(config: RunConfig) -> dict[str, Any]:
+    request = {
+        "template_path": str(config.template),
+        "scenario_id": config.scenario["id"],
+        "market_path": config.scenario["market"],
+        **config.session,
+    }
+    if (chainlink := config.scenario.get("chainlink")) is not None:
+        request["chainlink_path"] = chainlink
+    if (yb_mode := config.scenario.get("yb_mode")) is not None:
+        request.setdefault("yb_mode", yb_mode)
+    return request
+
+
+def run_metadata(config: RunConfig, *, effective_batch: int) -> dict[str, Any]:
+    grid = config.candidate.grid()
+    return {
         "config": str(config.path),
         "evaluator": str(config.evaluator),
         "template": str(config.template),
-        "manifest": str(config.manifest) if config.manifest is not None else "temporary",
-        "placement": "ssh" if config.hosts and client_factory is None else "local",
+        "placement": "ssh" if config.hosts else "local",
         "hosts": list(config.hosts),
         "batch_size": config.batch_size,
         "effective_batch_size": effective_batch,
         "workers": config.workers,
+        "axes": {name: list(grid.axes[name]) for name in sorted(grid.axes)},
+        "shape": list(grid.shape),
     }
+
+
+def _run(
+    config: RunConfig,
+    output_dir: str | Path,
+    *,
+    client_factory: ClientFactory | None,
+) -> ArtifactPaths:
+    lanes = placement_lanes(config, client_factory)
+    candidate_grid = config.candidate.grid()
+    lane_count = len(lanes)
+    effective_batch = min(config.batch_size, (len(candidate_grid) + lane_count - 1) // lane_count)
+    metadata = run_metadata(config, effective_batch=effective_batch)
+    if client_factory is not None:
+        metadata["placement"] = "injected"
     writer = ResultWriter(output_dir, run_id=config.run_id, metadata=metadata)
-    open_session = {
-        "template_path": str(config.template),
-        "manifest_path": str(manifest),
-        **config.session,
-    }
-    if (yb_mode := config.scenario.get("yb_mode")) is not None:
-        open_session.setdefault("yb_mode", yb_mode)
+    open_session = open_session_request(config)
     with writer:
         with EvaluatorFleet(
             lanes,
@@ -280,7 +270,7 @@ def _run_with_manifest(
             open_session=open_session,
         ) as fleet:
             for specs in candidate_grid.iter_batches(lane_count * effective_batch):
-                batch = tuple(_candidate(spec) for spec in specs)
+                batch = tuple(candidate_from_spec(spec) for spec in specs)
                 writer.append(batch, fleet.evaluate(batch))
         return writer.finalize()
 
@@ -293,13 +283,15 @@ def run_config(
 ) -> ArtifactPaths:
     """Run every grid point in bounded batches and publish the two artifacts."""
     config = RunConfig.from_toml(config_path)
-    if config.manifest is not None:
-        return _run_with_manifest(config, output_dir, config.manifest, client_factory=client_factory)
     output_path = Path(output_dir).expanduser().resolve()
-    output_path.mkdir(parents=True, exist_ok=True)
-    with TemporaryDirectory(prefix=".fxopt-session-", dir=output_path) as temporary:
-        manifest = _session_manifest(config, Path(temporary))
-        return _run_with_manifest(config, output_path, manifest, client_factory=client_factory)
+    return _run(config, output_path, client_factory=client_factory)
 
 
-__all__ = ["RunConfig", "run_config"]
+__all__ = [
+    "RunConfig",
+    "candidate_from_spec",
+    "open_session_request",
+    "placement_lanes",
+    "run_config",
+    "run_metadata",
+]

@@ -1,8 +1,0 @@
-[pair]
-id = "btcusd"
-name = "Bitcoin / US dollar"
-base_token = "BTC"
-quote_token = "USD"
-base_decimals = 8
-quote_decimals = 6
-tags = ["production", "crypto", "allowlisted"]
