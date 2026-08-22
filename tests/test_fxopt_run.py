@@ -5,8 +5,10 @@ import json
 import threading
 
 from click.testing import CliRunner
+import pytest
 
 from fxopt.cli import _ProgressReporter, main
+from fxopt.config import ConfigError
 from fxopt.results import ArtifactPaths, read_results
 from fxopt.run import RunConfig, open_session_request, run_config
 
@@ -99,13 +101,16 @@ pool = {}
 def test_run_uses_two_placement_lanes_with_direct_open_session(
     tmp_path: Path, monkeypatch
 ) -> None:
-    config = tmp_path / "run.toml"
+    workspace = tmp_path / "curve-fx-sim"
+    config = workspace / "curve-fx-optimization" / "configs" / "run.toml"
+    config.parent.mkdir(parents=True)
+    (workspace / "curve-fx-optimization" / "market.json").write_text("[]")
     config.write_text(
         """
 [run]
 id = "remote-run"
-evaluator = "/shared/evaluator"
-template = "/shared/template.json"
+evaluator = "../../curve-fx-arb-harness/build/evaluator"
+template = "../template.json"
 batch_size = 256
 workers = 2
 [placement]
@@ -114,7 +119,8 @@ hosts = ["blade-b6", "blade-b7"]
 n_candles = 1
 [scenario]
 id = "scenario-1"
-market = "market.json"
+market = "../market.json"
+chainlink = "../chainlink.json"
 [candidate.defaults]
 policy_params = []
 pool = {}
@@ -126,18 +132,35 @@ pool = {}
 """
     )
     clients: dict[str, FakeClient] = {}
-    calls: list[tuple[str, bool]] = []
+    calls: list[tuple[str, str, bool]] = []
+    ensured = []
 
     def fake_ssh(host: str, evaluator: str, *, workers: int, verify_local_inputs: bool):
-        calls.append((host, verify_local_inputs))
+        calls.append((host, str(evaluator), verify_local_inputs))
         clients[host] = FakeClient()
         return lambda: clients[host]
 
     monkeypatch.setattr("fxopt.run.ssh_client_factory", fake_ssh)
+    monkeypatch.setattr(
+        "fxopt.run.ensure_remote_file", lambda *args: ensured.append(args)
+    )
     output = tmp_path / "output"
     run_config(config, output)
 
-    assert calls == [("blade-b6", False), ("blade-b7", False)]
+    assert calls == [
+        ("blade-b6", "arb/curve-fx-arb-harness/build/evaluator", False),
+        ("blade-b7", "arb/curve-fx-arb-harness/build/evaluator", False),
+    ]
+    assert ensured == [
+        ("blade-b6", str(config.parent / "../template.json"), "arb/curve-fx-optimization/template.json"),
+        ("blade-b6", str(config.parent / "../market.json"), "arb/curve-fx-optimization/market.json"),
+        ("blade-b6", str(config.parent / "../chainlink.json"), "arb/curve-fx-optimization/chainlink.json"),
+    ]
+    for client in clients.values():
+        opened = next(event for event in client.events if isinstance(event, tuple) and event[0] == "open")
+        assert opened[2]["template_path"] == "arb/curve-fx-optimization/template.json"
+        assert opened[2]["market_path"] == "arb/curve-fx-optimization/market.json"
+        assert opened[2]["chainlink_path"] == "arb/curve-fx-optimization/chainlink.json"
     assert sorted(len(batch) for client in clients.values() for batch in client.batches) == [128, 128]
     assert {path.name for path in output.iterdir()} == {"run.json", "results.npz"}
     metadata = json.loads((output / "run.json").read_text())["metadata"]
@@ -145,6 +168,15 @@ pool = {}
     assert metadata["hosts"] == ["blade-b6", "blade-b7"]
     assert metadata["batch_size"] == 256
     assert metadata["effective_batch_size"] == 128
+    assert metadata["evaluator"] == "arb/curve-fx-arb-harness/build/evaluator"
+    assert metadata["template"] == "arb/curve-fx-optimization/template.json"
+    assert metadata["market"] == "arb/curve-fx-optimization/market.json"
+    config.write_text(config.read_text().replace(
+        'evaluator = "../../curve-fx-arb-harness/build/evaluator"',
+        'evaluator = "/outside/evaluator"',
+    ))
+    with pytest.raises(ConfigError, match="remote evaluator path must be inside"):
+        RunConfig.from_toml(config)
 
 
 def test_run_config_preserves_absolute_inputs_and_anchors_relative_market(

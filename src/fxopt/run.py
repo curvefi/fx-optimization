@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import tomllib
 from typing import Any
 
@@ -15,6 +15,7 @@ from .engine import ClientFactory
 from .placement import (
     EvaluatorFleet,
     PlacementLane,
+    ensure_remote_file,
     local_client_factory,
     ssh_client_factory,
 )
@@ -150,7 +151,7 @@ class RunConfig:
         if scenario_yb_mode is not None:
             resolved_scenario["yb_mode"] = scenario_yb_mode
         base = config_path.parent
-        return cls(
+        config = cls(
             path=config_path,
             run_id=_required_string(run, "id", "run"),
             evaluator=_resolve_path(_required_string(run, "evaluator", "run"), base),
@@ -162,6 +163,9 @@ class RunConfig:
             session=dict(session),
             scenario=resolved_scenario,
         )
+        if hosts:
+            _execution_inputs(config, remote=True)
+        return config
 
 
 def _display_value(value: object) -> str:
@@ -229,12 +233,17 @@ def placement_lanes(
     if client_factory is not None:
         return (PlacementLane("injected", client_factory),)
     if config.hosts:
+        local_inputs = _execution_inputs(config, remote=False)
+        inputs = _execution_inputs(config, remote=True)
+        for name in ("template", "market", "chainlink"):
+            if name in inputs:
+                ensure_remote_file(config.hosts[0], local_inputs[name], inputs[name])
         return tuple(
             PlacementLane(
                 host,
                 ssh_client_factory(
                     host,
-                    config.evaluator,
+                    inputs["evaluator"],
                     workers=config.workers,
                     verify_local_inputs=False,
                 ),
@@ -253,14 +262,46 @@ def placement_lanes(
     )
 
 
-def open_session_request(config: RunConfig) -> dict[str, Any]:
-    request = {
-        "template_path": str(config.template),
-        "scenario_id": config.scenario["id"],
-        "market_path": config.scenario["market"],
-        **config.session,
+def _execution_inputs(config: RunConfig, *, remote: bool) -> dict[str, str]:
+    inputs = {
+        "evaluator": str(config.evaluator),
+        "template": str(config.template),
+        "market": config.scenario["market"],
     }
     if (chainlink := config.scenario.get("chainlink")) is not None:
+        inputs["chainlink"] = chainlink
+    if remote:
+        try:
+            optimizer_root = next(
+                parent
+                for parent in config.path.parents
+                if parent.name == "curve-fx-optimization"
+            )
+        except StopIteration as exc:
+            raise ConfigError(
+                "remote config must be inside a curve-fx-optimization repository"
+            ) from exc
+        workspace = optimizer_root.parent.resolve()
+        mapped = {}
+        for name, value in inputs.items():
+            try:
+                relative = Path(value).resolve().relative_to(workspace)
+            except ValueError as exc:
+                raise ConfigError(f"remote {name} path must be inside {workspace}") from exc
+            mapped[name] = str(PurePosixPath("arb", *relative.parts))
+        return mapped
+    return inputs
+
+
+def open_session_request(config: RunConfig, *, remote: bool | None = None) -> dict[str, Any]:
+    inputs = _execution_inputs(config, remote=bool(config.hosts) if remote is None else remote)
+    request = {
+        "template_path": inputs["template"],
+        "scenario_id": config.scenario["id"],
+        "market_path": inputs["market"],
+        **config.session,
+    }
+    if (chainlink := inputs.get("chainlink")) is not None:
         request["chainlink_path"] = chainlink
     if (yb_mode := config.scenario.get("yb_mode")) is not None:
         request.setdefault("yb_mode", yb_mode)
@@ -269,10 +310,12 @@ def open_session_request(config: RunConfig) -> dict[str, Any]:
 
 def run_metadata(config: RunConfig, *, effective_batch: int) -> dict[str, Any]:
     grid = config.candidate.grid()
+    inputs = _execution_inputs(config, remote=bool(config.hosts))
     return {
         "config": str(config.path),
-        "evaluator": str(config.evaluator),
-        "template": str(config.template),
+        "evaluator": inputs["evaluator"],
+        "template": inputs["template"],
+        "market": inputs["market"],
         "placement": "ssh" if config.hosts else "local",
         "hosts": list(config.hosts),
         "batch_size": config.batch_size,

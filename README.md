@@ -27,7 +27,7 @@ cd /path/to/curve-fx-optimization
 uv sync --frozen --group dev
 ```
 
-Configs live under `configs/`. The current experiment example is `configs/experiments/eurusd-a-donation-rpf-8x8x8.toml`. Its TOML owns run, session, scenario, candidate, and placement settings; the pool template remains under `configs/templates`, while compiled policies are harness build inputs. `[placement]` is optional. Without it, the run is local. With `hosts = ["blade-b6", "blade-b7"]`, evaluator sessions are opened over SSH on those hosts. Absolute evaluator/template/data paths pass through unchanged and must be visible to the evaluator hosts, typically via shared NFS.
+Configs live under `configs/`. The current experiment example is `configs/experiments/eurusd-a-donation-rpf-8x8x8.toml`. Its TOML owns run, session, scenario, candidate, and placement settings; the pool template remains under `configs/templates`, while compiled policies are harness build inputs. Non-empty `[placement].hosts` implies SSH; otherwise execution is local. Remote runs map config-relative sibling-workspace paths to remote-home-relative `arb/...`. Missing portable session inputs are copied once through the first shared-NFS host, while existing files are kept; the evaluator is never copied.
 
 ## The four commands
 
@@ -65,7 +65,7 @@ uv run fxopt shiftclick runs/eurusd-a-donation-rpf-8x8x8 \
   --ordinal 12 --output runs/eurusd-a-donation-rpf-8x8x8/inspections/ordinal-12
 ```
 
-`--trace-interval` and `--actions` enable denser traces and action recording. Replay takes the exact stored candidate from `results.npz`; evaluator, session, and placement settings come from the source run's config metadata. It writes `shiftclick.json` plus trace artifacts under the selected output directory.
+`--trace-interval` and `--actions` enable denser traces and action recording. Replay takes the exact stored candidate from `results.npz` and uses the source config's local evaluator and session inputs with one local worker; SSH placement is not reused. It writes `shiftclick.json` plus trace artifacts under the selected output directory.
 
 ## Results and configuration
 

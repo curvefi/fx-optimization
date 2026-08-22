@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from threading import Barrier, Lock
+import subprocess
 
 import pytest
 
@@ -82,6 +83,30 @@ def test_ssh_factory_uses_absolute_evaluator_without_remote_workdir(monkeypatch)
     assert remote["launch_argv"] == [
         "ssh", "--", "blade-a1", "/shared/run/evaluator", "serve", "--workers", "2",
     ]
+
+
+@pytest.mark.parametrize("present", [True, False])
+def test_ensure_remote_file_copies_only_when_missing(tmp_path, monkeypatch, present):
+    source = tmp_path / "candles.json"
+    source.write_text("[]")
+    calls = []
+
+    def fake_run(argv, *, check):
+        calls.append((argv, check))
+        return subprocess.CompletedProcess(argv, 0 if present or len(calls) > 1 else 1)
+
+    monkeypatch.setattr(placement.subprocess, "run", fake_run)
+    placement.ensure_remote_file("blade-b6", source, "arb/optimizer/data/candles.json")
+
+    assert calls[0] == ([
+        "ssh", "--", "blade-b6", "test", "-f", "arb/optimizer/data/candles.json",
+    ], False)
+    assert len(calls) == (1 if present else 3)
+    if not present:
+        assert calls[1] == (["ssh", "--", "blade-b6", "mkdir", "-p",
+                             "arb/optimizer/data"], True)
+        assert calls[2] == (["rsync", "--ignore-existing", "--", str(source),
+                             "blade-b6:arb/optimizer/data/candles.json"], True)
 
 
 def test_fleet_balances_full_wave_across_all_lanes():

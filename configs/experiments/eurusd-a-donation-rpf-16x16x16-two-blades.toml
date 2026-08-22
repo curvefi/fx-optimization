@@ -1,0 +1,41 @@
+[run]
+id = "eurusd-a-donation-rpf-16x16x16-two-blades"
+evaluator = "../../../curve-fx-arb-harness/build/native/arb_evaluator_f64"
+template = "../templates/eurusd-2024-monorepo.json"
+batch_size = 256
+workers = 128
+
+[session]
+n_candles = 0
+start_time = 1704146400
+end_time = 0
+candle_filter = 99.0
+min_swap = 0.000001
+max_swap = 1.0
+user_swap_freq_s = 3600
+user_swap_size_frac = 0.01
+user_swap_thresh = 0.05
+
+[scenario]
+id = "eurusd-2024-monorepo"
+market = "../../data/market/eurusd/candles.json"
+yb_mode = "off"
+
+[candidate.defaults]
+policy_params = []
+pool = { mid_fee = 0.0003, out_fee = 0.0003 }
+
+[candidate.axes]
+"pool.A" = { start = 1, stop = 200, count = 16, multiply = 10000 }
+"pool.donation_apy" = { start = 0, stop = 0.10, count = 16 }
+"pool.reserved_profit_fraction" = { start = 0, stop = 1, count = 16 }
+
+[optimization]
+budget = 128
+batch_size = 32
+metric = "apy_net_gm"
+maximize = true
+seed = 42
+
+[placement]
+hosts = ["blade-b6", "blade-b7"]

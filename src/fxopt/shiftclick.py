@@ -8,12 +8,11 @@ from pathlib import Path
 import tempfile
 
 from .contract import Candidate
-from .placement import EvaluatorFleet
+from .placement import EvaluatorFleet, PlacementLane, local_client_factory
 from .engine import ClientFactory
 from .run import (
     RunConfig,
     open_session_request,
-    placement_lanes,
 )
 
 
@@ -41,7 +40,7 @@ def trace_candidate(
     client_factory: ClientFactory | None = None,
     yb_mode: str | None = None,
 ) -> Path:
-    """Replay one explicitly stored candidate through the source run's fleet."""
+    """Replay one explicitly stored candidate through one local evaluator."""
     if not isinstance(candidate, Candidate):
         raise TypeError("candidate must be a Candidate")
     if ordinal < 0:
@@ -52,13 +51,16 @@ def trace_candidate(
     destination = Path(output_dir).expanduser().resolve()
     destination.mkdir(parents=True, exist_ok=True)
 
-    open_session = open_session_request(config)
+    open_session = open_session_request(config, remote=False)
     if yb_mode is not None:
         if yb_mode not in {"off", "passive", "active_2l"}:
             raise ValueError("yb_mode must be off, passive, or active_2l")
         open_session["yb_mode"] = yb_mode
+    factory = client_factory or local_client_factory(
+        config.evaluator, work_dir=config.path.parent, workers=1
+    )
     with EvaluatorFleet(
-        placement_lanes(config, client_factory),
+        (PlacementLane("injected" if client_factory else "local", factory),),
         session_id=f"{config.run_id}-trace-{ordinal}",
         batch_size=1,
         open_session=open_session,

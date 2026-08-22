@@ -10,6 +10,8 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from os import PathLike, fspath
+from pathlib import Path, PurePosixPath
+import subprocess
 from threading import Lock
 from typing import Any
 
@@ -113,6 +115,32 @@ def ssh_client_factory(
         )
 
     return create
+
+
+def ensure_remote_file(
+    host: str,
+    local_path: str | PathLike[str],
+    remote_path: str | PathLike[str],
+) -> None:
+    """Publish a missing shared-NFS input through one placement host."""
+    remote_host = _token(host, "host")
+    source = Path(local_path)
+    destination = _token(remote_path, "remote_path")
+    if not source.is_file():
+        raise FileNotFoundError(f"remote input source is not a file: {source}")
+    present = subprocess.run(
+        ["ssh", "--", remote_host, "test", "-f", destination], check=False
+    )
+    if present.returncode == 0:
+        return
+    if present.returncode != 1:
+        present.check_returncode()
+    parent = str(PurePosixPath(destination).parent)
+    subprocess.run(["ssh", "--", remote_host, "mkdir", "-p", parent], check=True)
+    subprocess.run(
+        ["rsync", "--ignore-existing", "--", str(source), f"{remote_host}:{destination}"],
+        check=True,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,6 +336,7 @@ class EvaluatorFleet:
 __all__ = [
     "EvaluatorFleet",
     "PlacementLane",
+    "ensure_remote_file",
     "local_client_factory",
     "ssh_client_factory",
 ]

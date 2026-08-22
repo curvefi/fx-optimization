@@ -12,10 +12,14 @@ from fxopt.shiftclick import trace_candidate
 
 
 class FakeClient:
+    def __init__(self):
+        self.open_requests = []
+
     def start(self):
         return {"hello": True}
 
     def open_session(self, session_id, **request):
+        self.open_requests.append(request)
         return None
 
     def evaluate_batch(self, candidates, **request):
@@ -35,6 +39,7 @@ class FakeClient:
 
 
 def _config(tmp_path):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     path = tmp_path / "run.toml"
     path.write_text("""
 [run]
@@ -57,6 +62,21 @@ batch_size = 2
 metric = "score"
 maximize = true
 seed = 7
+""")
+    return path
+
+
+def _remote_config(tmp_path):
+    workspace = tmp_path / "curve-fx-sim"
+    path = _config(workspace / "curve-fx-optimization" / "configs")
+    source = path.read_text()
+    source = source.replace('evaluator = "evaluator"',
+                            'evaluator = "../../curve-fx-arb-harness/evaluator"')
+    source = source.replace('template = "template.json"', 'template = "../template.json"')
+    source = source.replace('market = "market.json"', 'market = "../market.json"')
+    path.write_text(source + """
+[placement]
+hosts = ["blade-b6", "blade-b7"]
 """)
     return path
 
@@ -101,6 +121,38 @@ def test_nevergrad_and_shiftclick_share_the_fleet(tmp_path):
     assert payload["source_ordinal"] == 1
     assert payload["candidate"]["candidate_id"] == candidate.candidate_id
     assert payload["result"]["artifacts"]["trace_path"] == "trace.json"
+
+
+def test_remote_optimize_maps_inputs_but_trace_replays_locally(
+    tmp_path, monkeypatch
+):
+    config = _remote_config(tmp_path)
+    remote = FakeClient()
+    optimize_config(config, tmp_path / "optimization", client_factory=lambda: remote)
+    assert remote.open_requests[0]["template_path"] == "arb/curve-fx-optimization/template.json"
+    assert remote.open_requests[0]["market_path"] == "arb/curve-fx-optimization/market.json"
+
+    local = FakeClient()
+    local_calls = []
+
+    def fake_local(evaluator, *, work_dir, workers):
+        local_calls.append((Path(evaluator), Path(work_dir), workers))
+        return lambda: local
+
+    monkeypatch.setattr("fxopt.shiftclick.local_client_factory", fake_local)
+    monkeypatch.setattr(
+        "fxopt.run.ssh_client_factory",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("SSH replay")),
+    )
+    candidate = Candidate("stored", [7.5], {"A": 99})
+    destination = tmp_path / "trace"
+    trace_candidate(config, candidate=candidate, ordinal=3, output_dir=destination)
+
+    workspace = tmp_path / "curve-fx-sim"
+    assert local_calls[0][0].resolve() == workspace / "curve-fx-arb-harness" / "evaluator"
+    assert local_calls[0][2] == 1
+    assert Path(local.open_requests[0]["template_path"]).resolve() == workspace / "curve-fx-optimization" / "template.json"
+    assert Path(local.open_requests[0]["market_path"]).resolve() == workspace / "curve-fx-optimization" / "market.json"
 
 
 def test_shiftclick_cli_replays_stored_adaptive_candidate(monkeypatch, tmp_path):
