@@ -141,14 +141,6 @@ def _artifact_paths(root: Path) -> ArtifactPaths:
     return ArtifactPaths(root / RUN_FILENAME, root / RESULTS_FILENAME)
 
 
-def _require_unused_artifacts(root: Path) -> ArtifactPaths:
-    paths = _artifact_paths(root)
-    existing = [path.name for path in (paths.run_json, paths.results_npz) if path.exists()]
-    if existing:
-        raise FileExistsError(f"result artifacts already exist: {', '.join(existing)}")
-    return paths
-
-
 def _metric_key(column: int) -> str:
     return f"metric_{column:04d}"
 
@@ -159,7 +151,7 @@ def write_results(bundle: ResultBundle, directory: str | Path) -> ArtifactPaths:
         raise TypeError("bundle must be a ResultBundle")
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
-    paths = _require_unused_artifacts(root)
+    paths = _artifact_paths(root)
     metric_names = sorted({name for result in bundle.results for name in result.metrics})
     metric_values = {
         name: np.full(len(bundle.results), np.nan, dtype=np.float64)
@@ -308,7 +300,6 @@ class ResultWriter:
             raise ValueError("run_id must be a non-empty string")
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
-        _require_unused_artifacts(self.directory)
         self._temporary = Path(tempfile.mkdtemp(prefix=".fxopt-", dir=self.directory))
         self._spool_path = self._temporary / "rows.jsonl"
         self._spool = self._spool_path.open("wb")

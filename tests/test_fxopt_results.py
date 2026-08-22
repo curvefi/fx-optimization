@@ -1,8 +1,6 @@
 import json
 
 import numpy as np
-import pytest
-
 from fxopt import Candidate, CandidateResult, ResultBundle, read_results, write_results
 from fxopt.results import ResultWriter, read_result_columns
 
@@ -90,17 +88,21 @@ def test_column_reader_selects_metrics_and_one_candidate(tmp_path):
         assert len([name for name in archive.files if name.startswith("metric_")]) == 3
 
 
-@pytest.mark.parametrize("existing", ["run.json", "results.npz"])
-def test_result_writers_refuse_either_existing_canonical_artifact(tmp_path, existing):
-    (tmp_path / existing).write_bytes(b"occupied")
-    bundle = ResultBundle(
-        "immutable",
-        (Candidate("c0"),),
-        (CandidateResult("c0"),),
-    )
+def test_result_writers_overwrite_complete_canonical_bundle(tmp_path):
+    initial = ResultBundle("initial", (Candidate("old"),), (CandidateResult("old"),))
+    write_results(initial, tmp_path)
 
-    with pytest.raises(FileExistsError):
-        write_results(bundle, tmp_path)
-    with pytest.raises(FileExistsError):
-        ResultWriter(tmp_path, run_id="immutable")
-    assert {path.name for path in tmp_path.iterdir()} == {existing}
+    replacement = ResultBundle(
+        "replacement", (Candidate("new", [3.0]),), (CandidateResult("new", metrics={"score": 7.0}),)
+    )
+    write_results(replacement, tmp_path)
+    assert read_results(tmp_path) == replacement
+
+    writer = ResultWriter(tmp_path, run_id="stream-replacement")
+    candidate = Candidate("stream-new", [4.0])
+    writer.append([candidate], [CandidateResult("stream-new", metrics={"score": 8.0})])
+    writer.finalize()
+    loaded = read_results(tmp_path)
+    assert loaded.run_id == "stream-replacement"
+    assert loaded.candidates == (candidate,)
+    assert loaded.results[0].metrics == {"score": 8.0}
