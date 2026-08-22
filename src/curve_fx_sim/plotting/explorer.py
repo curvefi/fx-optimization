@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import os
 import tempfile
@@ -280,7 +279,7 @@ def format_axis_value(value: Any) -> str:
 
 
 def format_metric_value(metric: str, value: Any) -> str:
-    """Use units that make fractions and price errors readable in the metrics window."""
+    """Use units that make fractions and price errors readable in output."""
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -337,7 +336,7 @@ def _finite_max(dataset: HeatmapDataset, metric: str, scale: float = 1.0) -> flo
 
 
 class HeatmapExplorer:
-    """Three-window heatmap, controls, and exact-cell metrics explorer."""
+    """Two-window heatmap and controls explorer with exact-cell replay."""
 
     def __init__(
         self,
@@ -400,10 +399,8 @@ class HeatmapExplorer:
         self._global_clims = self._compute_global_clims()
         self.fig_main = plt.figure(figsize=(13.0, 8.0), layout="constrained", num="Heatmaps")
         self.fig_controls = plt.figure(figsize=(3.2, 6.0), num="Controls")
-        self.fig_metrics = plt.figure(figsize=(6.5, 9.0), num="Metrics")
         _window_title(self.fig_main, "Heatmaps")
         _window_title(self.fig_controls, "Controls")
-        _window_title(self.fig_metrics, "Metrics")
         self.meshes: list[Any] = []
         self.colorbars: list[Any] = []
         self.axes: list[Any] = []
@@ -412,19 +409,8 @@ class HeatmapExplorer:
         self._metric_axes: list[Any] = []
         self._slider_value_texts: dict[str, Any] = {}
         self._threshold_value_texts: dict[str, Any] = {}
-        self.fig_metrics.text(
-            0.02,
-            0.98,
-            "Metrics (left click a heatmap cell)",
-            ha="left",
-            va="top",
-            fontsize=10,
-            fontweight="bold",
-        )
-        self.metrics_text = self.fig_metrics.text(
-            0.02, 0.94, "Click a heatmap cell to inspect it.",
-            ha="left", va="top", family="monospace", fontsize=8,
-        )
+        self._main_size_initialized = False
+        self._controls_size_initialized = False
         self.fig_main.canvas.mpl_connect("button_press_event", self._on_click)
         self._rebuild_controls()
         self._draw_heatmaps()
@@ -472,31 +458,49 @@ class HeatmapExplorer:
         )
         slider_count = len(self._get_slider_dims()) + threshold_count
         radio_height = len(keys) * 0.03 + 0.01
-        content_height = 0.03 + 2 * (0.01 + radio_height + 0.02) + slider_count * 0.075 + 0.02
+        content_height = 0.03 + 0.01 + radio_height + 0.02 + slider_count * 0.075 + 0.02
         height_multiplier = 11.0 + max(0, len(keys) - 5) * 0.3
-        self.fig_controls.set_size_inches(3.2, max(6.0, content_height * height_multiplier + 1.0))
+        if not self._controls_size_initialized:
+            self.fig_controls.set_size_inches(3.2, max(6.0, content_height * height_multiplier + 1.0))
+            self._controls_size_initialized = True
         self.fig_controls.text(
             0.5, 0.98, "Dimension Controls", ha="center", va="top", fontsize=10, fontweight="bold"
         )
-        self.fig_controls.text(0.05, 0.95, "X axis:", ha="left", va="top", fontsize=9)
-        x_box_top = 0.94
-        x_box = self.fig_controls.add_axes((0.20, x_box_top - radio_height, 0.75, radio_height))
-        x_box.set_frame_on(False)
-        y_label_y = x_box_top - radio_height - 0.02
-        self.fig_controls.text(0.05, y_label_y, "Y axis:", ha="left", va="top", fontsize=9)
-        y_box_top = y_label_y - 0.01
-        y_box = self.fig_controls.add_axes((0.20, y_box_top - radio_height, 0.75, radio_height))
-        y_box.set_frame_on(False)
+        radio_top = 0.94
+        radio_bottom = radio_top - radio_height
+        radio_columns = (("X", 0.05), ("Y", 0.23))
+        radio_boxes = []
+        for title, left in radio_columns:
+            self.fig_controls.text(left, 0.95, f"{title} axis:", ha="left", va="top", fontsize=9)
+            box = self.fig_controls.add_axes((left, radio_bottom, 0.16, radio_height))
+            box.set_frame_on(False)
+            radio_boxes.append(box)
+        self.fig_controls.text(0.43, 0.95, "Dimension", ha="left", va="top", fontsize=9)
+        label_rows = np.linspace(
+            1.0,
+            0.0,
+            len(keys) + 2,
+        )
+        for row_y, label in zip(label_rows[1:-1], radio_labels, strict=True):
+            self.fig_controls.text(
+                0.43,
+                radio_bottom + radio_height * row_y,
+                label,
+                ha="left",
+                va="center",
+                fontsize=8,
+            )
+        x_box, y_box = radio_boxes
         self.x_radio = RadioButtons(x_box, radio_labels, active=keys.index(self.state.x_axis))
         self.y_radio = RadioButtons(y_box, radio_labels, active=keys.index(self.state.y_axis))
         self.x_radio.on_clicked(self._on_x_changed)
         self.y_radio.on_clicked(self._on_y_changed)
         for radio in (self.x_radio, self.y_radio):
             for label in radio.labels:
-                label.set_fontsize(8)
+                label.set_visible(False)
         self.sliders = []
         self._slider_value_texts = {}
-        y = y_box_top - radio_height - 0.02
+        y = radio_bottom - 0.02
         for _, key in self._get_slider_dims():
             axis = self.dataset.axis(key)
             view = self._axis_views[key]
@@ -644,9 +648,11 @@ class HeatmapExplorer:
         rows = max(1, math.ceil(n / cols))
         x_view = self._axis_views[self.state.x_axis]
         y_view = self._axis_views[self.state.y_axis]
-        self.fig_main.set_size_inches(
-            *_main_figure_size(len(x_view.centers), len(y_view.centers), rows, cols)
-        )
+        if not self._main_size_initialized:
+            self.fig_main.set_size_inches(
+                *_main_figure_size(len(x_view.centers), len(y_view.centers), rows, cols)
+            )
+            self._main_size_initialized = True
         self._metric_axes = [self.fig_main.add_subplot(rows, cols, i + 1) for i in range(n)]
         self.axes = self._metric_axes
         self.meshes = []
@@ -761,23 +767,25 @@ class HeatmapExplorer:
         if selection is None:
             return
         self.last_selection = selection
-        self._update_metrics(selection)
         key = str(getattr(event, "key", "") or "").lower()
         right = event.button in {MouseButton.RIGHT, 3}
-        if right or (event.button in {MouseButton.LEFT, 1} and "shift" in key):
+        shifted = event.button in {MouseButton.LEFT, 1} and "shift" in key
+        if right or shifted:
             self.replay(selection, "shift" if "shift" in key else "right")
-
-    def _update_metrics(self, selection: HeatmapSelection) -> None:
-        lines = ["selection_ref:", json.dumps(selection.to_selection_ref(self.run_id).to_dict(), sort_keys=True), "", "coordinates:"]
-        lines.extend(f"  {name}: {format_axis_value(value)}" for name, value in selection.coordinates.items())
-        lines.append("")
-        lines.append("metrics:")
-        for metric in self.state.tiles:
-            tile_mask = self.state.mask if _metric_requires_mask(metric) else MaskSpec()
-            value = self.dataset.metric_array(metric, tile_mask)[selection.grid_indices]
-            lines.append(f"  {metric}: {format_metric_value(metric, value)}")
-        self.metrics_text.set_text("\n".join(lines))
-        self.fig_metrics.canvas.draw_idle()
+        elif event.button in {MouseButton.LEFT, 1}:
+            coordinates = ", ".join(
+                f"{name}={format_axis_value(value)}"
+                for name, value in selection.coordinates.items()
+            )
+            metrics = []
+            for metric in self.state.tiles:
+                tile_mask = self.state.mask if _metric_requires_mask(metric) else MaskSpec()
+                value = self.dataset.metric_array(metric, tile_mask)[selection.grid_indices]
+                metrics.append(f"{metric}={format_metric_value(metric, value)}")
+            print(
+                f"selection candidate={selection.candidate_id} ordinal={selection.ordinal} "
+                f"({coordinates}) | " + " | ".join(metrics)
+            )
 
     def replay(self, selection: HeatmapSelection, mode: str = "shift") -> Any:
         """Forward an exact selection to the caller's local replay callback."""
@@ -801,7 +809,7 @@ class HeatmapExplorer:
             Path(temporary_name).unlink(missing_ok=True)
         payload = self.state.to_dict()
         payload["explorer"] = {
-            "window_titles": ["Heatmaps", "Controls", "Metrics"],
+            "window_titles": ["Heatmaps", "Controls"],
             "run_id": self.run_id,
             "selection": self.last_selection.to_selection_ref(self.run_id).to_dict() if self.last_selection else None,
         }
@@ -812,7 +820,7 @@ class HeatmapExplorer:
         plt.show(block=block)
 
     def close(self) -> None:
-        for figure in (self.fig_main, self.fig_controls, self.fig_metrics):
+        for figure in (self.fig_main, self.fig_controls):
             plt.close(figure)
 
 

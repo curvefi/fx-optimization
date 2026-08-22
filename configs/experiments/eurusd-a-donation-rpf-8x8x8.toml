@@ -2,7 +2,7 @@
 id = "eurusd-a-donation-rpf-8x8x8"
 evaluator = "../../../curve-fx-arb-harness/build/native/arb_evaluator_f64"
 template = "../templates/eurusd-2024-monorepo.json"
-batch_size = 256
+batch_size = 64
 workers = 10
 
 [session]

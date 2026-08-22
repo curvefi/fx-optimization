@@ -48,6 +48,24 @@ def _event(explorer: HeatmapExplorer, *, button: int = 1, key: str | None = None
 def test_dimension_and_axis_sliders_keep_global_color_limits() -> None:
     explorer = HeatmapExplorer(_dataset(), metrics=["apy_net"], ncol=1)
     try:
+        assert not hasattr(explorer, "fig_metrics")
+        assert all(not label.get_visible() for label in explorer.x_radio.labels)
+        assert all(not label.get_visible() for label in explorer.y_radio.labels)
+        x_position = explorer.x_radio.ax.get_position()
+        y_position = explorer.y_radio.ax.get_position()
+        assert x_position.y0 == y_position.y0
+        assert x_position.x0 < y_position.x0
+        shared_labels = {
+            text.get_text(): text
+            for text in explorer.fig_controls.texts
+            if text.get_text() in {"x", "y", "scenario"}
+        }
+        assert set(shared_labels) == {"x", "y", "scenario"}
+        expected_rows = np.linspace(1.0, 0.0, 5)[1:-1]
+        assert np.allclose(
+            [shared_labels[name].get_position()[1] for name in ("x", "y", "scenario")],
+            x_position.y0 + x_position.height * expected_rows,
+        )
         clims = [mesh.get_clim() for mesh in explorer.meshes]
         assert dict(explorer.sliders)["scenario"].val == 0
         dict(explorer.sliders)["scenario"].set_val(1)
@@ -62,19 +80,51 @@ def test_dimension_and_axis_sliders_keep_global_color_limits() -> None:
         explorer.close()
 
 
-def test_left_shift_and_right_clicks_forward_exact_selection_ref() -> None:
+def test_controls_size_survives_axis_rebuild() -> None:
+    explorer = HeatmapExplorer(_dataset(), metrics=["apy_net"], ncol=1)
+    try:
+        assert tuple(explorer.fig_controls.get_size_inches()) == (3.2, 6.0)
+        user_size = (8.5, 4.25)
+        explorer.fig_controls.set_size_inches(*user_size)
+        explorer.x_radio.set_active(explorer._radio_keys.index("scenario"))
+        assert tuple(explorer.fig_controls.get_size_inches()) == user_size
+    finally:
+        explorer.close()
+
+
+def test_main_size_survives_axis_rebuild() -> None:
+    explorer = HeatmapExplorer(_dataset(), metrics=["apy_net"], ncol=1)
+    try:
+        user_size = (8.5, 4.25)
+        explorer.fig_main.set_size_inches(*user_size)
+        explorer.x_radio.set_active(explorer._radio_keys.index("scenario"))
+        assert tuple(explorer.fig_main.get_size_inches()) == user_size
+    finally:
+        explorer.close()
+
+
+def test_left_shift_and_right_clicks_forward_exact_selection_ref(capsys) -> None:
     callbacks: list[tuple[object, str]] = []
     explorer = HeatmapExplorer(
-        _dataset(), metrics=["apy_net"], run_id="grid-run",
+        _dataset(),
+        metrics=["apy_net", "max_7d_rel_price_diff", "tw_real_slippage_1pct"],
+        run_id="grid-run",
         on_replay=lambda selection, mode: callbacks.append((selection, mode)),
     )
     try:
         explorer._on_click(_event(explorer))
         assert explorer.last_selection is not None
         assert callbacks == []
+        output = capsys.readouterr().out
+        assert "candidate=candidate-0 ordinal=0" in output
+        assert "x=1, y=10, scenario=base" in output
+        assert "apy_net=0%" in output
+        assert "max_7d_rel_price_diff=0.1%" in output
+        assert "tw_real_slippage_1pct=0.1%" in output
 
         explorer._on_click(_event(explorer, key="shift"))
         explorer._on_click(_event(explorer, button=3))
+        assert capsys.readouterr().out == ""
         assert [mode for _, mode in callbacks] == ["shift", "right"]
         assert callbacks[0][0] == callbacks[1][0]
         selection = callbacks[0][0]
@@ -96,6 +146,6 @@ def test_save_exports_png_and_state_with_selection(tmp_path: Path) -> None:
 
     assert image.is_file() and image.stat().st_size > 0
     payload = json.loads(state.read_text())
-    assert payload["explorer"]["window_titles"] == ["Heatmaps", "Controls", "Metrics"]
+    assert payload["explorer"]["window_titles"] == ["Heatmaps", "Controls"]
     assert payload["explorer"]["selection"]["candidate_id"] == "candidate-0"
     assert payload["slider_indices"] == {"scenario": 0}
