@@ -27,6 +27,27 @@ cd /path/to/curve-fx-optimization
 uv sync --frozen --group dev
 ```
 
+## Market data
+
+Download raw candles and filter them as separate steps. Use dated filenames;
+both commands refuse to replace an existing output.
+
+```sh
+uv run python scripts/fetch_binance_candles.py \
+  --start 2023-01-01T00:00:00Z --end 2026-08-26T00:00:00Z \
+  --workers 16 \
+  --output data/market/ethusd/candles-2023-2026-08-25-raw.json
+
+uv run python scripts/filter_candles.py \
+  data/market/ethusd/candles-2023-2026-08-25-raw.json \
+  data/market/ethusd/candles-2023-2026-08-25-filtered.json
+```
+
+The downloader partitions the requested minute range into independent Binance
+pages, fetches them concurrently, preserves legitimate exchange gaps, rejects
+duplicates or disorder, and publishes the merged JSON atomically. The filter
+owns only the established centered-neighbor OHLC clipping step.
+
 Configs live under `configs/`. The current experiment example is `configs/experiments/eurusd-a-donation-rpf-8x8x8.toml`. Its TOML owns run, session, scenario, candidate, and placement settings; the pool template remains under `configs/templates`, while compiled policies are harness build inputs. Non-empty `[placement].hosts` implies SSH; otherwise execution is local. Remote runs map config-relative sibling-workspace paths to remote-home-relative `arb/...`. Missing portable session inputs are copied once through the first shared-NFS host, while existing files are kept; the evaluator is never copied.
 
 ## The four commands
