@@ -37,8 +37,14 @@ class CartesianGrid:
         names = tuple(sorted(self.axes))
         values = tuple(self.axes[name] for name in names)
         for ordinal, point in enumerate(product(*values)):
+            updates: dict[str, Any] = {}
+            for name, value in zip(names, point, strict=True):
+                if isinstance(value, Mapping):
+                    updates.update(value)
+                else:
+                    updates[name] = value
             yield CandidateSpec.from_payload(
-                merge_payload(self.defaults, dict(zip(names, point, strict=True))),
+                merge_payload(self.defaults, updates),
                 ordinal=ordinal,
             )
 
@@ -61,8 +67,14 @@ class CartesianGrid:
             values = self.axes[name]
             remainder, index = divmod(remainder, len(values))
             coordinates.append(values[index])
+        updates: dict[str, Any] = {}
+        for name, value in zip(names, reversed(coordinates), strict=True):
+            if isinstance(value, Mapping):
+                updates.update(value)
+            else:
+                updates[name] = value
         return CandidateSpec.from_payload(
-            merge_payload(self.defaults, dict(zip(names, reversed(coordinates), strict=True))),
+            merge_payload(self.defaults, updates),
             ordinal=ordinal,
         )
 

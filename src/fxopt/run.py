@@ -245,6 +245,7 @@ def placement_lanes(
                     host,
                     inputs["evaluator"],
                     workers=config.workers,
+                    timeout=600.0,
                     verify_local_inputs=False,
                 ),
             )

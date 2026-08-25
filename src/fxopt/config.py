@@ -91,6 +91,19 @@ def _axis_values(spec: object, label: str) -> tuple[Any, ...]:
     return tuple(values)
 
 
+def _paths_overlap(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
+    return left[: len(right)] == right or right[: len(left)] == left
+
+
+def _validate_update_paths(paths: Sequence[tuple[str, ...]]) -> None:
+    if any(
+        _paths_overlap(path, other)
+        for index, path in enumerate(paths)
+        for other in paths[:index]
+    ):
+        raise ConfigError("axis update paths contain a collision")
+
+
 @dataclass(frozen=True, slots=True)
 class CandidateConfig:
     """A shared default payload plus optional named Cartesian dimensions."""
@@ -117,20 +130,39 @@ class CandidateConfig:
         elif raw_axes:
             raise ConfigError("axes must be a mapping")
 
-        try:
-            paths = [path_parts(name) for name in axes]
-        except CandidateError as exc:
-            raise ConfigError(str(exc)) from exc
-        for index, path in enumerate(paths):
-            if any(path[:size] == other for other in paths[:index] for size in range(1, len(path) + 1)):
-                raise ConfigError("axis paths contain a collision")
-            if any(other[:size] == path for other in paths[:index] for size in range(1, len(other) + 1)):
-                raise ConfigError("axis paths contain a collision")
+        axis_paths: dict[str, list[tuple[str, ...]]] = {}
         for name, values in axes.items():
-            try:
-                merge_payload(defaults, {name: values[0]})
-            except CandidateError as exc:
-                raise ConfigError(str(exc)) from exc
+            grouped = isinstance(values[0], Mapping)
+            if any(isinstance(value, Mapping) != grouped for value in values):
+                raise ConfigError(f"axis {name} values must all be mappings or scalars")
+            declared_paths: frozenset[tuple[str, ...]] | None = None
+            for value in values:
+                updates = value if grouped else {name: value}
+                if not updates:
+                    raise ConfigError(f"axis {name} mapping values must not be empty")
+                try:
+                    value_paths = [path_parts(key) for key in updates]
+                    _validate_update_paths(value_paths)
+                    merge_payload(defaults, updates)
+                except CandidateError as exc:
+                    raise ConfigError(str(exc)) from exc
+                current_paths = frozenset(value_paths)
+                if declared_paths is None:
+                    declared_paths = current_paths
+                elif current_paths != declared_paths:
+                    raise ConfigError(
+                        f"axis {name} mapping values must update the same paths"
+                    )
+            axis_paths[name] = sorted(declared_paths or ())
+        names = tuple(axis_paths)
+        for index, name in enumerate(names):
+            if any(
+                _paths_overlap(path, other)
+                for other_name in names[:index]
+                for path in axis_paths[name]
+                for other in axis_paths[other_name]
+            ):
+                raise ConfigError("axis update paths contain a collision")
 
         return cls(dict(defaults), axes)
 

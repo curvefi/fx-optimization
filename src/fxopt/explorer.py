@@ -43,13 +43,35 @@ def _metric_columns(requested: Sequence[str], available: Sequence[str]) -> tuple
     return tuple(name for name in available if name in needed)
 
 
+def _heatmap_axis(name: str, raw_values: object) -> HeatmapAxis:
+    if not isinstance(raw_values, list) or not raw_values:
+        raise ValueError(f"run axis {name!r} has invalid values")
+    values = tuple(raw_values)
+    grouped = isinstance(values[0], dict)
+    if any(isinstance(value, dict) != grouped for value in values):
+        raise ValueError(f"run axis {name!r} mixes scalar and grouped values")
+    if not grouped:
+        return HeatmapAxis.from_metadata({"name": name, "values": values})
+
+    member_names = tuple(sorted(values[0]))
+    if not member_names or any(tuple(sorted(value)) != member_names for value in values):
+        raise ValueError(f"run axis {name!r} grouped values have inconsistent members")
+    rows = tuple(tuple(value[member] for member in member_names) for value in values)
+    if len(member_names) == 1:
+        return HeatmapAxis.from_metadata({
+            "name": member_names[0],
+            "values": tuple(row[0] for row in rows),
+        })
+    return HeatmapAxis.from_metadata({"names": member_names, "rows": rows})
+
+
 def _dataset(columns: ResultColumns) -> HeatmapDataset:
     raw_axes = columns.metadata.get("axes")
     raw_shape = columns.metadata.get("shape")
     if not isinstance(raw_axes, dict) or not isinstance(raw_shape, list):
         raise ValueError("run has no Cartesian axis metadata")
     names = tuple(sorted(raw_axes))
-    axes = tuple(HeatmapAxis((name,), tuple(raw_axes[name])) for name in names)
+    axes = tuple(_heatmap_axis(name, raw_axes[name]) for name in names)
     shape = tuple(int(value) for value in raw_shape)
     if shape != tuple(len(axis.values) for axis in axes):
         raise ValueError("run axis metadata and shape disagree")

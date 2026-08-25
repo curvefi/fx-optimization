@@ -81,7 +81,8 @@ def _axis_name_and_labels(name: str, values: Sequence[float]) -> tuple[str, tupl
     if "fee_bps" in key:
         return f"{name} (bps)", tuple(f"{value:.2f}" for value in values)
     if "fee" in key and "gamma" not in key:
-        return f"{name} (bps)", tuple(f"{value / 1e10 * 1e4:.2f}" for value in values)
+        scale = 1e4 if values and max(abs(value) for value in values) <= 1 else 1e-6
+        return f"{name} (bps)", tuple(f"{value * scale:.2f}" for value in values)
     if "ma_time" in key or "price_source_ema_half_time" in key:
         suffix = "" if "hrs" in key else " (hrs)"
         return display_name + suffix, tuple(_format_duration_short(value * _LN2) for value in values)
@@ -101,7 +102,7 @@ def _format_slider_value(name: str, value: float) -> str:
     if key in {"reserved_profit_fraction", "admin_fee"}:
         return f"{(value / 1e10 if abs(value) > 1 else value):.4f}"
     if "fee" in key and "gamma" not in key:
-        return f"{value / 1e10 * 1e4:.1f} bps"
+        return f"{value * (1e4 if abs(value) <= 1 else 1e-6):.1f} bps"
     if "ma_time" in key or "price_source_ema_half_time" in key:
         return _format_duration_short(value * _LN2)
     if name == "A" or key == "a":
