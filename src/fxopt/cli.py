@@ -1,6 +1,7 @@
 """One small CLI for grids, optimization, heatmaps, and Shift-click replay."""
 
 from pathlib import Path
+import platform
 import threading
 import time
 
@@ -10,7 +11,7 @@ from .config import ConfigError
 from .optimize import OptimizationError, optimize_config
 from .results import read_result_columns
 from .run import grid_summary, run_config
-from .shiftclick import trace_candidate
+from .shiftclick import save_shiftclick_plot, trace_candidate
 
 
 class _ProgressReporter:
@@ -183,9 +184,15 @@ def shiftclick_command(
         candidate = columns.candidate_at(ordinal)
         path = trace_candidate(config, candidate=candidate, ordinal=ordinal, output_dir=output_dir,
                                trace_interval=trace_interval, trace_actions=actions)
+        local_platform = " ".join(value for value in (platform.system(), platform.machine()) if value)
+        plot = save_shiftclick_plot(
+            path,
+            output_dir / "shiftclick.png",
+            title=f"{columns.run_id}: {ordinal} | local {local_platform}",
+        )
     except (ConfigError, OSError, TypeError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(f"wrote {path}")
+    click.echo(f"wrote {path} and {plot}")
 
 
 if __name__ == "__main__":

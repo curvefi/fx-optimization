@@ -14,10 +14,8 @@ from curve_fx_sim.plotting.masked_metrics import (
     SKEW_MASKED_METRICS,
     SLIPPAGE_APY_MASK_SOURCES,
 )
-from curve_fx_sim.plotting.shiftclick_view import render_shiftclick_figure
-
 from .results import ResultColumns, read_result_columns
-from .shiftclick import trace_candidate
+from .shiftclick import shiftclick_figure, trace_candidate
 
 
 def _metric_columns(requested: Sequence[str], available: Sequence[str]) -> tuple[str, ...]:
@@ -127,10 +125,7 @@ def open_fxopt_explorer(
             trace_actions=False,
             yb_mode=None if mode == "shift" else "off",
         )
-        import json
-        payload = json.loads(summary.read_text())
-        trace_path = payload["result"]["artifacts"]["trace_path"]
-        figure = render_shiftclick_figure(Path(trace_path), title=f"{columns.run_id}: {ordinal}")
+        figure = shiftclick_figure(summary, title=f"{columns.run_id}: {ordinal}")
         figure.show()
         return summary
 

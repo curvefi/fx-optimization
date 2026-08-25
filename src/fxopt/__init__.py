@@ -11,7 +11,7 @@ from .results import (
 )
 from .run import RunConfig, run_config
 from .optimize import optimize_config
-from .shiftclick import trace_candidate
+from .shiftclick import save_shiftclick_plot, shiftclick_figure, trace_candidate
 
 __all__ = [
     "ArtifactPaths",
@@ -27,5 +27,7 @@ __all__ = [
     "write_results",
     "run_config",
     "optimize_config",
+    "save_shiftclick_plot",
+    "shiftclick_figure",
     "trace_candidate",
 ]

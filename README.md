@@ -65,7 +65,7 @@ uv run fxopt shiftclick runs/eurusd-a-donation-rpf-8x8x8 \
   --ordinal 12 --output runs/eurusd-a-donation-rpf-8x8x8/inspections/ordinal-12
 ```
 
-`--trace-interval` and `--actions` enable denser traces and action recording. Replay takes the exact stored candidate from `results.npz` and uses the source config's local evaluator and session inputs with one local worker; SSH placement is not reused. It writes `shiftclick.json` plus trace artifacts under the selected output directory.
+`--trace-interval` and `--actions` enable denser traces and action recording. Replay takes the exact stored candidate from `results.npz` and uses the source config's local evaluator and session inputs with one local worker; SSH placement is not reused. It writes `shiftclick.json`, the trace artifacts, and `shiftclick.png` under the selected output directory. The plot title labels the local platform so double-versus-production-long-double stability checks stay explicit.
 
 ## Results and configuration
 

@@ -84,4 +84,46 @@ def trace_candidate(
     return summary
 
 
-__all__ = ["trace_candidate"]
+def shiftclick_figure(summary_path: str | Path, *, title: str | None = None):
+    """Render the trace referenced by a Shift-click summary."""
+    summary = Path(summary_path).expanduser().resolve()
+    try:
+        payload = json.loads(summary.read_text(encoding="utf-8"))
+        raw_trace = payload["result"]["artifacts"]["trace_path"]
+    except (OSError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid Shift-click summary: {summary}") from exc
+    if not isinstance(raw_trace, str) or not raw_trace:
+        raise ValueError(f"Shift-click summary has no trace path: {summary}")
+    trace = Path(raw_trace).expanduser()
+    if not trace.is_absolute():
+        trace = summary.parent / trace
+    if not trace.is_file():
+        raise ValueError(f"Shift-click trace does not exist locally: {trace}")
+    from curve_fx_sim.plotting.shiftclick_view import render_shiftclick_figure
+
+    return render_shiftclick_figure(trace, title=title)
+
+
+def save_shiftclick_plot(
+    summary_path: str | Path,
+    output_path: str | Path,
+    *,
+    title: str | None = None,
+) -> Path:
+    """Render and atomically save one Shift-click PNG."""
+    output = Path(output_path).expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.tmp")
+    figure = shiftclick_figure(summary_path, title=title)
+    try:
+        figure.savefig(temporary, format="png", dpi=160, bbox_inches="tight")
+        os.replace(temporary, output)
+    finally:
+        temporary.unlink(missing_ok=True)
+        from matplotlib import pyplot as plt
+
+        plt.close(figure)
+    return output
+
+
+__all__ = ["save_shiftclick_plot", "shiftclick_figure", "trace_candidate"]
