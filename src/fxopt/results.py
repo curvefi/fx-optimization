@@ -295,16 +295,21 @@ def read_results(directory: str | Path) -> ResultBundle:
 class ResultWriter:
     """Append bounded batches and finalize without retaining rows in memory."""
 
-    def __init__(self, directory: str | Path, *, run_id: str, metadata: Mapping[str, Any] | None = None):
+    def __init__(
+        self,
+        directory: str | Path,
+        *,
+        run_id: str,
+        metadata: Mapping[str, Any] | None = None,
+        resumable: bool = False,
+    ):
         if not isinstance(run_id, str) or not run_id.strip():
             raise ValueError("run_id must be a non-empty string")
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
-        self._temporary = Path(tempfile.mkdtemp(prefix=".fxopt-", dir=self.directory))
-        self._spool_path = self._temporary / "rows.jsonl"
-        self._spool = self._spool_path.open("wb")
         self._run_id = run_id
         self._metadata = dict(metadata or {})
+        self._resumable = resumable
         self._metric_names: set[str] = set()
         self._count = 0
         self._stats = {
@@ -315,11 +320,78 @@ class ResultWriter:
             "params": 0,
         }
         self._closed = False
+        if resumable:
+            if (self.directory / RUN_FILENAME).exists() or (
+                self.directory / RESULTS_FILENAME
+            ).exists():
+                raise FileExistsError(f"completed result already exists in {self.directory}")
+            self._temporary = self.directory / ".fxopt-partial"
+            state_path = self._temporary / "state.json"
+            expected_state = {"run_id": run_id, "metadata": self._metadata}
+            if self._temporary.exists():
+                try:
+                    state = json.loads(state_path.read_bytes())
+                except (OSError, ValueError, json.JSONDecodeError) as exc:
+                    raise ValueError("invalid resumable result state") from exc
+                if _canonical_json_bytes(state) != _canonical_json_bytes(expected_state):
+                    raise ValueError("partial result does not match this run configuration")
+            else:
+                self._temporary.mkdir()
+                _atomic_bytes(state_path, _canonical_json_bytes(expected_state))
+            self._spool_path = self._temporary / "rows.jsonl"
+            if self._spool_path.exists():
+                self._restore()
+            self._spool = self._spool_path.open("ab")
+        else:
+            self._temporary = Path(tempfile.mkdtemp(prefix=".fxopt-", dir=self.directory))
+            self._spool_path = self._temporary / "rows.jsonl"
+            self._spool = self._spool_path.open("wb")
 
     @property
     def retained_rows(self) -> int:
         """Always zero: rows live in the temporary spool, not in Python objects."""
         return 0
+
+    @property
+    def row_count(self) -> int:
+        return self._count
+
+    def _account(self, row: Mapping[str, Any]) -> None:
+        candidate_data = row["candidate"]
+        result_data = row["result"]
+        self._metric_names.update(result_data.get("metrics", {}))
+        self._count += 1
+        self._stats["max_id"] = max(
+            self._stats["max_id"], len(candidate_data["candidate_id"])
+        )
+        self._stats["max_status"] = max(
+            self._stats["max_status"], len(result_data["status"])
+        )
+        self._stats["max_error"] = max(
+            self._stats["max_error"], len(result_data.get("error") or "")
+        )
+        overrides = _canonical_json_bytes(candidate_data.get("pool_overrides", {}))
+        self._stats["max_overrides"] = max(
+            self._stats["max_overrides"], len(overrides.decode())
+        )
+        self._stats["params"] += len(candidate_data.get("policy_params", ()))
+
+    def _restore(self) -> None:
+        with self._spool_path.open("rb") as stream:
+            for expected_ordinal, line in enumerate(stream):
+                try:
+                    row = json.loads(line)
+                    candidate = row["candidate"]
+                    result = row["result"]
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ValueError("invalid resumable result row") from exc
+                if (
+                    candidate.get("ordinal") != expected_ordinal
+                    or result.get("ordinal") != expected_ordinal
+                    or candidate.get("candidate_id") != result.get("candidate_id")
+                ):
+                    raise ValueError("resumable result rows are not a contiguous prefix")
+                self._account(row)
 
     def update_metadata(self, **values: Any) -> None:
         """Add small run-level facts before final publication."""
@@ -337,15 +409,7 @@ class ResultWriter:
                 raise ValueError("candidate and result IDs must match")
             row = {"candidate": candidate.to_dict(ordinal=result.ordinal), "result": result.to_dict()}
             self._spool.write(_canonical_json_bytes(row) + b"\n")
-            self._metric_names.update(result.metrics)
-            self._count += 1
-            candidate_data, result_data = row["candidate"], row["result"]
-            self._stats["max_id"] = max(self._stats["max_id"], len(candidate_data["candidate_id"]))
-            self._stats["max_status"] = max(self._stats["max_status"], len(result_data["status"]))
-            self._stats["max_error"] = max(self._stats["max_error"], len(result_data.get("error") or ""))
-            overrides = _canonical_json_bytes(candidate_data.get("pool_overrides", {})).decode()
-            self._stats["max_overrides"] = max(self._stats["max_overrides"], len(overrides))
-            self._stats["params"] += len(candidate_data.get("policy_params", ()))
+            self._account(row)
         self._spool.flush()
 
     def _rows(self):
@@ -360,6 +424,7 @@ class ResultWriter:
             raise RuntimeError("result writer is closed")
         self._spool.close()
         self._closed = True
+        complete = False
         try:
             metric_names = tuple(sorted(self._metric_names))
             stats = self._stats
@@ -407,11 +472,13 @@ class ResultWriter:
                 run_payload = {"schema_version": SCHEMA_VERSION, "run_id": self._run_id, "candidate_count": self._count, "metric_names": list(metric_names), "metadata": self._metadata}
                 _atomic_npz(root / RESULTS_FILENAME, arrays)
                 _atomic_bytes(root / RUN_FILENAME, _canonical_json_bytes(run_payload))
+                complete = True
                 return ArtifactPaths(root / RUN_FILENAME, root / RESULTS_FILENAME)
             finally:
                 shutil.rmtree(staging, ignore_errors=True)
         finally:
-            self.cleanup()
+            if complete or not self._resumable:
+                self.cleanup()
 
     def cleanup(self) -> None:
         if not self._spool.closed:
@@ -422,7 +489,11 @@ class ResultWriter:
         return self
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        if exc_type is None and not self._closed:
-            self.finalize()
+        if exc_type is None:
+            if not self._closed:
+                self.finalize()
+        elif self._resumable:
+            if not self._spool.closed:
+                self._spool.close()
         else:
             self.cleanup()

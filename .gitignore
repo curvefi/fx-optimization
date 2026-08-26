@@ -9,6 +9,10 @@ build/
 dist/
 *.egg-info/
 runs/
+# Agent-generated search manifests are mutable workbench inputs. Completed runs
+# carry their resolved configuration and replay inputs in run.json.
+configs/autoresearch/*
+!configs/autoresearch/README.md
 # Market candles ship compressed (data/market/*/candles.xz via LFS); the
 # uncompressed JSON is a local working artifact and is not tracked.
 data/market/**/*.json

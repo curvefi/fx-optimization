@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 import tomllib
 from typing import Any
@@ -10,8 +11,8 @@ from typing import Any
 import nevergrad as ng
 
 from .candidates import CandidateSpec, merge_payload
-from .placement import EvaluatorFleet
 from .engine import ClientFactory
+from .placement import EvaluatorFleet
 from .results import ArtifactPaths, ResultWriter
 from .run import (
     ProgressCallback,
@@ -20,6 +21,13 @@ from .run import (
     open_session_request,
     placement_lanes,
     run_metadata,
+)
+from .scoring import (
+    COMBINED_SCORE,
+    COMBINED_SCORE_FORMULA,
+    DETACH_ENERGY_WEIGHT,
+    GM_FLOOR,
+    combined_score,
 )
 
 
@@ -51,8 +59,13 @@ def _settings(path: Path) -> dict[str, Any]:
         raise OptimizationError("optimization.maximize must be a boolean")
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise OptimizationError("optimization.seed must be an integer")
-    return {"budget": budget, "batch_size": batch_size, "metric": metric,
-            "maximize": maximize, "seed": seed}
+    return {
+        "budget": budget,
+        "batch_size": batch_size,
+        "metric": metric,
+        "maximize": maximize,
+        "seed": seed,
+    }
 
 
 def optimize_config(
@@ -68,7 +81,8 @@ def optimize_config(
     if not config.candidate.axes:
         raise OptimizationError("optimization requires at least one candidate axis")
     parametrization = ng.p.Dict(**{
-        name: ng.p.Choice(list(values)) for name, values in config.candidate.axes.items()
+        name: ng.p.Choice(list(values))
+        for name, values in config.candidate.axes.items()
     })
     optimizer = ng.optimizers.TwoPointsDE(
         parametrization=parametrization,
@@ -82,6 +96,12 @@ def optimize_config(
     per_lane_batch = min(config.batch_size, settings["batch_size"])
     metadata = run_metadata(config, effective_batch=per_lane_batch)
     metadata.update({"kind": "optimization", **settings})
+    if settings["metric"] == COMBINED_SCORE:
+        metadata[COMBINED_SCORE] = {
+            "formula": COMBINED_SCORE_FORMULA,
+            "gm_floor": GM_FLOOR,
+            "detach_energy_weight": DETACH_ENERGY_WEIGHT,
+        }
     writer = ResultWriter(destination, run_id=config.run_id, metadata=metadata)
     best_value = float("-inf") if settings["maximize"] else float("inf")
     best_ordinal: int | None = None
@@ -109,21 +129,40 @@ def optimize_config(
                 ]
                 candidates = tuple(candidate_from_spec(spec) for spec in specs)
                 results = fleet.evaluate(candidates)
-                for index, (asked_item, result) in enumerate(zip(asked, results, strict=True)):
+                if settings["metric"] == COMBINED_SCORE:
+                    results = [
+                        replace(
+                            result,
+                            metrics={
+                                **result.metrics,
+                                COMBINED_SCORE: combined_score(result.metrics),
+                            },
+                        )
+                        if result.status == "ok"
+                        else result
+                        for result in results
+                    ]
+                for index, (asked_item, result) in enumerate(
+                    zip(asked, results, strict=True)
+                ):
                     value = result.metrics.get(settings["metric"])
                     valid = result.status == "ok" and value is not None
                     loss = (-value if settings["maximize"] else value) if valid else 1e300
                     optimizer.tell(asked_item, loss)
-                    if valid and ((settings["maximize"] and value > best_value) or
-                                  (not settings["maximize"] and value < best_value)):
+                    if valid and (
+                        (settings["maximize"] and value > best_value)
+                        or (not settings["maximize"] and value < best_value)
+                    ):
                         best_value = value
                         best_ordinal = completed + index
                 writer.append(candidates, results)
                 completed += count
                 if progress_callback is not None:
                     progress_callback(completed, total)
-        writer.update_metadata(best_ordinal=best_ordinal,
-                               best_metric_value=None if best_ordinal is None else best_value)
+        writer.update_metadata(
+            best_ordinal=best_ordinal,
+            best_metric_value=None if best_ordinal is None else best_value,
+        )
         return writer.finalize()
 
 

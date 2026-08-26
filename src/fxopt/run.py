@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path, PurePosixPath
 import tomllib
 from typing import Any
@@ -20,10 +21,15 @@ from .placement import (
     ssh_client_factory,
 )
 from .results import ArtifactPaths, ResultWriter
+from .robustness import (
+    RobustnessAxis,
+    parse_robustness_axes,
+    robustness_metadata,
+)
 
 
 _RUN_KEYS = frozenset({"id", "evaluator", "template", "batch_size", "workers"})
-_PLACEMENT_KEYS = frozenset({"hosts"})
+_PLACEMENT_KEYS = frozenset({"hosts", "numa_nodes"})
 _CANDIDATE_KEYS = frozenset({"defaults", "axes"})
 _SCENARIO_KEYS = frozenset({"id", "market", "chainlink", "yb_mode"})
 
@@ -59,9 +65,11 @@ class RunConfig:
     batch_size: int
     workers: int
     hosts: tuple[str, ...]
+    numa_nodes: tuple[int, ...]
     candidate: CandidateConfig
     session: Mapping[str, Any]
     scenario: Mapping[str, Any]
+    robustness: tuple[RobustnessAxis, ...]
 
     @classmethod
     def from_toml(cls, path: str | Path) -> "RunConfig":
@@ -105,6 +113,23 @@ class RunConfig:
             if host in hosts:
                 raise ConfigError(f"duplicate placement host: {host!r}")
             hosts.append(host)
+        raw_numa_nodes = placement.get("numa_nodes", [])
+        if (
+            isinstance(raw_numa_nodes, (str, bytes))
+            or not isinstance(raw_numa_nodes, list)
+        ):
+            raise ConfigError("placement.numa_nodes must be an array")
+        numa_nodes: list[int] = []
+        for node in raw_numa_nodes:
+            if isinstance(node, bool) or not isinstance(node, int) or node < 0:
+                raise ConfigError(
+                    "placement.numa_nodes entries must be non-negative integers"
+                )
+            if node in numa_nodes:
+                raise ConfigError(f"duplicate placement NUMA node: {node}")
+            numa_nodes.append(node)
+        if numa_nodes and not hosts:
+            raise ConfigError("placement.numa_nodes requires placement.hosts")
 
         session = raw.get("session", {})
         if not isinstance(session, Mapping):
@@ -159,9 +184,13 @@ class RunConfig:
             batch_size=batch_size,
             workers=workers,
             hosts=tuple(hosts),
+            numa_nodes=tuple(numa_nodes),
             candidate=CandidateConfig.from_mapping(candidate),
             session=dict(session),
             scenario=resolved_scenario,
+            robustness=parse_robustness_axes(
+                raw.get("robustness"), required=False
+            ),
         )
         if hosts:
             _execution_inputs(config, remote=True)
@@ -238,18 +267,34 @@ def placement_lanes(
         for name in ("template", "market", "chainlink"):
             if name in inputs:
                 ensure_remote_file(config.hosts[0], local_inputs[name], inputs[name])
+        nodes: tuple[int | None, ...] = config.numa_nodes or (None,)
+        if config.workers < len(nodes):
+            raise ConfigError("run.workers must cover every configured NUMA node")
+        workers, extra = divmod(config.workers, len(nodes))
         return tuple(
             PlacementLane(
-                host,
+                host if node is None else f"{host}:numa{node}",
                 ssh_client_factory(
                     host,
                     inputs["evaluator"],
-                    workers=config.workers,
+                    workers=workers + (index < extra),
+                    **(
+                        {}
+                        if node is None
+                        else {
+                            "remote_prefix": (
+                                "numactl",
+                                f"--cpunodebind={node}",
+                                f"--membind={node}",
+                            )
+                        }
+                    ),
                     timeout=600.0,
                     verify_local_inputs=False,
                 ),
             )
             for host in config.hosts
+            for index, node in enumerate(nodes)
         )
     return (
         PlacementLane(
@@ -312,19 +357,46 @@ def open_session_request(config: RunConfig, *, remote: bool | None = None) -> di
 def run_metadata(config: RunConfig, *, effective_batch: int) -> dict[str, Any]:
     grid = config.candidate.grid()
     inputs = _execution_inputs(config, remote=bool(config.hosts))
-    return {
+    local_inputs = _execution_inputs(config, remote=False)
+    replay_session = open_session_request(config, remote=False)
+    for key in ("template_path", "market_path", "chainlink_path"):
+        if key in replay_session:
+            replay_session[key] = str(Path(replay_session[key]).resolve())
+    config_parent = config.path.parent
+    origin = (
+        "autoresearch"
+        if config_parent.name == "autoresearch"
+        and config_parent.parent.name == "configs"
+        else "human"
+        if config_parent.name == "experiments"
+        and config_parent.parent.name == "configs"
+        else "external"
+    )
+    metadata = {
         "config": str(config.path),
+        "config_origin": origin,
         "evaluator": inputs["evaluator"],
         "template": inputs["template"],
         "market": inputs["market"],
         "placement": "ssh" if config.hosts else "local",
         "hosts": list(config.hosts),
+        "numa_nodes": list(config.numa_nodes),
         "batch_size": config.batch_size,
         "effective_batch_size": effective_batch,
         "workers": config.workers,
         "axes": {name: list(grid.axes[name]) for name in sorted(grid.axes)},
         "shape": list(grid.shape),
+        "candidate_defaults": config.candidate.defaults,
+        "open_session": open_session_request(config),
+        "replay": {
+            "evaluator": str(Path(local_inputs["evaluator"]).resolve()),
+            "work_dir": str(config_parent),
+            "open_session": replay_session,
+        },
     }
+    if config.robustness:
+        metadata["robustness"] = robustness_metadata(config.robustness)
+    return metadata
 
 
 def _run(
@@ -341,20 +413,32 @@ def _run(
     metadata = run_metadata(config, effective_batch=effective_batch)
     if client_factory is not None:
         metadata["placement"] = "injected"
-    writer = ResultWriter(output_dir, run_id=config.run_id, metadata=metadata)
-    open_session = open_session_request(config)
+    open_session = metadata["open_session"]
+    writer = ResultWriter(
+        output_dir,
+        run_id=config.run_id,
+        metadata=metadata,
+        resumable=True,
+    )
     with writer:
         total = len(candidate_grid)
+        completed = writer.row_count
+        if completed > total:
+            raise ValueError("partial result contains more rows than this grid")
         if progress_callback is not None:
-            progress_callback(0, total)
+            progress_callback(completed, total)
+        if completed == total:
+            return writer.finalize()
         with EvaluatorFleet(
             lanes,
             session_id=config.run_id,
             batch_size=effective_batch,
+            start_ordinal=completed,
             open_session=open_session,
         ) as fleet:
-            completed = 0
-            for specs in candidate_grid.iter_batches(lane_count * effective_batch):
+            pending = islice(candidate_grid, completed, None)
+            batch_size = lane_count * effective_batch
+            while specs := tuple(islice(pending, batch_size)):
                 batch = tuple(candidate_from_spec(spec) for spec in specs)
                 writer.append(batch, fleet.evaluate(batch))
                 completed += len(batch)

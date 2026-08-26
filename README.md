@@ -48,11 +48,28 @@ pages, fetches them concurrently, preserves legitimate exchange gaps, rejects
 duplicates or disorder, and publishes the merged JSON atomically. The filter
 owns only the established centered-neighbor OHLC clipping step.
 
-Configs live under `configs/`. The current experiment example is `configs/experiments/eurusd-a-donation-rpf-8x8x8.toml`. Its TOML owns run, session, scenario, candidate, and placement settings; the pool template remains under `configs/templates`, while compiled policies are harness build inputs. Non-empty `[placement].hosts` implies SSH; otherwise execution is local. Remote runs map config-relative sibling-workspace paths to remote-home-relative `arb/...`. Missing portable session inputs are copied once through the first shared-NFS host, while existing files are kept; the evaluator is never copied.
+Configs live under `configs/`. Human-curated manifests live in
+`configs/experiments/`; LLM-generated iterative manifests belong in the ignored
+`configs/autoresearch/` workbench. A completed run embeds resolved candidate
+defaults, axes, robustness radii, execution inputs, and local replay inputs in
+`run.json`, so autoresearch TOMLs can be reused or discarded without losing the
+result's meaning. The pool template remains under `configs/templates`, while
+compiled policies are harness build inputs.
+
+Non-empty `[placement].hosts` implies SSH; otherwise execution is local.
+Optional `[placement].numa_nodes` creates one persistent evaluator lane per NUMA
+node. Remote runs map config-relative sibling-workspace paths to
+remote-home-relative `arb/...`. Missing portable session inputs are copied once
+through the first shared-NFS host, while existing files are kept; the evaluator
+is never copied.
 
 ## The four commands
 
-`run` and `optimize` write a compact result bundle containing exactly `run.json` and `results.npz`; heatmap and Shift-click add their own image/state or trace artifacts. The output directory is the durable hand-off between running, plotting, and replaying.
+`run` and `optimize` write a compact result bundle containing exactly `run.json`
+and `results.npz`; heatmap and Shift-click add their own image/state or trace
+artifacts. An interrupted grid keeps one `.fxopt-partial` spool and resumes when
+the same config and output directory are run again. The output directory is the
+durable hand-off between running, plotting, and replaying.
 
 Run a Cartesian candidate grid in bounded batches:
 
@@ -86,11 +103,33 @@ uv run fxopt shiftclick runs/eurusd-a-donation-rpf-8x8x8 \
   --ordinal 12 --output runs/eurusd-a-donation-rpf-8x8x8/inspections/ordinal-12
 ```
 
-`--trace-interval` and `--actions` enable denser traces and action recording. Replay takes the exact stored candidate from `results.npz` and uses the source config's local evaluator and session inputs with one local worker; SSH placement is not reused. It writes `shiftclick.json`, the trace artifacts, and `shiftclick.png` under the selected output directory. The plot title labels the local platform so double-versus-production-long-double stability checks stay explicit.
+`--trace-interval` and `--actions` enable denser traces and action recording.
+Replay takes the exact stored candidate from `results.npz` and the local evaluator
+and session inputs embedded in `run.json`; SSH placement is not reused. It writes
+`shiftclick.json`, the trace artifacts, and `shiftclick.png` under the selected
+output directory. The plot title labels the local platform so
+double-versus-production-long-double stability checks stay explicit.
 
 ## Results and configuration
 
-`run.json` contains run metadata, axes, config location, and evaluator/session settings. `results.npz` contains candidate results and metrics. Heatmaps load the requested metric columns from this bundle rather than materializing unrelated result data. Do not copy evaluator or pool code into this repository. Run outputs are ordinary local artifacts and can be inspected or plotted again without rebuilding the grid.
+`run.json` contains the resolved run metadata, config origin, axes, robustness
+radii, evaluator/session settings, and local replay inputs. `results.npz`
+contains candidate results and metrics. Heatmaps and Shift-click use this bundle
+directly; the mutable source TOML is only a fallback for older runs.
+
+Rank point values or exact axial stars without creating another manifest:
+
+```sh
+uv run python scripts/analyze_basins.py runs/RUN --rank score
+uv run python scripts/analyze_basins.py runs/RUN --rank yb-gm \
+  --min-lp-gm 0.05 --max-detach 5
+```
+
+For an older run with no embedded radii, repeat `--robust AXIS=RADIUS`, for
+example `--robust pool.mid_fee=0.0002 --robust pool.out_fee=0.0002`.
+Do not copy evaluator or pool code into this repository. Run outputs are
+ordinary local artifacts and can be inspected or plotted again without
+rebuilding the grid.
 
 For a production run, fetch authorized Git-LFS market data first:
 

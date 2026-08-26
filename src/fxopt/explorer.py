@@ -15,7 +15,7 @@ from curve_fx_sim.plotting.masked_metrics import (
     SLIPPAGE_APY_MASK_SOURCES,
 )
 from .results import ResultColumns, read_result_columns
-from .shiftclick import shiftclick_figure, trace_candidate
+from .shiftclick import shiftclick_figure, trace_stored_candidate
 
 
 def _metric_columns(requested: Sequence[str], available: Sequence[str]) -> tuple[str, ...]:
@@ -106,18 +106,15 @@ def open_fxopt_explorer(
     metadata = read_result_columns(root, metrics=())
     selected_columns = _metric_columns(metrics, metadata.available_metrics)
     columns = read_result_columns(root, metrics=selected_columns)
-    config_path = columns.metadata.get("config")
-    if not isinstance(config_path, str):
-        raise ValueError("run metadata has no source config for Shift-click replay")
-
     def replay(selection: Any, mode: str) -> Path:
         ordinal = int(selection.index)
         candidate = columns.candidate_at(ordinal)
         if candidate.candidate_id != selection.candidate_id:
             raise ValueError("selected candidate does not match the stored result row")
         output = root / "inspections" / f"ordinal-{ordinal}"
-        summary = trace_candidate(
-            config_path,
+        summary = trace_stored_candidate(
+            columns.run_id,
+            columns.metadata,
             candidate=candidate,
             ordinal=ordinal,
             output_dir=output,

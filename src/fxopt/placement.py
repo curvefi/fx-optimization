@@ -37,6 +37,22 @@ def _token(value: str | PathLike[str], label: str) -> str:
     return token
 
 
+def _argv_token(value: str | PathLike[str], label: str) -> str:
+    """Validate a non-shell argv token while allowing ordinary option prefixes."""
+    token = fspath(value)
+    if not isinstance(token, str):
+        raise TypeError(f"{label} must be a string or path")
+    if not token or any(
+        character.isspace()
+        or ord(character) < 32
+        or ord(character) == 127
+        or character in ";&|$`<>\\\"'(){}"
+        for character in token
+    ):
+        raise ValueError(f"{label} must not contain whitespace or control characters")
+    return token
+
+
 def _client_options(
     options: Mapping[str, Any] | None,
     updates: Mapping[str, Any],
@@ -85,6 +101,7 @@ def ssh_client_factory(
     executable_path: str | PathLike[str],
     *,
     workers: int = 1,
+    remote_prefix: Sequence[str | PathLike[str]] = (),
     ssh_path: str | PathLike[str] = "ssh",
     verify_local_inputs: bool = False,
     client_options: Mapping[str, Any] | None = None,
@@ -100,12 +117,27 @@ def ssh_client_factory(
     remote_host = _token(host, "host")
     executable = _token(executable_path, "executable_path")
     ssh = _token(ssh_path, "ssh_path")
+    if isinstance(remote_prefix, (str, bytes)):
+        raise TypeError("remote_prefix must be a sequence of argv tokens")
+    prefix = [
+        _argv_token(value, f"remote_prefix[{index}]")
+        for index, value in enumerate(remote_prefix)
+    ]
     if not isinstance(verify_local_inputs, bool):
         raise TypeError("verify_local_inputs must be a boolean")
     fixed = {
         "executable_path": executable,
         "work_dir": None,
-        "launch_argv": [ssh, "--", remote_host, executable, "serve", "--workers", str(workers)],
+        "launch_argv": [
+            ssh,
+            "--",
+            remote_host,
+            *prefix,
+            executable,
+            "serve",
+            "--workers",
+            str(workers),
+        ],
         "verify_local_inputs": verify_local_inputs,
     }
 
@@ -171,6 +203,7 @@ class EvaluatorFleet:
         *,
         session_id: str,
         batch_size: int,
+        start_ordinal: int = 0,
         open_session: Mapping[str, Any] | None = None,
         metric_projection: str | None = None,
         observation: Mapping[str, Any] | None = None,
@@ -179,6 +212,8 @@ class EvaluatorFleet:
             raise ValueError("fleet requires at least one lane")
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
             raise ValueError("batch_size must be a positive integer")
+        if isinstance(start_ordinal, bool) or not isinstance(start_ordinal, int) or start_ordinal < 0:
+            raise ValueError("start_ordinal must be a non-negative integer")
         normalized: list[PlacementLane] = []
         for index, lane in enumerate(lanes):
             if isinstance(lane, PlacementLane):
@@ -202,7 +237,7 @@ class EvaluatorFleet:
         self.batch_size = batch_size
         self._started = False
         self._closed = False
-        self._next_ordinal = 0
+        self._next_ordinal = start_ordinal
         self._next_lane = 0
         self._evaluation_lock = Lock()
 
@@ -270,30 +305,41 @@ class EvaluatorFleet:
                 if not started:
                     self.start()
                     started = True
-                assignments: dict[int, tuple[int, list[Candidate]]] = {}
+                assignments: dict[int, list[tuple[int, Candidate]]] = {}
                 active_lanes = min(lane_count, len(wave))
-                smaller, extra = divmod(len(wave), active_lanes)
-                offset = 0
-                for index in range(active_lanes):
-                    size = smaller + (index < extra)
-                    lane_index = (self._next_lane + index) % lane_count
-                    assignments[lane_index] = (offset, wave[offset : offset + size])
-                    offset += size
+                lane_indices = tuple(
+                    (self._next_lane + index) % lane_count
+                    for index in range(active_lanes)
+                )
+                for lane_index in lane_indices:
+                    assignments[lane_index] = []
+                for offset, candidate in enumerate(wave):
+                    assignments[lane_indices[offset % active_lanes]].append(
+                        (offset, candidate)
+                    )
                 self._next_lane = (self._next_lane + active_lanes) % lane_count
                 if executor is None:
                     executor = ThreadPoolExecutor(max_workers=lane_count)
 
                 def run_lane(
-                    lane_index: int, assignment: tuple[int, list[Candidate]]
+                    lane_index: int, assignment: list[tuple[int, Candidate]]
                 ) -> list[tuple[int, CandidateResult]]:
-                    offset, batch = assignment
+                    offsets, batch = zip(*assignment, strict=True)
                     engine = self._engines[lane_index]
-                    results = engine.evaluate(batch)
+                    try:
+                        results = engine.evaluate(batch)
+                    except Exception as exc:
+                        first = base_ordinal + total + offsets[0]
+                        last = base_ordinal + total + offsets[-1]
+                        raise RuntimeError(
+                            f"lane {self.lanes[lane_index].name} failed for "
+                            f"{len(batch)} striped candidates spanning ordinals {first}..{last}"
+                        ) from exc
                     if len(results) != len(batch):  # Defensive seam for injected engines.
                         raise ValueError("lane returned the wrong number of results")
                     return [
-                        (offset + index, replace(result, ordinal=base_ordinal + total + offset + index))
-                        for index, result in enumerate(results)
+                        (offset, replace(result, ordinal=base_ordinal + total + offset))
+                        for offset, result in zip(offsets, results, strict=True)
                     ]
 
                 ordered: list[CandidateResult | None] = [None] * len(wave)
@@ -330,7 +376,11 @@ class EvaluatorFleet:
         return self
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        self.close()
+        try:
+            self.close()
+        except BaseException:
+            if exc_type is None:
+                raise
 
 
 __all__ = [

@@ -56,36 +56,31 @@ def merge_payload(defaults: Mapping[str, Any], updates: Mapping[str, Any]) -> di
     return result
 
 
-def _number_text(value: int | float | Decimal) -> str:
+def _validate_number(value: int | float | Decimal) -> None:
     try:
         number = Decimal(str(value))
     except (InvalidOperation, ValueError) as exc:
         raise CandidateError(f"non-finite numeric value: {value!r}") from exc
     if not number.is_finite():
         raise CandidateError(f"non-finite numeric value: {value!r}")
-    if not number:
-        return "0"
-    # Fixed notation makes 1, 1.0, and Decimal("1.00") one semantic value.
-    text = format(number.normalize(), "f")
-    return text.rstrip("0").rstrip(".") if "." in text else text
 
 
-def _canonical(value: object) -> object:
-    """Encode JSON-like values with explicit primitive types for hashing."""
-    if value is None:
-        return ["null"]
-    if isinstance(value, bool):
-        return ["bool", value]
+def _validate_json_value(value: object) -> None:
+    if value is None or isinstance(value, (bool, str)):
+        return
     if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
-        return ["number", _number_text(value)]
-    if isinstance(value, str):
-        return ["string", value]
+        _validate_number(value)
+        return
     if isinstance(value, Mapping):
         if any(not isinstance(key, str) for key in value):
             raise CandidateError("candidate payload keys must be strings")
-        return ["object", [[key, _canonical(value[key])] for key in sorted(value)]]
+        for item in value.values():
+            _validate_json_value(item)
+        return
     if isinstance(value, (list, tuple)):
-        return ["array", [_canonical(item) for item in value]]
+        for item in value:
+            _validate_json_value(item)
+        return
     raise CandidateError(f"unsupported candidate value: {type(value).__name__}")
 
 
@@ -93,9 +88,8 @@ def canonical_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Copy a payload while validating that it contains JSON-like values."""
     if not isinstance(payload, Mapping) or any(not isinstance(key, str) for key in payload):
         raise CandidateError("candidate payload must be a mapping with string keys")
-    # The copy keeps the caller's useful numeric types while recursively checking values.
     result = deepcopy(dict(payload))
-    _canonical(result)
+    _validate_json_value(result)
     return result
 
 

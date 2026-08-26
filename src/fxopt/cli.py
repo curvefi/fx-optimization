@@ -11,7 +11,7 @@ from .config import ConfigError
 from .optimize import OptimizationError, optimize_config
 from .results import read_result_columns
 from .run import grid_summary, run_config
-from .shiftclick import save_shiftclick_plot, trace_candidate
+from .shiftclick import save_shiftclick_plot, trace_stored_candidate
 
 
 class _ProgressReporter:
@@ -178,12 +178,16 @@ def shiftclick_command(
     """Replay one exact stored RUN_DIR candidate with a full trace."""
     try:
         columns = read_result_columns(run_dir, metrics=())
-        config = columns.metadata.get("config")
-        if not isinstance(config, str):
-            raise ValueError("run metadata has no source config for Shift-click replay")
         candidate = columns.candidate_at(ordinal)
-        path = trace_candidate(config, candidate=candidate, ordinal=ordinal, output_dir=output_dir,
-                               trace_interval=trace_interval, trace_actions=actions)
+        path = trace_stored_candidate(
+            columns.run_id,
+            columns.metadata,
+            candidate=candidate,
+            ordinal=ordinal,
+            output_dir=output_dir,
+            trace_interval=trace_interval,
+            trace_actions=actions,
+        )
         local_platform = " ".join(value for value in (platform.system(), platform.machine()) if value)
         plot = save_shiftclick_plot(
             path,
