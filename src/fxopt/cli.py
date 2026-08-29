@@ -324,18 +324,18 @@ def optimize_command(config: Path, output_dir: Path) -> None:
 @click.option("--x", "x_axis")
 @click.option("--y", "y_axis")
 @click.option("--metric", "metrics", multiple=True,
-              default=("apy_net", "max_7d_rel_price_diff", "tw_real_slippage_1pct", "max_7d_skew"),
+              default=("apy_net_gm", "detach_energy_ungated", "max_7d_rel_price_diff", "max_7d_skew"),
               show_default=True)
 @click.option("--max-price-diff-bps", type=float, default=100.0, show_default=True)
 @click.option("--max-skew-percent", type=float)
-@click.option("--slippage-bps", type=float, default=20.0, show_default=True)
+@click.option("--slippage-bps", type=float)
 @click.option("--final-price-diff-bps", type=float)
 @click.option("--output", type=click.Path(dir_okay=False, path_type=Path))
 @click.option("--show/--no-show", default=True, show_default=True)
 def heatmap_command(
     run_dir: Path, x_axis: str | None, y_axis: str | None,
     metrics: tuple[str, ...], max_price_diff_bps: float,
-    max_skew_percent: float | None, slippage_bps: float,
+    max_skew_percent: float | None, slippage_bps: float | None,
     final_price_diff_bps: float | None, output: Path | None, show: bool,
 ) -> None:
     """Open the interactive filtered heatmap explorer."""

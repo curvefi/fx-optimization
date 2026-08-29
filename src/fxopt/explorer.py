@@ -99,7 +99,7 @@ def open_fxopt_explorer(
     y_axis: str | None = None,
     max_price_diff_bps: float | None = 100.0,
     max_skew_percent: float | None = None,
-    slippage_bps: float | None = 20.0,
+    slippage_bps: float | None = None,
     final_price_diff_bps: float | None = None,
 ) -> HeatmapExplorer:
     """Open the interactive UI from columnar run results."""
