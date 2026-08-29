@@ -153,6 +153,8 @@ def test_remote_optimize_maps_inputs_but_trace_replays_locally(
     assert local_calls[0][2] == 1
     assert Path(local.open_requests[0]["template_path"]).resolve() == workspace / "curve-fx-optimization" / "template.json"
     assert Path(local.open_requests[0]["market_path"]).resolve() == workspace / "curve-fx-optimization" / "market.json"
+    assert local.open_requests[0]["event_cursor"] == "scalar"
+    assert local.open_requests[0]["metric_profile"] == "full_summary"
 
 
 def test_shiftclick_cli_replays_stored_adaptive_candidate(monkeypatch, tmp_path):

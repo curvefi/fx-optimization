@@ -99,6 +99,8 @@ def _trace_candidate(
     destination.mkdir(parents=True, exist_ok=True)
 
     open_session = dict(replay.open_session)
+    open_session["event_cursor"] = "scalar"
+    open_session["metric_profile"] = "full_summary"
     if yb_mode is not None:
         if yb_mode not in {"off", "active_2l", "reference_2l"}:
             raise ValueError(
