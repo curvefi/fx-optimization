@@ -135,7 +135,15 @@ pool = {}
     calls: list[tuple[str, str, bool]] = []
     ensured = []
 
-    def fake_ssh(host: str, evaluator: str, *, workers: int, verify_local_inputs: bool):
+    def fake_ssh(
+        host: str,
+        evaluator: str,
+        *,
+        workers: int,
+        timeout: float,
+        verify_local_inputs: bool,
+    ):
+        assert timeout == 600.0
         calls.append((host, str(evaluator), verify_local_inputs))
         clients[host] = FakeClient()
         return lambda: clients[host]

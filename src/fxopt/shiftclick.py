@@ -100,8 +100,10 @@ def _trace_candidate(
 
     open_session = dict(replay.open_session)
     if yb_mode is not None:
-        if yb_mode not in {"off", "passive", "active_2l"}:
-            raise ValueError("yb_mode must be off, passive, or active_2l")
+        if yb_mode not in {"off", "active_2l", "reference_2l"}:
+            raise ValueError(
+                "yb_mode must be off, active_2l, or reference_2l"
+            )
         open_session["yb_mode"] = yb_mode
     factory = client_factory or local_client_factory(
         replay.evaluator, work_dir=replay.work_dir, workers=1

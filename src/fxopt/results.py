@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import orjson
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -111,6 +112,11 @@ def _canonical_json_bytes(value: Any) -> bytes:
         ).encode("utf-8")
     except (TypeError, ValueError) as exc:
         raise TypeError("artifact metadata must be finite JSON") from exc
+
+
+def _row_json_bytes(value: Any) -> bytes:
+    """Encode already-validated candidate/result rows on the hot path."""
+    return orjson.dumps(value, option=orjson.OPT_SORT_KEYS)
 
 
 def _atomic_bytes(path: Path, data: bytes) -> None:
@@ -370,7 +376,7 @@ class ResultWriter:
         self._stats["max_error"] = max(
             self._stats["max_error"], len(result_data.get("error") or "")
         )
-        overrides = _canonical_json_bytes(candidate_data.get("pool_overrides", {}))
+        overrides = _row_json_bytes(candidate_data.get("pool_overrides", {}))
         self._stats["max_overrides"] = max(
             self._stats["max_overrides"], len(overrides.decode())
         )
@@ -380,7 +386,7 @@ class ResultWriter:
         with self._spool_path.open("rb") as stream:
             for expected_ordinal, line in enumerate(stream):
                 try:
-                    row = json.loads(line)
+                    row = orjson.loads(line)
                     candidate = row["candidate"]
                     result = row["result"]
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -408,7 +414,7 @@ class ResultWriter:
             if candidate.candidate_id != result.candidate_id:
                 raise ValueError("candidate and result IDs must match")
             row = {"candidate": candidate.to_dict(ordinal=result.ordinal), "result": result.to_dict()}
-            self._spool.write(_canonical_json_bytes(row) + b"\n")
+            self._spool.write(_row_json_bytes(row) + b"\n")
             self._account(row)
         self._spool.flush()
 
@@ -417,7 +423,7 @@ class ResultWriter:
             self._spool.flush()
         with self._spool_path.open("rb") as stream:
             for line in stream:
-                yield json.loads(line)
+                yield orjson.loads(line)
 
     def finalize(self) -> ArtifactPaths:
         if self._closed:

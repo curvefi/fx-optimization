@@ -31,7 +31,12 @@ def _response_field(value: Any, name: str, default: Any = None) -> Any:
     return getattr(value, name, default)
 
 
-def _normalize_result(value: Any, candidate: Candidate, ordinal: int) -> CandidateResult:
+def _normalize_result(
+    value: Any,
+    candidate: Candidate,
+    ordinal: int,
+    metric_fields: Sequence[str] | None = None,
+) -> CandidateResult:
     if isinstance(value, CandidateResult):
         if value.candidate_id != candidate.candidate_id:
             raise ValueError("evaluator returned a result for the wrong candidate")
@@ -51,6 +56,11 @@ def _normalize_result(value: Any, candidate: Candidate, ordinal: int) -> Candida
     metrics = _response_field(value, "metrics", {})
     if metrics is None:
         metrics = {}
+    if metric_fields is not None and not isinstance(metrics, Mapping):
+        values = list(metrics)
+        if len(values) != len(metric_fields):
+            raise ValueError("evaluator metric array has the wrong length")
+        metrics = dict(zip(metric_fields, values, strict=True))
     status = _response_field(value, "status", "ok")
     return CandidateResult(
         candidate_id=candidate.candidate_id,
@@ -72,6 +82,7 @@ class OptimizerEngine:
         session_id: str,
         open_session: Mapping[str, Any] | None = None,
         metric_projection: str | None = None,
+        metric_fields: Sequence[str] | None = None,
         observation: Mapping[str, Any] | None = None,
     ) -> None:
         if not callable(client_factory):
@@ -86,6 +97,20 @@ class OptimizerEngine:
         self._batch_request: dict[str, Any] = {}
         if metric_projection is not None:
             self._batch_request["metric_projection"] = metric_projection
+        self._metric_fields: tuple[str, ...] | None = None
+        if metric_fields is not None:
+            fields = tuple(metric_fields)
+            if (
+                not fields
+                or any(not isinstance(name, str) or not name for name in fields)
+                or len(set(fields)) != len(fields)
+            ):
+                raise ValueError(
+                    "metric_fields must contain unique non-empty strings"
+                )
+            self._metric_fields = fields
+            self._batch_request["metric_fields"] = list(fields)
+            self._batch_request["metrics_format"] = "array"
         if observation is not None:
             self._batch_request["observation"] = dict(observation)
         self._client: EvaluatorClient | None = None
@@ -131,11 +156,23 @@ class OptimizerEngine:
         self.start()
         assert self._client is not None
         start = self._next_ordinal
-        payload = [item.to_dict(ordinal=start + index) for index, item in enumerate(items)]
+        payload = [
+            item.to_dict(ordinal=start + index)
+            for index, item in enumerate(items)
+        ]
         request = dict(self._batch_request)
         request["session_id"] = self.session_id
         response = self._client.evaluate_batch(payload, **request)
         values = _response_field(response, "results", response)
+        response_metric_fields = _response_field(response, "metric_fields")
+        if self._metric_fields is not None:
+            if tuple(response_metric_fields or ()) != self._metric_fields:
+                raise ValueError(
+                    "evaluator metric_fields do not match the request"
+                )
+            response_metric_fields = self._metric_fields
+        else:
+            response_metric_fields = None
         if isinstance(values, (str, bytes)) or not isinstance(values, Iterable):
             raise TypeError("evaluator batch response must contain iterable results")
         values = list(values)
@@ -153,7 +190,10 @@ class OptimizerEngine:
         if missing:
             raise ValueError(f"evaluator omitted candidate IDs: {missing!r}")
         results = [
-            _normalize_result(by_id[item.candidate_id], item, start + index)
+            _normalize_result(
+                by_id[item.candidate_id], item, start + index,
+                response_metric_fields,
+            )
             for index, item in enumerate(items)
         ]
         self._next_ordinal += len(items)

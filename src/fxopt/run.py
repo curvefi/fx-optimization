@@ -28,7 +28,7 @@ from .robustness import (
 )
 
 
-_RUN_KEYS = frozenset({"id", "evaluator", "template", "batch_size", "workers"})
+_RUN_KEYS = frozenset({"id", "evaluator", "template", "batch_size", "workers", "metric_fields"})
 _PLACEMENT_KEYS = frozenset({"hosts", "numa_nodes"})
 _CANDIDATE_KEYS = frozenset({"defaults", "axes"})
 _SCENARIO_KEYS = frozenset({"id", "market", "chainlink", "yb_mode"})
@@ -64,6 +64,7 @@ class RunConfig:
     template: Path
     batch_size: int
     workers: int
+    metric_fields: tuple[str, ...]
     hosts: tuple[str, ...]
     numa_nodes: tuple[int, ...]
     candidate: CandidateConfig
@@ -92,6 +93,14 @@ class RunConfig:
         workers = run.get("workers", 1)
         if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
             raise ConfigError("run.workers must be a positive integer")
+        raw_metric_fields = run.get("metric_fields", [])
+        if (
+            isinstance(raw_metric_fields, (str, bytes))
+            or not isinstance(raw_metric_fields, list)
+            or any(not isinstance(name, str) or not name for name in raw_metric_fields)
+            or len(set(raw_metric_fields)) != len(raw_metric_fields)
+        ):
+            raise ConfigError("run.metric_fields must be an array of unique non-empty strings")
 
         placement = raw.get("placement", {})
         if not isinstance(placement, Mapping):
@@ -183,6 +192,7 @@ class RunConfig:
             template=_resolve_path(_required_string(run, "template", "run"), base),
             batch_size=batch_size,
             workers=workers,
+            metric_fields=tuple(raw_metric_fields),
             hosts=tuple(hosts),
             numa_nodes=tuple(numa_nodes),
             candidate=CandidateConfig.from_mapping(candidate),
@@ -384,6 +394,7 @@ def run_metadata(config: RunConfig, *, effective_batch: int) -> dict[str, Any]:
         "batch_size": config.batch_size,
         "effective_batch_size": effective_batch,
         "workers": config.workers,
+        "metric_fields": list(config.metric_fields),
         "axes": {name: list(grid.axes[name]) for name in sorted(grid.axes)},
         "shape": list(grid.shape),
         "candidate_defaults": config.candidate.defaults,
@@ -435,6 +446,7 @@ def _run(
             batch_size=effective_batch,
             start_ordinal=completed,
             open_session=open_session,
+            metric_fields=config.metric_fields or None,
         ) as fleet:
             pending = islice(candidate_grid, completed, None)
             batch_size = lane_count * effective_batch

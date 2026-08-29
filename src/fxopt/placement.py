@@ -206,6 +206,7 @@ class EvaluatorFleet:
         start_ordinal: int = 0,
         open_session: Mapping[str, Any] | None = None,
         metric_projection: str | None = None,
+        metric_fields: Sequence[str] | None = None,
         observation: Mapping[str, Any] | None = None,
     ) -> None:
         if not lanes:
@@ -228,6 +229,7 @@ class EvaluatorFleet:
                 session_id=session_id,
                 open_session=open_session,
                 metric_projection=metric_projection,
+                metric_fields=metric_fields,
                 observation=observation,
             )
             for lane in normalized
