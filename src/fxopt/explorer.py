@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -83,9 +84,9 @@ def _dataset(columns: ResultColumns) -> HeatmapDataset:
     return HeatmapDataset(
         axes=axes,
         metrics=metrics,
-        candidate_ids=columns.candidate_ids.reshape(shape),
+        candidate_ids=columns.candidate_ids_array().reshape(shape),
         ordinals=columns.ordinals.reshape(shape),
-        valid=(columns.statuses == "ok").reshape(shape),
+        valid=columns.ok_mask.reshape(shape),
         metadata=dict(columns.metadata),
     )
 
@@ -103,8 +104,13 @@ def open_fxopt_explorer(
 ) -> HeatmapExplorer:
     """Open the interactive UI from columnar run results."""
     root = Path(run_dir).expanduser().resolve()
-    metadata = read_result_columns(root, metrics=())
-    selected_columns = _metric_columns(metrics, metadata.available_metrics)
+    try:
+        available_metrics = tuple(
+            json.loads((root / "run.json").read_bytes())["metric_names"]
+        )
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("run has no readable metric manifest") from exc
+    selected_columns = _metric_columns(metrics, available_metrics)
     columns = read_result_columns(root, metrics=selected_columns)
     def replay(selection: Any, mode: str) -> Path:
         ordinal = int(selection.index)
@@ -126,11 +132,17 @@ def open_fxopt_explorer(
         figure.show()
         return summary
 
+    dataset = _dataset(columns)
+    raw_axes = columns.metadata["axes"]
+    aliases = {
+        name: axis.key
+        for name, axis in zip(sorted(raw_axes), dataset.axes, strict=True)
+    }
     return HeatmapExplorer(
-        _dataset(columns),
+        dataset,
         metrics=tuple(metrics),
-        x_axis=x_axis,
-        y_axis=y_axis,
+        x_axis=aliases.get(x_axis, x_axis),
+        y_axis=aliases.get(y_axis, y_axis),
         max_pricethr=max_price_diff_bps,
         skewthr=max_skew_percent,
         slipthr=slippage_bps,

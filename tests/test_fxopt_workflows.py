@@ -129,8 +129,8 @@ def test_remote_optimize_maps_inputs_but_trace_replays_locally(
     config = _remote_config(tmp_path)
     remote = FakeClient()
     optimize_config(config, tmp_path / "optimization", client_factory=lambda: remote)
-    assert remote.open_requests[0]["template_path"] == "arb/curve-fx-optimization/template.json"
-    assert remote.open_requests[0]["market_path"] == "arb/curve-fx-optimization/market.json"
+    assert remote.open_requests[0]["template_path"] == "/home/heswithme/arb/curve-fx-optimization/template.json"
+    assert remote.open_requests[0]["market_path"] == "/home/heswithme/arb/curve-fx-optimization/market.json"
 
     local = FakeClient()
     local_calls = []
@@ -169,14 +169,24 @@ def test_shiftclick_cli_replays_stored_adaptive_candidate(monkeypatch, tmp_path)
     )
     captured = {}
 
-    def fake_trace(config_path, *, candidate, ordinal, output_dir, **_kwargs):
-        captured.update(config=Path(config_path), candidate=candidate, ordinal=ordinal)
+    def fake_trace(run_id, metadata, *, candidate, ordinal, output_dir, **_kwargs):
+        captured.update(
+            config=Path(metadata["config"]),
+            candidate=candidate,
+            ordinal=ordinal,
+            run_id=run_id,
+        )
         output_dir.mkdir(parents=True)
         summary = output_dir / "shiftclick.json"
         summary.write_text("{}")
         return summary
 
-    monkeypatch.setattr("fxopt.cli.trace_candidate", fake_trace)
+    def fake_plot(_summary, output, **_kwargs):
+        output.write_bytes(b"png")
+        return output
+
+    monkeypatch.setattr("fxopt.shiftclick.trace_stored_candidate", fake_trace)
+    monkeypatch.setattr("fxopt.shiftclick.save_shiftclick_plot", fake_plot)
     result = CliRunner().invoke(main, [
         "shiftclick", str(tmp_path / "adaptive"), "--ordinal", "1",
         "--output", str(tmp_path / "trace"),

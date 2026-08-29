@@ -28,6 +28,12 @@ packages = ["src/curve_fx_sim", "src/fxopt"]
 curve_fx_harness_client = { path = "../curve-fx-arb-harness/python", editable = true }
 
 [dependency-groups]
+cluster = [
+    "click>=8.1.0",
+    "numpy>=1.26.0",
+    "orjson>=3.10.0",
+    "pydantic>=2.0.0",
+]
 dev = [
     "pytest>=8.0.0",
 ]

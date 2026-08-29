@@ -1,8 +1,9 @@
 import json
+import zipfile
 
 import numpy as np
 from fxopt import Candidate, CandidateResult, ResultBundle, read_results, write_results
-from fxopt.results import ResultWriter, read_result_columns
+from fxopt.results import GridResultWriter, ResultWriter, read_result_columns
 
 
 def test_results_round_trip_is_exactly_two_canonical_files(tmp_path):
@@ -28,7 +29,7 @@ def test_results_round_trip_is_exactly_two_canonical_files(tmp_path):
 
 def test_result_writer_appends_batches_without_retaining_rows(tmp_path):
     writer = ResultWriter(tmp_path, run_id="stream-1", metadata={"kind": "adaptive"})
-    for index in range(3):
+    for index in (2, 0, 1):
         candidate = Candidate(f"c{index}", [float(index)])
         writer.append([candidate], [CandidateResult(
             candidate.candidate_id, metrics={"score": float(index)}, ordinal=index
@@ -61,6 +62,45 @@ def test_result_writer_finalize_reads_spool_once(tmp_path):
     writer.finalize()
 
     assert calls == 1
+
+
+def test_grid_writer_streams_typed_shards_and_reconstructs_candidates(tmp_path):
+    metadata = {
+        "candidate_defaults": {"policy_params": [], "pool": {}},
+        "axes": {"pool.A": [1, 2]},
+        "shape": [2],
+    }
+    writer = GridResultWriter(
+        tmp_path,
+        run_id="grid",
+        total=2,
+        metadata=metadata,
+        metric_names=("score",),
+    )
+    candidates = (Candidate("p00000001", pool_overrides={"A": 2}),
+                  Candidate("p00000000", pool_overrides={"A": 1}))
+    writer.append(
+        candidates,
+        (
+            CandidateResult("p00000001", status="failed", error="collapsed", ordinal=1),
+            CandidateResult("p00000000", metrics={"score": 3.0}, ordinal=0),
+        ),
+    )
+    writer.finalize()
+
+    columns = read_result_columns(tmp_path, metrics=("score",))
+    assert columns.candidate_at(1) == candidates[0]
+    assert columns.status_at(1) == "failed"
+    assert columns.error_at(1) == "collapsed"
+    assert columns.metrics["score"][0] == 3.0
+    assert np.isnan(columns.metrics["score"][1])
+    assert {path.name for path in tmp_path.iterdir()} == {"run.json", "results.npz"}
+    with zipfile.ZipFile(tmp_path / "results.npz") as archive:
+        assert archive.namelist() == [
+            "index_00000000.npy",
+            "metric_0000_00000000.npy",
+            "errors_00000000.npy",
+        ]
 
 
 def test_column_reader_selects_metrics_and_one_candidate(tmp_path):

@@ -4,24 +4,23 @@
 from __future__ import annotations
 
 import argparse
-import json
 import math
 from pathlib import Path
 from typing import Any, Iterator
 
 import numpy as np
 
+from fxopt.results import read_result_columns
 from fxopt.robustness import (
     RobustnessAxis,
     load_robustness_axes,
     parse_robustness_axes,
     score_robustness,
 )
-from fxopt.scoring import combined_scores
+from fxopt.scoring import combined_scores, lp_detach_scores
 
 
-METRICS = ("apy_net_gm", "yb_apy_gm", "detach_energy_ungated")
-RANKINGS = ("score", "gm", "yb-gm")
+RANKINGS = ("lp-score", "score", "gm", "yb-gm")
 
 
 def _leaves(value: Any, prefix: str = "") -> Iterator[tuple[str, Any]]:
@@ -33,14 +32,48 @@ def _leaves(value: Any, prefix: str = "") -> Iterator[tuple[str, Any]]:
         yield prefix, value
 
 
-def _candidate_parameters(overrides: str, policy: np.ndarray) -> str:
-    try:
-        pool = json.loads(overrides)
-    except (TypeError, json.JSONDecodeError):
-        pool = {"<invalid>": overrides}
+def _candidate_parameters(pool: dict[str, Any], policy: tuple[float, ...]) -> str:
     fields = [f"pool.{name}={value!r}" for name, value in _leaves(pool)]
     fields.extend(f"policy[{index}]={value:g}" for index, value in enumerate(policy))
     return " ".join(fields) or "(no parameters)"
+
+
+def _axis_path_values(
+    axis: str, values: list[Any], path: str
+) -> np.ndarray | None:
+    selected = []
+    for value in values:
+        updates = value if isinstance(value, dict) else {axis: value}
+        if path not in updates:
+            return None
+        selected.append(float(updates[path]))
+    return np.asarray(selected)
+
+
+def _flat_fee_mask(
+    metadata: dict[str, Any], shape: tuple[int, ...]
+) -> np.ndarray:
+    axes = metadata.get("axes")
+    defaults = metadata.get("candidate_defaults")
+    if not isinstance(axes, dict) or not isinstance(defaults, dict):
+        raise ValueError("run metadata cannot resolve flat fees")
+    pool = defaults.get("pool", {})
+    mid: Any = pool.get("mid_fee") if isinstance(pool, dict) else None
+    out: Any = pool.get("out_fee") if isinstance(pool, dict) else None
+    for dimension, (axis, values) in enumerate(axes.items()):
+        if not isinstance(values, list):
+            raise ValueError("run axis values must be arrays")
+        view = [1] * len(shape)
+        view[dimension] = len(values)
+        mid_values = _axis_path_values(axis, values, "pool.mid_fee")
+        out_values = _axis_path_values(axis, values, "pool.out_fee")
+        if mid_values is not None:
+            mid = mid_values.reshape(view)
+        if out_values is not None:
+            out = out_values.reshape(view)
+    if mid is None or out is None:
+        raise ValueError("run metadata does not define both fee coordinates")
+    return np.broadcast_to(np.equal(mid, out), shape).reshape(-1)
 
 
 def _coordinates(ordinal: int, shape: tuple[int, ...]) -> tuple[int, ...]:
@@ -127,7 +160,7 @@ def main() -> int:
         "--rank",
         choices=RANKINGS,
         default="score",
-        help="score, geometric mean of LP/YB GM, or YB GM (default: score)",
+        help="LP-detachment score, joint score, geometric LP/YB GM, or YB GM",
     )
     parser.add_argument(
         "--gap",
@@ -152,7 +185,9 @@ def main() -> int:
         help="override run metadata; repeat for each exact axial radius",
     )
     args = parser.parse_args()
-    gap = args.gap if args.gap is not None else (0.1 if args.rank == "score" else 0.001)
+    gap = args.gap if args.gap is not None else (
+        0.1 if args.rank in {"lp-score", "score"} else 0.001
+    )
     finite_nonnegative = (gap, args.min_lp_gm, args.min_yb_gm)
     if (
         args.top < 1
@@ -164,49 +199,48 @@ def main() -> int:
 
     root = args.run_dir
     try:
-        run = json.loads((root / "run.json").read_text())
-        with np.load(root / "results.npz", allow_pickle=False) as archive:
-            metric_names = list(run["metric_names"])
-            columns = {name: metric_names.index(name) for name in METRICS}
-            metrics = {
-                name: archive[f"metric_{columns[name]:04d}"] for name in METRICS
-            }
-            statuses = archive["statuses"]
-            ordinals = archive["ordinals"]
-            overrides = archive["candidate_pool_overrides"]
-            offsets = archive["candidate_policy_offsets"]
-            policy_values = archive["candidate_policy_values"]
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        required = ("apy_net_gm", "detach_energy_ungated")
+        if args.rank != "lp-score":
+            required += ("yb_apy_gm",)
+        columns = read_result_columns(root, metrics=required)
+    except (OSError, KeyError, TypeError, ValueError) as exc:
         parser.error(f"could not read result artifact: {exc}")
 
-    count = len(ordinals)
-    if any(
-        array.shape != (count,)
-        for array in (*metrics.values(), statuses, overrides, ordinals)
-    ):
-        parser.error("result arrays have inconsistent lengths")
-    metadata = run.get("metadata", {})
+    count = columns.row_count
+    metadata = dict(columns.metadata)
     if not isinstance(metadata, dict):
         parser.error("run metadata must be an object")
+    ordinals = columns.ordinals
     raw_axes = metadata.get("axes", {})
     raw_shape = metadata.get("shape", [])
     axes = dict(raw_axes) if isinstance(raw_axes, dict) else {}
     shape = tuple(int(size) for size in raw_shape) if isinstance(raw_shape, list) else ()
 
-    lp = np.asarray(metrics["apy_net_gm"], dtype=float)
-    yb = np.asarray(metrics["yb_apy_gm"], dtype=float)
-    detach = np.asarray(metrics["detach_energy_ungated"], dtype=float)
-    valid = (
-        (statuses == "ok")
+    lp = np.asarray(columns.metrics["apy_net_gm"], dtype=float)
+    detach = np.asarray(columns.metrics["detach_energy_ungated"], dtype=float)
+    yb = (
+        np.asarray(columns.metrics["yb_apy_gm"], dtype=float)
+        if "yb_apy_gm" in columns.metrics
+        else np.full(count, np.nan)
+    )
+    metrics = {
+        "apy_net_gm": lp,
+        "yb_apy_gm": yb,
+        "detach_energy_ungated": detach,
+    }
+    lp_valid = (
+        columns.ok_mask
         & np.isfinite(lp)
-        & np.isfinite(yb)
         & np.isfinite(detach)
         & (detach >= 0)
     )
+    valid = lp_valid & np.isfinite(yb)
+    lp_score = lp_detach_scores(metrics)
     score = combined_scores(metrics)
     gm = np.sqrt(np.maximum(lp, 0.0) * np.maximum(yb, 0.0))
     score[~valid] = np.nan
     gm[~valid] = np.nan
+    lp_score[~lp_valid] = np.nan
 
     try:
         if args.robustness_config is not None:
@@ -225,6 +259,14 @@ def main() -> int:
         try:
             robust_score = _robust(
                 score, valid=valid, ordinals=ordinals, axes=axes, shape=shape, specs=specs
+            )
+            robust_lp_score = _robust(
+                lp_score,
+                valid=lp_valid,
+                ordinals=ordinals,
+                axes=axes,
+                shape=shape,
+                specs=specs,
             )
             robust_gm = _robust(
                 gm, valid=valid, ordinals=ordinals, axes=axes, shape=shape, specs=specs
@@ -246,25 +288,34 @@ def main() -> int:
             )
         except ValueError as exc:
             parser.error(f"could not score robustness: {exc}")
-        complete = (
+        joint_complete = (
             robust_score.complete
             & robust_gm.complete
             & robust_lp.complete
             & robust_yb.complete
             & robust_detach.complete
         )
+        lp_complete = (
+            robust_lp_score.complete
+            & robust_lp.complete
+            & robust_detach.complete
+        )
+        complete = lp_complete if args.rank == "lp-score" else joint_complete
+        lp_score_floor = robust_lp_score.robust_score
         score_floor = robust_score.robust_score
         gm_floor = robust_gm.robust_score
         lp_floor = robust_lp.robust_score
         yb_floor = robust_yb.robust_score
         detach_ceiling = -robust_detach.robust_score
         robust_results = {
+            "lp-score": robust_lp_score,
             "score": robust_score,
             "gm": robust_gm,
             "yb-gm": robust_yb,
         }
     else:
-        complete = valid
+        complete = lp_valid if args.rank == "lp-score" else valid
+        lp_score_floor = lp_score
         score_floor = score
         gm_floor = gm
         lp_floor = lp
@@ -272,27 +323,30 @@ def main() -> int:
         detach_ceiling = detach
 
     rank_values = {
+        "lp-score": lp_score_floor,
         "score": score_floor,
         "gm": gm_floor,
         "yb-gm": yb_floor,
     }[args.rank]
-    point_rank = {"score": score, "gm": gm, "yb-gm": yb}[args.rank]
+    point_rank = {
+        "lp-score": lp_score,
+        "score": score,
+        "gm": gm,
+        "yb-gm": yb,
+    }[args.rank]
     eligible = (
         complete
         & np.isfinite(rank_values)
         & (lp_floor >= args.min_lp_gm)
-        & (yb_floor >= args.min_yb_gm)
         & (detach_ceiling <= args.max_detach)
     )
+    if args.rank != "lp-score":
+        eligible &= yb_floor >= args.min_yb_gm
     if args.flat_fee:
-        fee_equal = np.zeros(count, dtype=bool)
-        for row, raw in enumerate(overrides.tolist()):
-            try:
-                candidate = json.loads(str(raw))
-                fee_equal[row] = candidate.get("mid_fee") == candidate.get("out_fee")
-            except (TypeError, AttributeError, json.JSONDecodeError):
-                pass
-        eligible &= fee_equal
+        try:
+            eligible &= _flat_fee_mask(metadata, shape)
+        except ValueError as exc:
+            parser.error(str(exc))
     if not np.any(eligible):
         suffix = " with complete robustness coverage" if specs else ""
         parser.error(f"no eligible rows{suffix} after filtering")
@@ -304,7 +358,7 @@ def main() -> int:
     best = float(rank_values[ordered[0]])
     basin = eligible & (rank_values >= best - gap)
     print(
-        f"RUN {run.get('run_id', root.name)}: {int(eligible.sum())}/{count} eligible; "
+        f"RUN {columns.run_id}: {int(eligible.sum())}/{count} eligible; "
         f"best {args.rank}={best:.8g}"
     )
     if specs:
@@ -325,8 +379,10 @@ def main() -> int:
     print("\nBEST ROWS (human review; no automatic optimization)")
     ranking_result = robust_results[args.rank] if robust_results is not None else None
     for row in ordered[: args.top]:
-        start, stop = int(offsets[row]), int(offsets[row + 1])
-        params = _candidate_parameters(str(overrides[row]), policy_values[start:stop])
+        candidate = columns.candidate_at(int(ordinals[row]))
+        params = _candidate_parameters(
+            dict(candidate.pool_overrides), candidate.policy_params
+        )
         robust_fields = ""
         if ranking_result is not None:
             robust_fields = (

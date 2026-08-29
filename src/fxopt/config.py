@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+import math
 from pathlib import Path
 import tomllib
 from typing import Any
@@ -38,7 +39,12 @@ def _decimal(value: object, label: str) -> Decimal:
 def _range_values(spec: Mapping[str, Any], label: str) -> tuple[Any, ...]:
     start = _decimal(spec["start"], f"{label}.start")
     stop = _decimal(spec["stop"], f"{label}.stop")
+    scale = spec.get("scale", "linear")
+    if scale not in {"linear", "log"}:
+        raise ConfigError(f"{label}.scale must be 'linear' or 'log'")
     if "step" in spec:
+        if scale != "linear":
+            raise ConfigError(f"{label}.step is only supported for linear ranges")
         step = _decimal(spec["step"], f"{label}.step")
         if not step:
             raise ConfigError(f"{label}.step must be non-zero")
@@ -57,6 +63,14 @@ def _range_values(spec: Mapping[str, Any], label: str) -> tuple[Any, ...]:
         raise ConfigError(f"{label} requires a positive integer count or non-zero step")
     if count == 1:
         return (_number_value(start),)
+    if scale == "log":
+        if start <= 0 or stop <= 0:
+            raise ConfigError(f"{label} logarithmic endpoints must be positive")
+        start_log = math.log(float(start))
+        log_increment = (math.log(float(stop)) - start_log) / (count - 1)
+        values = [math.exp(start_log + log_increment * index) for index in range(count)]
+        values[0], values[-1] = _number_value(start), _number_value(stop)
+        return tuple(values)
     increment = (stop - start) / (count - 1)
     return tuple(_number_value(start + increment * index) for index in range(count))
 
@@ -69,9 +83,23 @@ def _number_value(value: Decimal) -> int | float:
 
 def _axis_values(spec: object, label: str) -> tuple[Any, ...]:
     multiplier: Decimal | None = None
+    targets: tuple[str, ...] = ()
     if isinstance(spec, Mapping):
         if "multiply" in spec:
             multiplier = _decimal(spec["multiply"], f"{label}.multiply")
+        if "targets" in spec:
+            raw_targets = spec["targets"]
+            if (
+                isinstance(raw_targets, (str, bytes))
+                or not isinstance(raw_targets, Sequence)
+                or not raw_targets
+                or any(not isinstance(target, str) or not target for target in raw_targets)
+                or len(set(raw_targets)) != len(raw_targets)
+            ):
+                raise ConfigError(
+                    f"{label}.targets must contain unique non-empty paths"
+                )
+            targets = tuple(raw_targets)
         if "values" in spec:
             values = spec["values"]
         elif "start" in spec and "stop" in spec:
@@ -88,6 +116,10 @@ def _axis_values(spec: object, label: str) -> tuple[Any, ...]:
         values = tuple(
             _number_value(_decimal(value, f"{label}.value") * multiplier) for value in values
         )
+    if targets:
+        if any(isinstance(value, Mapping) for value in values):
+            raise ConfigError(f"{label}.targets requires scalar values")
+        values = tuple({target: value for target in targets} for value in values)
     return tuple(values)
 
 

@@ -7,18 +7,35 @@ search, and scoring remain callers' concerns.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
+from itertools import islice
 from os import PathLike, fspath
 from pathlib import Path, PurePosixPath
+import shlex
 import subprocess
 from threading import Lock
+import time
 from typing import Any
 
 from curve_fx_harness_client import EvaluatorClient
 
 from .contract import Candidate, CandidateResult
 from .engine import ClientFactory, OptimizerEngine
+
+
+SSH_OPTIONS = (
+    "-o", "ControlMaster=no",
+    "-o", "ControlPath=none",
+    "-o", "ServerAliveInterval=30",
+    "-o", "ServerAliveCountMax=6",
+)
+RSYNC_SSH = (
+    "ssh -o ControlMaster=no -o ControlPath=none "
+    "-o ServerAliveInterval=30 -o ServerAliveCountMax=6"
+)
+REMOTE_BASE = PurePosixPath("/home/heswithme/arb")
+_MAX_CONSECUTIVE_GRID_FAILURES = 3
 
 
 def _token(value: str | PathLike[str], label: str) -> str:
@@ -130,6 +147,7 @@ def ssh_client_factory(
         "work_dir": None,
         "launch_argv": [
             ssh,
+            *SSH_OPTIONS,
             "--",
             remote_host,
             *prefix,
@@ -153,26 +171,147 @@ def ensure_remote_file(
     host: str,
     local_path: str | PathLike[str],
     remote_path: str | PathLike[str],
+    *,
+    replace: bool = False,
 ) -> None:
-    """Publish a missing shared-NFS input through one placement host."""
+    """Publish one shared-NFS input through one placement host."""
     remote_host = _token(host, "host")
     source = Path(local_path)
     destination = _token(remote_path, "remote_path")
     if not source.is_file():
         raise FileNotFoundError(f"remote input source is not a file: {source}")
     present = subprocess.run(
-        ["ssh", "--", remote_host, "test", "-f", destination], check=False
+        ["ssh", *SSH_OPTIONS, "--", remote_host, "test", "-f", destination],
+        check=False,
     )
-    if present.returncode == 0:
+    if present.returncode == 0 and not replace:
         return
     if present.returncode != 1:
         present.check_returncode()
     parent = str(PurePosixPath(destination).parent)
-    subprocess.run(["ssh", "--", remote_host, "mkdir", "-p", parent], check=True)
     subprocess.run(
-        ["rsync", "--ignore-existing", "--", str(source), f"{remote_host}:{destination}"],
+        ["ssh", *SSH_OPTIONS, "--", remote_host, "mkdir", "-p", parent],
         check=True,
     )
+    command = ["rsync", "-a", "-e", RSYNC_SSH]
+    if not replace:
+        command.append("--ignore-existing")
+    subprocess.run([*command, "--", str(source), f"{remote_host}:{destination}"], check=True)
+
+
+def require_reachable_hosts(hosts: Sequence[str]) -> tuple[str, ...]:
+    """Fail once with the complete unreachable-host list."""
+    if not hosts:
+        return ()
+
+    def reachable(host: str) -> tuple[str, bool]:
+        result = subprocess.run(
+            [
+                "ssh", *SSH_OPTIONS,
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=8",
+                "-o", "ConnectionAttempts=1",
+                "--", host, "true",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return host, result.returncode == 0
+
+    with ThreadPoolExecutor(max_workers=len(hosts)) as executor:
+        results = dict(executor.map(reachable, hosts))
+    missing = [host for host in hosts if not results[host]]
+    if missing:
+        raise RuntimeError("unreachable placement hosts: " + ", ".join(missing))
+    return tuple(hosts)
+
+
+def transfer_workspace(host: str, workspace: str | Path) -> None:
+    """Rsync evaluator and coordinator sources once into shared cluster home."""
+    remote_host = _token(host, "host")
+    root = Path(workspace)
+    excludes = (
+        ".git/", ".venv/", ".venv-cluster/", "__pycache__/", "build/",
+        "build-*/", "_install/",
+    )
+    for name in ("twocrypto-cpp", "curve-fx-arb-harness", "curve-fx-optimization"):
+        source = root / name
+        if not source.is_dir():
+            raise FileNotFoundError(f"workspace source repository is missing: {source}")
+        destination = str(REMOTE_BASE / name)
+        subprocess.run(
+            ["ssh", *SSH_OPTIONS, "--", remote_host, "mkdir", "-p", destination],
+            check=True,
+        )
+        command = ["rsync", "-a", "-e", RSYNC_SSH]
+        patterns = excludes + (
+            ("configs/", "data/", "runs/")
+            if name == "curve-fx-optimization"
+            else ()
+        )
+        for pattern in patterns:
+            command.extend(("--exclude", pattern))
+        subprocess.run(
+            [*command, "--", f"{source}/", f"{remote_host}:{destination}/"],
+            check=True,
+        )
+
+
+def rebuild_shared_evaluator(host: str, evaluator: str) -> None:
+    """Build the configured evaluator once in the shared cluster workspace."""
+    remote_host = _token(host, "host")
+    executable = PurePosixPath(_token(evaluator, "evaluator"))
+    build_root = REMOTE_BASE / "curve-fx-arb-harness" / "build"
+    if executable.parent == build_root or not executable.parent.is_relative_to(build_root):
+        raise ValueError(f"evaluator build directory must be below {build_root}")
+    build_dir = str(executable.parent)
+    target = executable.name
+    quoted_build = shlex.quote(build_dir)
+    quoted_target = shlex.quote(target)
+    build_script = " ".join((
+        "set -euo pipefail;",
+        f"root={shlex.quote(str(REMOTE_BASE))};",
+        'cmake -S "$root/twocrypto-cpp" -B "$root/twocrypto-cpp/build/cluster-release"',
+        '-DCMAKE_BUILD_TYPE=Release -DTWOCRYPTO_POOL_BUILD_TESTS=OFF',
+        '-DTWOCRYPTO_POOL_BUILD_BENCHMARKS=OFF',
+        '-DCMAKE_INSTALL_PREFIX="$root/twocrypto-cpp/_install";',
+        'cmake --build "$root/twocrypto-cpp/build/cluster-release" --parallel --target install;',
+        f"rm -rf -- {quoted_build};",
+        f'cmake -S "$root/curve-fx-arb-harness" -B {quoted_build}',
+        '-DCMAKE_BUILD_TYPE=Release -DCURVE_FX_NATIVE_TUNING=ON',
+        '-DCURVE_FX_ENABLE_IPO=ON -DCMAKE_PREFIX_PATH="$root/twocrypto-cpp/_install";',
+        f'cmake --build {quoted_build} --parallel --target {quoted_target}',
+    ))
+    command = (
+        "nix-shell -p gcc cmake boost gnumake --run "
+        + shlex.quote(build_script)
+    )
+    result = subprocess.run(
+        ["ssh", *SSH_OPTIONS, "--", remote_host, command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = "\n".join(
+            line for line in (result.stdout + result.stderr).splitlines()[-20:] if line
+        )
+        raise RuntimeError("shared evaluator build failed" + (f":\n{detail}" if detail else ""))
+
+
+def require_shared_evaluator(host: str, evaluator: str) -> None:
+    """Check the shared evaluator once, not once per blade."""
+    remote_host = _token(host, "host")
+    executable = _token(evaluator, "evaluator")
+    result = subprocess.run(
+        ["ssh", *SSH_OPTIONS, "--", remote_host, "test", "-x", executable],
+        check=False,
+    )
+    if result.returncode != 0:
+        raise FileNotFoundError(
+            f"shared evaluator is missing: {executable}; rerun with --rebuild"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +326,17 @@ class PlacementLane:
             raise ValueError("lane name must be a non-empty string")
         if not callable(self.client_factory):
             raise TypeError("lane client_factory must be callable")
+
+
+@dataclass(frozen=True, slots=True)
+class LaneBatchResult:
+    """One bounded lane batch, returned as soon as that lane is free."""
+
+    lane: str
+    candidates: tuple[Candidate, ...]
+    results: tuple[CandidateResult, ...]
+    elapsed: float
+    error: str | None = None
 
 
 class EvaluatorFleet:
@@ -208,6 +358,7 @@ class EvaluatorFleet:
         metric_projection: str | None = None,
         metric_fields: Sequence[str] | None = None,
         observation: Mapping[str, Any] | None = None,
+        lane_callback: Callable[[str, int, float], None] | None = None,
     ) -> None:
         if not lanes:
             raise ValueError("fleet requires at least one lane")
@@ -223,30 +374,45 @@ class EvaluatorFleet:
                 normalized.append(PlacementLane(f"lane-{index}", lane))
             else:
                 raise TypeError("lanes must contain PlacementLane or client factories")
-        self._engines = tuple(
-            OptimizerEngine(
-                lane.client_factory,
-                session_id=session_id,
-                open_session=open_session,
-                metric_projection=metric_projection,
-                metric_fields=metric_fields,
-                observation=observation,
-            )
-            for lane in normalized
-        )
         self.lanes = tuple(normalized)
         self.session_id = session_id
         self.batch_size = batch_size
+        self._engine_options = {
+            "session_id": session_id,
+            "open_session": open_session,
+            "metric_projection": metric_projection,
+            "metric_fields": metric_fields,
+            "observation": observation,
+        }
+        self._engines = [self._new_engine(index) for index in range(len(self.lanes))]
         self._started = False
         self._closed = False
         self._next_ordinal = start_ordinal
         self._next_lane = 0
         self._evaluation_lock = Lock()
+        self._lane_callback = lane_callback
 
     @property
     def engines(self) -> tuple[OptimizerEngine, ...]:
         """Read-only access to lane engines for diagnostics."""
-        return self._engines
+        return tuple(self._engines)
+
+    def _new_engine(self, lane_index: int) -> OptimizerEngine:
+        return OptimizerEngine(
+            self.lanes[lane_index].client_factory,
+            **self._engine_options,
+        )
+
+    def _recycle_engine(self, lane_index: int) -> None:
+        engine = self._engines[lane_index]
+        try:
+            if engine.client is None:
+                engine.close()
+            else:
+                engine.client.shutdown()
+        except Exception:
+            pass
+        self._engines[lane_index] = self._new_engine(lane_index)
 
     def start(self) -> None:
         if self._closed:
@@ -269,6 +435,134 @@ class EvaluatorFleet:
         # A fleet may be reused by callers, but an engine must never receive two
         # requests concurrently; lane-level workers provide the useful parallelism.
         return [result for wave in self.iter_evaluate(candidates) for result in wave]
+
+    def iter_grid(
+        self,
+        assignments: Sequence[Iterable[tuple[int, Candidate]]],
+    ) -> Iterator[LaneBatchResult]:
+        """Run fixed lane stripes without barriers, recycling failed lanes."""
+        if len(assignments) != len(self.lanes):
+            raise ValueError("grid assignments must match the fleet lane count")
+        with self._evaluation_lock:
+            yield from self._iter_grid(assignments)
+
+    def _iter_grid(
+        self,
+        assignments: Sequence[Iterable[tuple[int, Candidate]]],
+    ) -> Iterator[LaneBatchResult]:
+        if self._closed:
+            raise RuntimeError("fleet is closed")
+        iterators = tuple(iter(items) for items in assignments)
+        consecutive_failures = [0] * len(self.lanes)
+        quarantined = [False] * len(self.lanes)
+
+        def next_batch(lane_index: int) -> tuple[tuple[int, Candidate], ...]:
+            items = tuple(islice(iterators[lane_index], self.batch_size))
+            for ordinal, candidate in items:
+                if (
+                    isinstance(ordinal, bool)
+                    or not isinstance(ordinal, int)
+                    or ordinal < 0
+                    or not isinstance(candidate, Candidate)
+                ):
+                    raise TypeError(
+                        "grid assignments must contain non-negative ordinal/Candidate pairs"
+                    )
+            return items
+
+        def run_lane(
+            lane_index: int,
+            items: tuple[tuple[int, Candidate], ...],
+        ) -> LaneBatchResult:
+            ordinals, candidates = zip(*items, strict=True)
+            started_at = time.monotonic()
+            error: str | None = None
+            try:
+                evaluated = self._engines[lane_index].evaluate(candidates)
+                if len(evaluated) != len(candidates):
+                    raise ValueError("lane returned the wrong number of results")
+                results = tuple(
+                    replace(result, ordinal=ordinal)
+                    for ordinal, result in zip(ordinals, evaluated, strict=True)
+                )
+            except Exception as exc:
+                detail = " | ".join(str(exc).splitlines()).strip()
+                error = f"{type(exc).__name__}: {detail}"[:500]
+                results = tuple(
+                    CandidateResult(
+                        candidate_id=candidate.candidate_id,
+                        status="failed",
+                        error=error if index == 0 else None,
+                        ordinal=ordinal,
+                    )
+                    for index, (ordinal, candidate) in enumerate(items)
+                )
+                self._recycle_engine(lane_index)
+            return LaneBatchResult(
+                lane=self.lanes[lane_index].name,
+                candidates=tuple(candidates),
+                results=results,
+                elapsed=time.monotonic() - started_at,
+                error=error,
+            )
+
+        def failed_lane(
+            lane_index: int,
+            items: tuple[tuple[int, Candidate], ...],
+        ) -> LaneBatchResult:
+            error = (
+                f"lane quarantined after {_MAX_CONSECUTIVE_GRID_FAILURES} "
+                "consecutive chunk failures"
+            )
+            return LaneBatchResult(
+                lane=self.lanes[lane_index].name,
+                candidates=tuple(candidate for _ordinal, candidate in items),
+                results=tuple(
+                    CandidateResult(
+                        candidate_id=candidate.candidate_id,
+                        status="failed",
+                        error=error if index == 0 else None,
+                        ordinal=ordinal,
+                    )
+                    for index, (ordinal, candidate) in enumerate(items)
+                ),
+                elapsed=0.0,
+                error=error,
+            )
+
+        def submit(executor, lane_index, items):
+            task = failed_lane if quarantined[lane_index] else run_lane
+            return executor.submit(task, lane_index, items)
+
+        executor = ThreadPoolExecutor(max_workers=len(self.lanes))
+        futures = {}
+        try:
+            for lane_index in range(len(self.lanes)):
+                if items := next_batch(lane_index):
+                    futures[submit(executor, lane_index, items)] = lane_index
+            while futures:
+                future = next(as_completed(futures))
+                lane_index = futures.pop(future)
+                completed = future.result()
+                if completed.error is None:
+                    consecutive_failures[lane_index] = 0
+                elif not quarantined[lane_index]:
+                    consecutive_failures[lane_index] += 1
+                    quarantined[lane_index] = (
+                        consecutive_failures[lane_index]
+                        >= _MAX_CONSECUTIVE_GRID_FAILURES
+                    )
+                if self._lane_callback is not None:
+                    self._lane_callback(
+                        completed.lane,
+                        len(completed.results),
+                        completed.elapsed,
+                    )
+                yield completed
+                if items := next_batch(lane_index):
+                    futures[submit(executor, lane_index, items)] = lane_index
+        finally:
+            executor.shutdown(wait=True)
 
     def iter_evaluate(self, candidates: Iterable[Candidate]) -> Iterator[list[CandidateResult]]:
         """Yield globally ordered waves; cross-batch ID uniqueness is caller-owned."""
@@ -325,9 +619,10 @@ class EvaluatorFleet:
 
                 def run_lane(
                     lane_index: int, assignment: list[tuple[int, Candidate]]
-                ) -> list[tuple[int, CandidateResult]]:
+                ) -> tuple[list[tuple[int, CandidateResult]], float]:
                     offsets, batch = zip(*assignment, strict=True)
                     engine = self._engines[lane_index]
+                    started_at = time.monotonic()
                     try:
                         results = engine.evaluate(batch)
                     except Exception as exc:
@@ -339,16 +634,29 @@ class EvaluatorFleet:
                         ) from exc
                     if len(results) != len(batch):  # Defensive seam for injected engines.
                         raise ValueError("lane returned the wrong number of results")
-                    return [
-                        (offset, replace(result, ordinal=base_ordinal + total + offset))
-                        for offset, result in zip(offsets, results, strict=True)
-                    ]
+                    return (
+                        [
+                            (offset, replace(result, ordinal=base_ordinal + total + offset))
+                            for offset, result in zip(offsets, results, strict=True)
+                        ],
+                        time.monotonic() - started_at,
+                    )
 
                 ordered: list[CandidateResult | None] = [None] * len(wave)
-                futures = [executor.submit(run_lane, lane, assignment)
-                           for lane, assignment in assignments.items()]
-                for future in futures:
-                    for offset, result in future.result():
+                futures = {
+                    executor.submit(run_lane, lane, assignment): lane
+                    for lane, assignment in assignments.items()
+                }
+                for future in as_completed(futures):
+                    lane_index = futures[future]
+                    lane_results, elapsed = future.result()
+                    if self._lane_callback is not None:
+                        self._lane_callback(
+                            self.lanes[lane_index].name,
+                            len(lane_results),
+                            elapsed,
+                        )
+                    for offset, result in lane_results:
                         ordered[offset] = result
                 total += len(wave)
                 self._next_ordinal += len(wave)
@@ -387,7 +695,11 @@ class EvaluatorFleet:
 
 __all__ = [
     "EvaluatorFleet",
+    "LaneBatchResult",
     "PlacementLane",
+    "REMOTE_BASE",
+    "RSYNC_SSH",
+    "SSH_OPTIONS",
     "ensure_remote_file",
     "local_client_factory",
     "ssh_client_factory",

@@ -10,12 +10,14 @@ import numpy as np
 
 
 COMBINED_SCORE = "combined_score"
+LP_DETACH_SCORE = "lp_detach_score"
 GM_FLOOR = 1e-4
 DETACH_ENERGY_WEIGHT = 2.5
 COMBINED_SCORE_FORMULA = (
     "2*ln(sqrt(max(apy_net_gm,1e-4)*max(yb_apy_gm,1e-4)))"
     "-2.5*detach_energy_ungated"
 )
+LP_DETACH_SCORE_FORMULA = "ln(max(apy_net_gm,1e-4))-2.5*detach_energy_ungated"
 
 
 def _combined_formula(lp_gm: Any, yb_gm: Any, detach: Any) -> Any:
@@ -60,11 +62,47 @@ def combined_scores(metrics: Mapping[str, Any]) -> np.ndarray:
     return scores
 
 
+def lp_detach_score(metrics: Mapping[str, float]) -> float:
+    """Rank no-YB LP growth after charging persistent E1.5 detachment."""
+    try:
+        lp_gm = float(metrics["apy_net_gm"])
+        detach_energy = float(metrics["detach_energy_ungated"])
+    except KeyError as exc:
+        raise ValueError(f"lp_detach_score requires metric {exc.args[0]!r}") from exc
+    if not math.isfinite(lp_gm) or not math.isfinite(detach_energy):
+        raise ValueError("lp_detach_score inputs must be finite")
+    if detach_energy < 0.0:
+        raise ValueError("lp_detach_score requires non-negative detach_energy_ungated")
+    return math.log(max(lp_gm, GM_FLOOR)) - DETACH_ENERGY_WEIGHT * detach_energy
+
+
+def lp_detach_scores(metrics: Mapping[str, Any]) -> np.ndarray:
+    """Vectorized no-YB LP-detachment score; invalid rows are NaN."""
+    try:
+        lp_gm = np.asarray(metrics["apy_net_gm"], dtype=float)
+        detach = np.asarray(metrics["detach_energy_ungated"], dtype=float)
+    except KeyError as exc:
+        raise ValueError(f"lp_detach_score requires metric {exc.args[0]!r}") from exc
+    if lp_gm.ndim != 1 or lp_gm.shape != detach.shape:
+        raise ValueError("lp_detach_score metrics must be equal-length vectors")
+    valid = np.isfinite(lp_gm) & np.isfinite(detach) & (detach >= 0.0)
+    scores = np.full(lp_gm.shape, np.nan)
+    scores[valid] = (
+        np.log(np.maximum(lp_gm[valid], GM_FLOOR))
+        - DETACH_ENERGY_WEIGHT * detach[valid]
+    )
+    return scores
+
+
 __all__ = [
     "COMBINED_SCORE",
     "COMBINED_SCORE_FORMULA",
     "DETACH_ENERGY_WEIGHT",
     "GM_FLOOR",
+    "LP_DETACH_SCORE",
+    "LP_DETACH_SCORE_FORMULA",
     "combined_score",
     "combined_scores",
+    "lp_detach_score",
+    "lp_detach_scores",
 ]

@@ -7,6 +7,7 @@ import os
 import orjson
 import shutil
 import tempfile
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -14,12 +15,18 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from .candidates import candidate_id
 from .contract import Candidate, CandidateResult
+from .grid import CartesianGrid
 
 
 SCHEMA_VERSION = "fxopt.results.v2"
+GRID_SCHEMA_VERSION = "fxopt.grid-results.v1"
 RUN_FILENAME = "run.json"
 RESULTS_FILENAME = "results.npz"
+
+_STATUS_TO_CODE = {"ok": 0, "failed": 1, "cancelled": 2}
+_CODE_TO_STATUS = tuple(_STATUS_TO_CODE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,12 +65,15 @@ class ResultColumns:
     run_id: str
     metadata: Mapping[str, Any]
     available_metrics: tuple[str, ...]
-    candidate_ids: np.ndarray
+    candidate_ids: np.ndarray | None
     ordinals: np.ndarray
-    statuses: np.ndarray
+    statuses: np.ndarray | None
     metrics: Mapping[str, np.ndarray]
-    errors: np.ndarray
-    error_present: np.ndarray
+    errors: np.ndarray | None
+    error_present: np.ndarray | None
+    status_codes: np.ndarray | None = None
+    failures: Mapping[int, str] = MappingProxyType({})
+    grid: CartesianGrid | None = None
 
     @property
     def row_count(self) -> int:
@@ -77,11 +87,55 @@ class ResultColumns:
             raise ValueError(f"result artifact has no unique row for ordinal {ordinal}")
         return int(rows[0])
 
+    @property
+    def ok_mask(self) -> np.ndarray:
+        if self.status_codes is not None:
+            return self.status_codes == _STATUS_TO_CODE["ok"]
+        assert self.statuses is not None
+        return self.statuses == "ok"
+
+    def status_at(self, row: int) -> str:
+        if self.status_codes is not None:
+            code = int(self.status_codes[row])
+            if code < 0 or code >= len(_CODE_TO_STATUS):
+                raise ValueError(f"invalid stored status code: {code}")
+            return _CODE_TO_STATUS[code]
+        assert self.statuses is not None
+        return str(self.statuses[row])
+
+    def error_at(self, row: int) -> str | None:
+        if self.error_present is not None and self.errors is not None:
+            return str(self.errors[row]) if bool(self.error_present[row]) else None
+        return self.failures.get(int(self.ordinals[row]))
+
+    def candidate_ids_array(self) -> np.ndarray:
+        if self.candidate_ids is not None:
+            return self.candidate_ids
+        width = len(candidate_id(max(0, self.row_count - 1)))
+        return np.fromiter(
+            (candidate_id(int(ordinal)) for ordinal in self.ordinals),
+            dtype=f"U{width}",
+            count=self.row_count,
+        )
+
     def candidate_at(self, ordinal: int) -> Candidate:
         """Construct only the candidate selected by its stored result ordinal."""
         return self._candidate_at_row(self.row_for_ordinal(ordinal))
 
     def _candidate_at_row(self, row: int) -> Candidate:
+        if self.grid is not None:
+            spec = self.grid.candidate_at(int(self.ordinals[row]))
+            payload = spec.payload
+            policy_params = payload.get("policy_params")
+            pool = payload.get("pool")
+            if not isinstance(policy_params, (list, tuple)) or not isinstance(pool, Mapping):
+                raise ValueError("grid metadata cannot reconstruct candidate payloads")
+            return Candidate(
+                candidate_id=spec.candidate_id,
+                policy_params=tuple(policy_params),
+                pool_overrides=pool,
+            )
+        assert self.candidate_ids is not None
         try:
             with np.load(self.root / RESULTS_FILENAME, allow_pickle=False) as archive:
                 offsets = archive["candidate_policy_offsets"]
@@ -94,8 +148,9 @@ class ResultColumns:
             pool_overrides = json.loads(str(overrides[row]))
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ValueError("invalid stored candidate pool overrides") from exc
+        raw_id = self.candidate_ids[row]
         return Candidate(
-            candidate_id=str(self.candidate_ids[row]),
+            candidate_id=(raw_id.decode() if isinstance(raw_id, bytes) else str(raw_id)),
             policy_params=values[start:stop].tolist(),
             pool_overrides=pool_overrides,
         )
@@ -149,6 +204,44 @@ def _artifact_paths(root: Path) -> ArtifactPaths:
 
 def _metric_key(column: int) -> str:
     return f"metric_{column:04d}"
+
+
+def _grid_member(kind: str, shard: int) -> str:
+    return f"{kind}_{shard:08d}.npy"
+
+
+def _grid_metric_member(column: int, shard: int) -> str:
+    return f"metric_{column:04d}_{shard:08d}.npy"
+
+
+def _read_npy_member(archive: zipfile.ZipFile, name: str) -> np.ndarray:
+    with archive.open(name, "r") as stream:
+        return np.lib.format.read_array(stream, allow_pickle=False)
+
+
+def _write_npy_member(
+    archive: zipfile.ZipFile, name: str, values: np.ndarray
+) -> None:
+    with archive.open(name, "w", force_zip64=True) as stream:
+        np.lib.format.write_array(stream, np.asarray(values), allow_pickle=False)
+
+
+def _grid_from_metadata(metadata: Mapping[str, Any], count: int) -> CartesianGrid:
+    defaults = metadata.get("candidate_defaults")
+    axes = metadata.get("axes")
+    if not isinstance(defaults, Mapping) or not isinstance(axes, Mapping):
+        raise ValueError("compact grid results require candidate defaults and axes")
+    grid = CartesianGrid(
+        dict(defaults),
+        {
+            str(name): tuple(values)
+            for name, values in axes.items()
+            if isinstance(name, str) and isinstance(values, list)
+        },
+    )
+    if len(grid) != count or len(grid.axes) != len(axes):
+        raise ValueError("compact grid metadata does not match candidate count")
+    return grid
 
 
 def write_results(bundle: ResultBundle, directory: str | Path) -> ArtifactPaths:
@@ -218,7 +311,8 @@ def read_result_columns(
     run_path = root / RUN_FILENAME
     try:
         payload = json.loads(run_path.read_bytes())
-        if payload.get("schema_version") != SCHEMA_VERSION:
+        schema = payload.get("schema_version")
+        if schema not in {SCHEMA_VERSION, GRID_SCHEMA_VERSION}:
             raise ValueError("unsupported result artifact schema")
         metric_names = tuple(payload["metric_names"])
         if len(set(metric_names)) != len(metric_names) or not all(
@@ -237,6 +331,86 @@ def read_result_columns(
     if missing:
         raise ValueError(f"unknown result metrics: {', '.join(missing)}")
     columns = {name: index for index, name in enumerate(metric_names)}
+
+    if schema == GRID_SCHEMA_VERSION:
+        shard_count = payload.get("shard_count")
+        if isinstance(shard_count, bool) or not isinstance(shard_count, int) or shard_count < 1:
+            raise ValueError("compact grid result has invalid shard count")
+        selected_metrics = {
+            name: np.empty(count, dtype=np.float64) for name in selected
+        }
+        status_codes = np.empty(count, dtype=np.uint8)
+        written = np.zeros(count, dtype=np.bool_)
+        failures: dict[int, str] = {}
+        try:
+            with zipfile.ZipFile(root / RESULTS_FILENAME, "r") as archive:
+                members = set(archive.namelist())
+                for shard in range(shard_count):
+                    index_name = _grid_member("index", shard)
+                    metric_members = tuple(
+                        _grid_metric_member(column, shard)
+                        for column in range(len(metric_names))
+                    )
+                    if index_name not in members or any(
+                        name not in members for name in metric_members
+                    ):
+                        raise ValueError(f"compact grid result is missing shard {shard}")
+                    index = _read_npy_member(archive, index_name)
+                    if (
+                        index.dtype.names != ("ordinal", "status")
+                        or index.ndim != 1
+                    ):
+                        raise ValueError(f"compact grid shard {shard} has invalid arrays")
+                    ordinals = np.asarray(index["ordinal"], dtype=np.int64)
+                    if (
+                        np.any(ordinals < 0)
+                        or np.any(ordinals >= count)
+                        or len(np.unique(ordinals)) != len(ordinals)
+                        or np.any(written[ordinals])
+                    ):
+                        raise ValueError(f"compact grid shard {shard} has invalid ordinals")
+                    written[ordinals] = True
+                    status_codes[ordinals] = index["status"]
+                    for name in selected:
+                        values = _read_npy_member(
+                            archive, metric_members[columns[name]]
+                        )
+                        if values.shape != (len(index),):
+                            raise ValueError(
+                                f"compact grid shard {shard} has invalid arrays"
+                            )
+                        selected_metrics[name][ordinals] = values
+                    errors_name = _grid_member("errors", shard)
+                    if errors_name in members:
+                        errors = _read_npy_member(archive, errors_name)
+                        if errors.dtype.names != ("ordinal", "error") or errors.ndim != 1:
+                            raise ValueError(
+                                f"compact grid shard {shard} has invalid errors"
+                            )
+                        for item in errors:
+                            ordinal = int(item["ordinal"])
+                            if ordinal not in failures:
+                                failures[ordinal] = str(item["error"])
+        except (OSError, KeyError, ValueError, zipfile.BadZipFile) as exc:
+            raise ValueError(f"invalid {RESULTS_FILENAME}") from exc
+        if not np.all(written) or np.any(status_codes >= len(_CODE_TO_STATUS)):
+            raise ValueError("compact grid shards do not cover the grid")
+        return ResultColumns(
+            root=root,
+            run_id=payload["run_id"],
+            metadata=dict(metadata),
+            available_metrics=metric_names,
+            candidate_ids=None,
+            ordinals=np.arange(count, dtype=np.int64),
+            statuses=None,
+            metrics=MappingProxyType(selected_metrics),
+            errors=None,
+            error_present=None,
+            status_codes=status_codes,
+            failures=MappingProxyType(failures),
+            grid=_grid_from_metadata(metadata, count),
+        )
+
     try:
         with np.load(root / RESULTS_FILENAME, allow_pickle=False) as archive:
             candidate_ids = archive["candidate_ids"]
@@ -280,13 +454,12 @@ def read_results(directory: str | Path) -> ResultBundle:
             for name, values in columns.metrics.items()
             if np.isfinite(values[row])
         }
-        error = str(columns.errors[row]) if bool(columns.error_present[row]) else None
         results.append(
             CandidateResult(
-                candidate_id=str(columns.candidate_ids[row]),
-                status=str(columns.statuses[row]),
+                candidate_id=candidates[row].candidate_id,
+                status=columns.status_at(row),
                 metrics=metrics,
-                error=error,
+                error=columns.error_at(row),
                 ordinal=int(columns.ordinals[row]),
             )
         )
@@ -298,6 +471,238 @@ def read_results(directory: str | Path) -> ResultBundle:
     )
 
 
+class GridResultWriter:
+    """Stream typed Cartesian shards into one atomically published NPZ."""
+
+    def __init__(
+        self,
+        directory: str | Path,
+        *,
+        run_id: str,
+        total: int,
+        metadata: Mapping[str, Any],
+        metric_names: Sequence[str] | None = None,
+        shard_rows: int = 65_536,
+    ) -> None:
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("run_id must be a non-empty string")
+        if isinstance(total, bool) or not isinstance(total, int) or total < 1:
+            raise ValueError("grid result total must be a positive integer")
+        names = None if metric_names is None else tuple(sorted(metric_names))
+        if names is not None and (
+            not names
+            or len(set(names)) != len(names)
+            or any(not isinstance(name, str) or not name for name in names)
+        ):
+            raise ValueError("metric names must be unique non-empty strings")
+        if (
+            isinstance(shard_rows, bool)
+            or not isinstance(shard_rows, int)
+            or shard_rows < 1
+        ):
+            raise ValueError("shard_rows must be a positive integer")
+
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self._paths = _artifact_paths(self.directory)
+        if self._paths.run_json.exists() or self._paths.results_npz.exists():
+            raise FileExistsError(f"completed result already exists in {self.directory}")
+        self._temporary = self.directory / f".{RESULTS_FILENAME}.tmp"
+        self._temporary.unlink(missing_ok=True)
+        self._archive = zipfile.ZipFile(
+            self._temporary,
+            mode="w",
+            compression=zipfile.ZIP_STORED,
+            allowZip64=True,
+        )
+        self._run_id = run_id
+        self._total = total
+        self._metadata = dict(metadata)
+        self._metric_names = names
+        self._shard_rows = shard_rows
+        self._written = np.zeros(total, dtype=np.bool_)
+        self._ordinal_dtype = np.dtype("<u4" if total <= np.iinfo(np.uint32).max else "<u8")
+        self._index_dtype = np.dtype(
+            [("ordinal", self._ordinal_dtype), ("status", "u1")]
+        )
+        self._buffer_index = np.empty(shard_rows, dtype=self._index_dtype)
+        self._buffer_values: np.ndarray | None = None
+        self._buffer_errors: list[tuple[int, str]] = []
+        self._buffer_count = 0
+        self._status_counts = {name: 0 for name in _STATUS_TO_CODE}
+        self._count = 0
+        self._shard_count = 0
+        self._closed = False
+
+    @property
+    def retained_rows(self) -> int:
+        return self._buffer_count
+
+    @property
+    def row_count(self) -> int:
+        return self._count
+
+    def append(
+        self,
+        candidates: Sequence[Candidate],
+        results: Sequence[CandidateResult],
+    ) -> None:
+        if self._closed:
+            raise RuntimeError("grid result writer is closed")
+        pairs = tuple(zip(candidates, results, strict=True))
+        if not pairs:
+            return
+        for candidate, result in pairs:
+            if not isinstance(candidate, Candidate) or not isinstance(result, CandidateResult):
+                raise TypeError("append expects Candidate and CandidateResult values")
+            if (
+                candidate.candidate_id != result.candidate_id
+                or candidate.candidate_id != candidate_id(result.ordinal)
+            ):
+                raise ValueError("grid candidate identity does not match its ordinal")
+
+        ordinals = np.fromiter(
+            (result.ordinal for _candidate, result in pairs),
+            dtype=np.int64,
+            count=len(pairs),
+        )
+        if (
+            np.any(ordinals < 0)
+            or np.any(ordinals >= self._total)
+            or len(np.unique(ordinals)) != len(ordinals)
+            or np.any(self._written[ordinals])
+        ):
+            raise ValueError("grid result ordinals must be unique and in range")
+
+        if self._metric_names is None:
+            self._metric_names = tuple(sorted({
+                name
+                for _candidate, result in pairs
+                for name in result.metrics
+            }))
+        metric_names = self._metric_names
+        if self._buffer_values is None:
+            self._buffer_values = np.empty(
+                (len(metric_names), self._shard_rows), dtype=np.float64
+            )
+        metric_columns = {name: index for index, name in enumerate(metric_names)}
+        values = np.full((len(metric_names), len(pairs)), np.nan, dtype=np.float64)
+        status = np.empty(len(pairs), dtype=np.uint8)
+        errors: list[tuple[int, str]] = []
+        for row, (_candidate, result) in enumerate(pairs):
+            if (
+                any(name not in metric_columns for name in result.metrics)
+                or (result.status == "ok" and len(result.metrics) != len(metric_names))
+            ):
+                raise ValueError("grid result metrics do not match the configured fields")
+            for name, value in result.metrics.items():
+                values[metric_columns[name], row] = value
+            status[row] = _STATUS_TO_CODE[result.status]
+            self._status_counts[result.status] += 1
+            if result.error is not None:
+                errors.append((result.ordinal, result.error))
+
+        error_by_ordinal = dict(errors)
+        offset = 0
+        while offset < len(pairs):
+            space = self._shard_rows - self._buffer_count
+            take = min(space, len(pairs) - offset)
+            target = slice(self._buffer_count, self._buffer_count + take)
+            source = slice(offset, offset + take)
+            self._buffer_index["ordinal"][target] = ordinals[source]
+            self._buffer_index["status"][target] = status[source]
+            assert self._buffer_values is not None
+            self._buffer_values[:, target] = values[:, source]
+            self._buffer_errors.extend(
+                (int(ordinal), error_by_ordinal[int(ordinal)])
+                for ordinal in ordinals[source]
+                if int(ordinal) in error_by_ordinal
+            )
+            self._buffer_count += take
+            offset += take
+            if self._buffer_count == self._shard_rows:
+                self._flush()
+        self._written[ordinals] = True
+        self._count += len(pairs)
+
+    def _flush(self) -> None:
+        if not self._buffer_count:
+            return
+        shard = self._shard_count
+        _write_npy_member(
+            self._archive,
+            _grid_member("index", shard),
+            self._buffer_index[: self._buffer_count],
+        )
+        assert self._buffer_values is not None
+        for column in range(len(self._metric_names or ())):
+            _write_npy_member(
+                self._archive,
+                _grid_metric_member(column, shard),
+                self._buffer_values[column, : self._buffer_count],
+            )
+        if self._buffer_errors:
+            width = max(len(error) for _ordinal, error in self._buffer_errors)
+            error_values = np.asarray(
+                self._buffer_errors,
+                dtype=np.dtype(
+                    [("ordinal", self._ordinal_dtype), ("error", f"U{width}")]
+                ),
+            )
+            _write_npy_member(
+                self._archive, _grid_member("errors", shard), error_values
+            )
+        self._buffer_count = 0
+        self._buffer_errors.clear()
+        self._shard_count += 1
+
+    def finalize(self) -> ArtifactPaths:
+        if self._closed:
+            raise RuntimeError("grid result writer is closed")
+        if self._count != self._total or not np.all(self._written):
+            raise ValueError("grid results do not cover every candidate")
+        self._flush()
+        self._archive.close()
+        self._closed = True
+        with self._temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
+        run_payload = {
+            "schema_version": GRID_SCHEMA_VERSION,
+            "run_id": self._run_id,
+            "candidate_count": self._total,
+            "metric_names": list(self._metric_names or ()),
+            "shard_count": self._shard_count,
+            "status_counts": self._status_counts,
+            "metadata": self._metadata,
+        }
+        os.replace(self._temporary, self._paths.results_npz)
+        try:
+            _atomic_bytes(
+                self._paths.run_json,
+                _canonical_json_bytes(run_payload),
+            )
+        except BaseException:
+            self._paths.results_npz.unlink(missing_ok=True)
+            raise
+        return self._paths
+
+    def cleanup(self) -> None:
+        if not self._closed:
+            self._archive.close()
+            self._closed = True
+        self._temporary.unlink(missing_ok=True)
+
+    def __enter__(self) -> "GridResultWriter":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        if exc_type is None:
+            if not self._closed:
+                self.finalize()
+        else:
+            self.cleanup()
+
+
 class ResultWriter:
     """Append bounded batches and finalize without retaining rows in memory."""
 
@@ -307,7 +712,6 @@ class ResultWriter:
         *,
         run_id: str,
         metadata: Mapping[str, Any] | None = None,
-        resumable: bool = False,
     ):
         if not isinstance(run_id, str) or not run_id.strip():
             raise ValueError("run_id must be a non-empty string")
@@ -315,7 +719,6 @@ class ResultWriter:
         self.directory.mkdir(parents=True, exist_ok=True)
         self._run_id = run_id
         self._metadata = dict(metadata or {})
-        self._resumable = resumable
         self._metric_names: set[str] = set()
         self._count = 0
         self._stats = {
@@ -324,34 +727,13 @@ class ResultWriter:
             "max_error": 1,
             "max_overrides": 2,
             "params": 0,
+            "min_params": None,
+            "max_params": 0,
         }
         self._closed = False
-        if resumable:
-            if (self.directory / RUN_FILENAME).exists() or (
-                self.directory / RESULTS_FILENAME
-            ).exists():
-                raise FileExistsError(f"completed result already exists in {self.directory}")
-            self._temporary = self.directory / ".fxopt-partial"
-            state_path = self._temporary / "state.json"
-            expected_state = {"run_id": run_id, "metadata": self._metadata}
-            if self._temporary.exists():
-                try:
-                    state = json.loads(state_path.read_bytes())
-                except (OSError, ValueError, json.JSONDecodeError) as exc:
-                    raise ValueError("invalid resumable result state") from exc
-                if _canonical_json_bytes(state) != _canonical_json_bytes(expected_state):
-                    raise ValueError("partial result does not match this run configuration")
-            else:
-                self._temporary.mkdir()
-                _atomic_bytes(state_path, _canonical_json_bytes(expected_state))
-            self._spool_path = self._temporary / "rows.jsonl"
-            if self._spool_path.exists():
-                self._restore()
-            self._spool = self._spool_path.open("ab")
-        else:
-            self._temporary = Path(tempfile.mkdtemp(prefix=".fxopt-", dir=self.directory))
-            self._spool_path = self._temporary / "rows.jsonl"
-            self._spool = self._spool_path.open("wb")
+        self._temporary = Path(tempfile.mkdtemp(prefix=".fxopt-", dir=self.directory))
+        self._spool_path = self._temporary / "rows.jsonl"
+        self._spool = self._spool_path.open("wb")
 
     @property
     def retained_rows(self) -> int:
@@ -381,23 +763,12 @@ class ResultWriter:
             self._stats["max_overrides"], len(overrides.decode())
         )
         self._stats["params"] += len(candidate_data.get("policy_params", ()))
-
-    def _restore(self) -> None:
-        with self._spool_path.open("rb") as stream:
-            for expected_ordinal, line in enumerate(stream):
-                try:
-                    row = orjson.loads(line)
-                    candidate = row["candidate"]
-                    result = row["result"]
-                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-                    raise ValueError("invalid resumable result row") from exc
-                if (
-                    candidate.get("ordinal") != expected_ordinal
-                    or result.get("ordinal") != expected_ordinal
-                    or candidate.get("candidate_id") != result.get("candidate_id")
-                ):
-                    raise ValueError("resumable result rows are not a contiguous prefix")
-                self._account(row)
+        param_count = len(candidate_data.get("policy_params", ()))
+        current_min = self._stats["min_params"]
+        self._stats["min_params"] = (
+            param_count if current_min is None else min(current_min, param_count)
+        )
+        self._stats["max_params"] = max(self._stats["max_params"], param_count)
 
     def update_metadata(self, **values: Any) -> None:
         """Add small run-level facts before final publication."""
@@ -430,10 +801,12 @@ class ResultWriter:
             raise RuntimeError("result writer is closed")
         self._spool.close()
         self._closed = True
-        complete = False
         try:
             metric_names = tuple(sorted(self._metric_names))
             stats = self._stats
+            if stats["min_params"] != stats["max_params"]:
+                raise ValueError("streamed candidates must have a fixed policy width")
+            param_width = int(stats["max_params"])
             root = self.directory
             staging = Path(tempfile.mkdtemp(prefix=".fxopt-final-", dir=root))
             try:
@@ -456,35 +829,46 @@ class ResultWriter:
                         for column, _name in enumerate(metric_names)
                     },
                 }
-                offsets, param_at = arrays["candidate_policy_offsets"], 0
+                written = np.lib.format.open_memmap(
+                    staging / "written.npy",
+                    mode="w+",
+                    dtype=np.bool_,
+                    shape=(self._count,),
+                )
+                written.fill(False)
+                offsets = arrays["candidate_policy_offsets"]
+                offsets[:] = np.arange(self._count + 1, dtype=np.int64) * param_width
                 columns = {name: index for index, name in enumerate(metric_names)}
                 for column in columns.values():
                     arrays[_metric_key(column)].fill(np.nan)
-                for index, row in enumerate(self._rows()):
+                for row in self._rows():
                     candidate, result = row["candidate"], row["result"]
+                    index = int(result["ordinal"])
+                    if index < 0 or index >= self._count or written[index]:
+                        raise ValueError("streamed result ordinals must form one grid permutation")
+                    written[index] = True
                     arrays["candidate_ids"][index] = candidate["candidate_id"]
                     params = candidate.get("policy_params", ())
-                    arrays["candidate_policy_values"][param_at : param_at + len(params)] = params
-                    param_at += len(params)
-                    offsets[index + 1] = param_at
+                    start = index * param_width
+                    arrays["candidate_policy_values"][start : start + param_width] = params
                     arrays["candidate_pool_overrides"][index] = _canonical_json_bytes(candidate.get("pool_overrides", {})).decode()
-                    arrays["ordinals"][index], arrays["statuses"][index] = result["ordinal"], result["status"]
+                    arrays["ordinals"][index], arrays["statuses"][index] = index, result["status"]
                     for name, value in result.get("metrics", {}).items():
                         arrays[_metric_key(columns[name])][index] = value
                     arrays["errors"][index], arrays["error_present"][index] = result.get("error") or "", result.get("error") is not None
-                arrays["candidate_policy_offsets"][0] = 0
+                if not np.all(written):
+                    raise ValueError("streamed result ordinals do not cover the grid")
                 for array in arrays.values():
                     array.flush()
+                written.flush()
                 run_payload = {"schema_version": SCHEMA_VERSION, "run_id": self._run_id, "candidate_count": self._count, "metric_names": list(metric_names), "metadata": self._metadata}
                 _atomic_npz(root / RESULTS_FILENAME, arrays)
                 _atomic_bytes(root / RUN_FILENAME, _canonical_json_bytes(run_payload))
-                complete = True
                 return ArtifactPaths(root / RUN_FILENAME, root / RESULTS_FILENAME)
             finally:
                 shutil.rmtree(staging, ignore_errors=True)
         finally:
-            if complete or not self._resumable:
-                self.cleanup()
+            self.cleanup()
 
     def cleanup(self) -> None:
         if not self._spool.closed:
@@ -498,8 +882,5 @@ class ResultWriter:
         if exc_type is None:
             if not self._closed:
                 self.finalize()
-        elif self._resumable:
-            if not self._spool.closed:
-                self._spool.close()
         else:
             self.cleanup()

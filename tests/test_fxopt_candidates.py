@@ -77,3 +77,31 @@ def test_million_candidate_grid_only_materializes_requested_batch() -> None:
         "policy_params": [0.5, 0.0003],
         "pool": {"A": 999, "donation_apy": 999},
     }
+
+    small = CandidateConfig.from_mapping({
+        "defaults": {"policy_params": [], "pool": {}},
+        "axes": {"pool.A": range(4), "pool.donation_apy": range(4)},
+    }).grid()
+    scheduled = list(small.iter_rotating_blocks(block_size=2, rotations=4))
+    assert [ordinal for ordinal, _spec in scheduled] == [
+        0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15,
+    ]
+    assert sorted(ordinal for ordinal, _spec in scheduled) == list(range(16))
+
+
+def test_compact_ranges_support_log_spacing_and_linked_targets() -> None:
+    grid = CandidateConfig.from_mapping({
+        "defaults": {"policy_params": [], "pool": {}},
+        "axes": {
+            "flat_fee": {
+                "start": 0.005,
+                "stop": 0.035,
+                "count": 3,
+                "targets": ["pool.mid_fee", "pool.out_fee"],
+            },
+            "pool.ma_time": {"start": 300, "stop": 1200, "count": 3, "scale": "log"},
+        },
+    }).grid()
+    assert grid.axes["pool.ma_time"] == (300, 600.0, 1200)
+    assert grid.candidate_at(0).payload["pool"]["mid_fee"] == 0.005
+    assert grid.candidate_at(len(grid) - 1).payload["pool"]["out_fee"] == 0.035

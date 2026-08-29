@@ -55,19 +55,20 @@ def test_factories_use_argv_direct_serve_and_validate_tokens(monkeypatch):
     monkeypatch.setattr(placement, "EvaluatorClient", fake_client)
     local = placement.local_client_factory("/opt/evaluator", work_dir="/tmp/run", workers=2)()
     remote = placement.ssh_client_factory(
-        "blade-a1", "/shared/evaluator", workers=3, verify_local_inputs=True
+        "blade-a1", "/home/heswithme/arb/evaluator", workers=3, verify_local_inputs=True
     )()
 
     assert local["launch_argv"] == ["/opt/evaluator", "serve", "--workers", "2"]
     assert remote["launch_argv"] == [
-        "ssh", "--", "blade-a1", "/shared/evaluator", "serve", "--workers", "3"
+        "ssh", *placement.SSH_OPTIONS, "--",
+        "blade-a1", "/home/heswithme/arb/evaluator", "serve", "--workers", "3"
     ]
     assert remote["verify_local_inputs"] is True
     assert all("optimizer" not in token and "python" not in token for token in remote["launch_argv"])
     with pytest.raises(ValueError, match="whitespace"):
-        placement.ssh_client_factory("blade a1", "/shared/evaluator")
+        placement.ssh_client_factory("blade a1", "/home/heswithme/arb/evaluator")
     with pytest.raises(ValueError):
-        placement.ssh_client_factory("--proxy-command=bad", "/shared/evaluator")
+        placement.ssh_client_factory("--proxy-command=bad", "/home/heswithme/arb/evaluator")
     with pytest.raises(ValueError):
         placement.ssh_client_factory("blade-a1", "--help")
     with pytest.raises(ValueError, match="workers"):
@@ -77,11 +78,14 @@ def test_factories_use_argv_direct_serve_and_validate_tokens(monkeypatch):
 
 def test_ssh_factory_uses_absolute_evaluator_without_remote_workdir(monkeypatch):
     monkeypatch.setattr(placement, "EvaluatorClient", lambda **kwargs: kwargs)
-    remote = placement.ssh_client_factory("blade-a1", "/shared/run/evaluator", workers=2)()
+    remote = placement.ssh_client_factory(
+        "blade-a1", "/home/heswithme/arb/run/evaluator", workers=2
+    )()
 
     assert remote["work_dir"] is None
     assert remote["launch_argv"] == [
-        "ssh", "--", "blade-a1", "/shared/run/evaluator", "serve", "--workers", "2",
+        "ssh", *placement.SSH_OPTIONS, "--",
+        "blade-a1", "/home/heswithme/arb/run/evaluator", "serve", "--workers", "2",
     ]
 
 
@@ -96,17 +100,22 @@ def test_ensure_remote_file_copies_only_when_missing(tmp_path, monkeypatch, pres
         return subprocess.CompletedProcess(argv, 0 if present or len(calls) > 1 else 1)
 
     monkeypatch.setattr(placement.subprocess, "run", fake_run)
-    placement.ensure_remote_file("blade-b6", source, "arb/optimizer/data/candles.json")
+    placement.ensure_remote_file(
+        "blade-b6", source, "/home/heswithme/arb/optimizer/data/candles.json"
+    )
 
     assert calls[0] == ([
-        "ssh", "--", "blade-b6", "test", "-f", "arb/optimizer/data/candles.json",
+        "ssh", *placement.SSH_OPTIONS, "--",
+        "blade-b6", "test", "-f", "/home/heswithme/arb/optimizer/data/candles.json",
     ], False)
     assert len(calls) == (1 if present else 3)
     if not present:
-        assert calls[1] == (["ssh", "--", "blade-b6", "mkdir", "-p",
-                             "arb/optimizer/data"], True)
-        assert calls[2] == (["rsync", "--ignore-existing", "--", str(source),
-                             "blade-b6:arb/optimizer/data/candles.json"], True)
+        assert calls[1] == (["ssh", *placement.SSH_OPTIONS, "--",
+                             "blade-b6", "mkdir", "-p",
+                             "/home/heswithme/arb/optimizer/data"], True)
+        assert calls[2] == (["rsync", "-a", "-e", placement.RSYNC_SSH,
+                             "--ignore-existing", "--", str(source),
+                             "blade-b6:/home/heswithme/arb/optimizer/data/candles.json"], True)
 
 
 def test_fleet_balances_full_wave_across_all_lanes():
@@ -126,7 +135,7 @@ def test_fleet_balances_full_wave_across_all_lanes():
     assert sorted(len(batch) for _, batch in batches) == [128, 128]
 
 
-def test_fleet_round_robins_whole_batches_and_preserves_global_order():
+def test_fleet_balances_partial_waves_and_preserves_global_order():
     events: list[tuple] = []
     batches: list[tuple] = []
     barrier = Barrier(2)
@@ -138,10 +147,12 @@ def test_fleet_round_robins_whole_batches_and_preserves_global_order():
         name: (lambda name=name: clients[name])
         for name in clients
     }
+    lane_updates = []
     fleet = placement.EvaluatorFleet(
         [placement.PlacementLane(name, factory) for name, factory in factories.items()],
         session_id="session",
         batch_size=2,
+        lane_callback=lambda name, count, elapsed: lane_updates.append((name, count, elapsed)),
     )
 
     candidates = [Candidate(f"c{index}") for index in range(5)]
@@ -153,9 +164,12 @@ def test_fleet_round_robins_whole_batches_and_preserves_global_order():
     assert [result.ordinal for result in results] == list(range(5))
     assert [result.ordinal for result in follow_up] == [5]
     assert sorted(batches[:3]) == sorted(
-        [("a", ["c0", "c1"]), ("b", ["c2", "c3"]), ("a", ["c4"])]
+        [("a", ["c0", "c2"]), ("b", ["c1", "c3"]), ("a", ["c4"])]
     )
     assert batches[3] == ("b", ["c5"])
+    assert sorted((name, count) for name, count, _elapsed in lane_updates) == [
+        ("a", 1), ("a", 2), ("b", 1), ("b", 2),
+    ]
     for name in clients:
         assert events.count((name, "start")) == 1
         assert events.count((name, "open", "session")) == 1
@@ -217,3 +231,79 @@ def test_fleet_streams_a_wave_before_consuming_later_candidates():
     assert [item.ordinal for item in first + second] == list(range(7))
     assert list(stream) == []
     fleet.close()
+
+
+def test_grid_fleet_records_failed_chunk_and_restarts_only_that_lane():
+    events: list[tuple] = []
+    batches: list[tuple] = []
+    created = {"a": 0, "b": 0}
+
+    class FailFirstClient(RecordingClient):
+        def evaluate_batch(self, candidates, **request):
+            raise RuntimeError("evaluator exited")
+
+    def factory(name):
+        def create():
+            created[name] += 1
+            cls = FailFirstClient if name == "a" and created[name] == 1 else RecordingClient
+            return cls(name, events, batches)
+
+        return create
+
+    fleet = placement.EvaluatorFleet(
+        [
+            placement.PlacementLane("a", factory("a")),
+            placement.PlacementLane("b", factory("b")),
+        ],
+        session_id="session",
+        batch_size=2,
+    )
+    assignments = (
+        tuple((index, Candidate(f"p{index:08d}")) for index in (0, 2, 4, 6)),
+        tuple((index, Candidate(f"p{index:08d}")) for index in (1, 3, 5, 7)),
+    )
+
+    completed = list(fleet.iter_grid(assignments))
+    fleet.close()
+
+    results = sorted(
+        (result for batch in completed for result in batch.results),
+        key=lambda result: result.ordinal,
+    )
+    assert [result.ordinal for result in results] == list(range(8))
+    assert [result.status for result in results] == [
+        "failed", "ok", "failed", "ok", "ok", "ok", "ok", "ok",
+    ]
+    assert all(not result.metrics for result in results if result.status == "failed")
+    assert sum(result.error is not None for result in results) == 1
+    assert created == {"a": 2, "b": 1}
+
+
+def test_grid_fleet_quarantines_a_lane_after_three_consecutive_failures():
+    created = 0
+
+    class AlwaysFailClient(RecordingClient):
+        def evaluate_batch(self, candidates, **request):
+            raise RuntimeError("still broken")
+
+    def factory():
+        nonlocal created
+        created += 1
+        return AlwaysFailClient("a", [], [])
+
+    fleet = placement.EvaluatorFleet(
+        [placement.PlacementLane("a", factory)],
+        session_id="session",
+        batch_size=1,
+    )
+    assignments = (tuple(
+        (index, Candidate(f"p{index:08d}")) for index in range(10)
+    ),)
+
+    completed = list(fleet.iter_grid(assignments))
+    fleet.close()
+
+    assert created == 3
+    assert all(batch.results[0].status == "failed" for batch in completed)
+    assert "quarantined" not in completed[2].error
+    assert "quarantined" in completed[3].error
