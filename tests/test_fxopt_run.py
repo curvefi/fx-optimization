@@ -20,6 +20,7 @@ from fxopt.run import (
     remote_run_status,
     run_config,
     run_remote_config,
+    stop_remote_run,
 )
 
 
@@ -318,11 +319,72 @@ pool = {}
     assert launch[: len(["ssh", *placement.SSH_OPTIONS, "--", "blade-a5"])] == [
         "ssh", *placement.SSH_OPTIONS, "--", "blade-a5"
     ]
+    assert "nohup setsid /bin/sh" in launch[-1]
     assert not (output / REMOTE_JOB_FILENAME).exists()
     assert {path.name for path in output.iterdir()} == {"run.json", "results.npz"}
     assert remote_run_status(config, output).state == "retrieved"
     assert sum(call[0] == "rsync" for call in calls) == 1
     assert calls[-1][-4:-1] == ["rm", "-rf", "--"]
+
+
+def test_stop_remote_run_terminates_coordinator_and_retains_handle(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = (
+        tmp_path / "curve-fx-sim" / "curve-fx-optimization" /
+        "configs" / "run.toml"
+    )
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        """
+[run]
+id = "remote"
+evaluator = "evaluator"
+template = "template.json"
+batch_size = 512
+metric_fields = ["score"]
+[placement]
+hosts = ["blade-a5"]
+[scenario]
+id = "scenario"
+market = "market.json"
+[candidate.defaults]
+policy_params = []
+pool = {}
+[candidate.axes]
+"pool.A" = [1]
+"""
+    )
+    output = tmp_path / "result"
+    output.mkdir()
+    handle = output / REMOTE_JOB_FILENAME
+    handle.write_text(json.dumps({
+        "run_id": "remote",
+        "coordinator": "blade-a5",
+        "remote_output": "/tmp/fxopt-grid.test",
+    }))
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(list(argv))
+        command = argv[-1]
+        if "state=stopped" in command:
+            return subprocess.CompletedProcess(
+                argv, 0, "running\n\nblade-a5: 512/1024 (50%)\n", ""
+            )
+        if "signal_tree()" in command:
+            return subprocess.CompletedProcess(argv, 0, "stopped\n", "")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr("fxopt.run.subprocess.run", fake_run)
+    status = stop_remote_run(config, output)
+
+    assert status.state == "stopped"
+    assert status.detail == "blade-a5: 512/1024 (50%)"
+    assert handle.is_file()
+    stop_command = calls[-1][-1]
+    assert 'kill -TERM -- "-$pid"' in stop_command
+    assert 'printf \'operator-stop\\n\' > "$work/stopped"' in stop_command
 
 
 def test_fxopt_help_exposes_only_run_surface() -> None:

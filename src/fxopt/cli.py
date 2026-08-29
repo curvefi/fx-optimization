@@ -18,6 +18,7 @@ from .run import (
     retrieve_remote_run,
     run_config,
     run_remote_config,
+    stop_remote_run,
 )
 
 
@@ -180,6 +181,7 @@ def main() -> None:
 @click.option("--status", "status_only", is_flag=True, help="Check detached remote state once.")
 @click.option("--follow", is_flag=True, help="Follow a detached job, then retrieve it.")
 @click.option("--retrieve", is_flag=True, help="Retrieve an already-complete remote job.")
+@click.option("--stop", "stop_only", is_flag=True, help="Stop a detached remote job.")
 def run_command(
     config: Path,
     output_dir: Path,
@@ -189,20 +191,34 @@ def run_command(
     status_only: bool,
     follow: bool,
     retrieve: bool,
+    stop_only: bool,
 ) -> None:
     """Run CONFIG or manage its detached remote coordinator."""
     reporter: _ProgressReporter | None = None
     try:
         config_value = RunConfig.from_toml(config)
-        modes = sum((status_only, follow, retrieve))
+        modes = sum((status_only, follow, retrieve, stop_only))
         if modes > 1:
-            raise ConfigError("--status, --follow, and --retrieve are mutually exclusive")
+            raise ConfigError(
+                "--status, --follow, --retrieve, and --stop are mutually exclusive"
+            )
         if modes and not config_value.hosts:
             raise ConfigError("remote job controls require placement hosts")
         if stream_blade is not None and stream_blade not in config_value.hosts:
             raise ConfigError(f"--stream-blade is not a placement host: {stream_blade}")
         if status_only:
             status = remote_run_status(config, output_dir)
+            location = (
+                f" at {status.coordinator}:{status.remote_output}"
+                if status.remote_output is not None
+                else ""
+            )
+            click.echo(f"remote: {status.state}{location}")
+            if status.detail:
+                click.echo(status.detail)
+            return
+        if stop_only:
+            status = stop_remote_run(config, output_dir)
             location = (
                 f" at {status.coordinator}:{status.remote_output}"
                 if status.remote_output is not None

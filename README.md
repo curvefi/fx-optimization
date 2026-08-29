@@ -105,12 +105,15 @@ the remaining state transitions:
 uv run fxopt run <config> --output <run-dir> --status
 uv run fxopt run <config> --output <run-dir> --follow
 uv run fxopt run <config> --output <run-dir> --retrieve
+uv run fxopt run <config> --output <run-dir> --stop
 ```
 
 `--status` checks once. `--follow` resumes the concise coordinator log and
-retrieves on completion. `--retrieve` fetches only an already-complete job. A
-small hidden job handle exists locally until successful retrieval, after which
-the run directory again contains exactly `run.json` and `results.npz`.
+retrieves on completion. `--retrieve` fetches only an already-complete job.
+`--stop` terminates the coordinator and its evaluator connections while retaining
+the remote directory and local job handle for diagnosis; partial grids are not
+resumable. A small hidden job handle exists locally until successful retrieval,
+after which the run directory again contains exactly `run.json` and `results.npz`.
 
 `--transfer` rsyncs the pool, harness, and optimizer sources once to the first
 configured blade. `--rebuild` implies transfer and builds the configured long-double

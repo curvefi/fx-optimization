@@ -692,7 +692,8 @@ def _start_remote_job(
         raise FileExistsError(f"completed result already exists in {destination}")
     if job_path.exists():
         raise FileExistsError(
-            f"remote job already exists in {destination}; use --status or --retrieve"
+            f"remote job already exists in {destination}; "
+            "use --status, --follow, --retrieve, or --stop"
         )
 
     prepare_remote(config, transfer=transfer, rebuild=rebuild)
@@ -760,7 +761,7 @@ def _start_remote_job(
     ))
     launch = " ".join((
         f": > {shlex.quote(log_path)};",
-        f"nohup /bin/sh -c {shlex.quote(wrapped)} </dev/null "
+        f"nohup setsid /bin/sh -c {shlex.quote(wrapped)} </dev/null "
         f">>{shlex.quote(log_path)} 2>&1 &",
         f"printf '%s\\n' \"$!\" > {shlex.quote(pid_path)}",
     ))
@@ -802,6 +803,7 @@ def remote_run_status(
         "if ! test -d \"$work\"; then state=missing;",
         "elif test -s \"$work/run.json\" && test -s \"$work/results.npz\"; "
         "then state=complete; code=0;",
+        "elif test -s \"$work/stopped\"; then state=stopped;",
         "elif test -s \"$work/exit_code\"; then "
         "code=$(cat \"$work/exit_code\"); state=failed;",
         "elif test -s \"$work/pid\" && "
@@ -831,6 +833,69 @@ def remote_run_status(
         job.remote_output,
         detail=lines[2] if len(lines) > 2 else "",
         exit_code=exit_code,
+    )
+
+
+def stop_remote_run(
+    config_path: str | Path,
+    output_dir: str | Path,
+) -> RemoteRunStatus:
+    """Stop one detached coordinator while retaining its diagnostic state."""
+    config = RunConfig.from_toml(config_path)
+    if not config.hosts:
+        raise ConfigError("remote stop requires placement hosts")
+    destination, paths, job_path = _remote_paths(output_dir)
+    if _local_run_complete(config, paths):
+        raise RuntimeError("remote job was already retrieved")
+    status = remote_run_status(config.path, destination)
+    if status.state == "complete":
+        raise RuntimeError("remote job is complete; use --retrieve")
+    if status.state != "running":
+        return status
+
+    job = _read_remote_job(config, job_path)
+    script = " ".join((
+        "set -eu;",
+        f"work={shlex.quote(job.remote_output)};",
+        "pid=$(cat \"$work/pid\");",
+        "case \"$pid\" in ''|*[!0-9]*) exit 2;; esac;",
+        "if test -s \"$work/run.json\" && test -s \"$work/results.npz\"; "
+        "then printf 'complete\\n'; exit 0; fi;",
+        "signal_tree() { signal=$1; current=$2; "
+        "for child in $(cat \"/proc/$current/task/$current/children\" "
+        "2>/dev/null || true); do signal_tree \"$signal\" \"$child\"; done; "
+        "kill -\"$signal\" \"$current\" 2>/dev/null || true; };",
+        "pgid=$(ps -o pgid= -p \"$pid\" 2>/dev/null | tr -d ' ' || true);",
+        "if test \"$pgid\" = \"$pid\"; then "
+        "kill -TERM -- \"-$pid\" 2>/dev/null || true; "
+        "else signal_tree TERM \"$pid\"; fi;",
+        "attempt=0; while kill -0 \"$pid\" 2>/dev/null && "
+        "test \"$attempt\" -lt 20; do sleep 0.25; attempt=$((attempt + 1)); done;",
+        "if kill -0 \"$pid\" 2>/dev/null; then "
+        "if test \"$pgid\" = \"$pid\"; then "
+        "kill -KILL -- \"-$pid\" 2>/dev/null || true; "
+        "else signal_tree KILL \"$pid\"; fi; fi;",
+        "printf 'operator-stop\\n' > \"$work/stopped\";",
+        "printf 'stopped\\n'",
+    ))
+    stopped = subprocess.run(
+        ["ssh", *SSH_OPTIONS, "--", job.coordinator, script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    state = stopped.stdout.strip()
+    if state == "complete":
+        raise RuntimeError(
+            "remote job completed before it could be stopped; use --retrieve"
+        )
+    if state != "stopped":
+        raise RuntimeError("coordinator returned an invalid stop result")
+    return RemoteRunStatus(
+        "stopped",
+        job.coordinator,
+        job.remote_output,
+        detail=status.detail,
     )
 
 
@@ -934,7 +999,7 @@ def _follow_and_retrieve(
     except BaseException:
         print(
             "cluster: connection ended; detached job retained "
-            "(--status / --follow / --retrieve)",
+            "(--status / --follow / --retrieve / --stop)",
             file=sys.stderr,
         )
         raise
