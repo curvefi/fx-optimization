@@ -2,10 +2,11 @@
 
 `curve-fx-optimization` is the small, user-facing workflow layer for Curve FX experiments. It owns candidate grids, optimization, result files, interactive heatmaps, and trace replay. It calls the evaluator supplied by `curve-fx-arb-harness`; pool mechanics remain in `twocrypto-cpp`.
 
-```
-twocrypto-cpp  ->  curve-fx-arb-harness  ->  curve-fx-optimization (fxopt)
- pool mechanics     evaluator session        runs, plots, replay
-```
+## Repository split
+
+- [`twocrypto-cpp`](https://github.com/curvefi/twocrypto-cpp) — C++ Twocrypto pool implementation and Vyper parity; no market simulation or experiment orchestration.
+- [`fx-arb-harness`](https://github.com/curvefi/fx-arb-harness) — C++ arbitrage simulation and evaluator protocol; owns market-event execution and raw metrics.
+- [`fx-optimization`](https://github.com/curvefi/fx-optimization) — cluster orchestration, parameter grids, scoring, result storage, robustness analysis, heatmaps, and replay.
 
 ## Setup
 
