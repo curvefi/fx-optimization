@@ -14,14 +14,89 @@ from fxopt.results import ArtifactPaths, read_result_columns
 from fxopt.run import (
     REMOTE_JOB_FILENAME,
     RunConfig,
-    _shuffled_block_ranges,
+    _ClusterProgress,
+    _shuffled_block_leases,
     follow_remote_run,
     open_session_request,
+    prepare_remote,
     remote_run_status,
     run_config,
     run_remote_config,
     stop_remote_run,
 )
+
+
+def test_cluster_progress_reports_elapsed_wall_time(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    now = [10.0]
+    monkeypatch.setattr("fxopt.run.time.monotonic", lambda: now[0])
+    progress = _ClusterProgress(total=100, workers=1, interval=3600.0)
+    now[0] = 12.0
+    progress.update(0, {
+        "type": "progress", "completed": 50, "total": 100,
+        "calculation_s": 5.0,
+    })
+    progress.write()
+    progress.close()
+
+    assert (
+        "run: 50/100 (50%) 10.0 pools/s "
+        "(2.0s elapsed, 5.0s ETA; 0/1 workers complete)"
+        in capsys.readouterr().err
+    )
+
+
+def test_remote_rebuild_receives_compiled_policy_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "curve-fx-sim"
+    config_path = (
+        workspace / "curve-fx-optimization" / "configs" / "autoresearch" / "run.toml"
+    )
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        """
+[run]
+id = "compiled"
+evaluator = "../../../curve-fx-arb-harness/build/dual/arb_evaluator_f64"
+template = "template.json"
+batch_size = 1
+metric_fields = ["score"]
+[placement]
+hosts = ["blade-a5"]
+[compiled_policy]
+id = "yieldbasis_twocrypto_policy"
+header = "../../../twocrypto-cpp/include/policy.hpp"
+[scenario]
+id = "scenario"
+market = "market.json"
+[candidate.defaults]
+policy_params = [1, 2, 3, 4, 5, 6]
+pool = {}
+"""
+    )
+    config = RunConfig.from_toml(config_path)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr("fxopt.run.require_reachable_hosts", lambda hosts: hosts)
+    monkeypatch.setattr("fxopt.run.transfer_workspace", lambda *_args: None)
+    monkeypatch.setattr("fxopt.run.require_shared_evaluator", lambda *_args: None)
+    monkeypatch.setattr(
+        "fxopt.run.rebuild_shared_evaluator",
+        lambda host, evaluator, **kwargs: captured.update(
+            host=host, evaluator=evaluator, **kwargs
+        ),
+    )
+
+    prepare_remote(config, transfer=False, rebuild=True)
+
+    assert captured == {
+        "host": "blade-a5",
+        "evaluator": "/home/heswithme/arb/curve-fx-arb-harness/build/dual/arb_evaluator_f64",
+        "policy_header": "/home/heswithme/arb/twocrypto-cpp/include/policy.hpp",
+        "policy_id": "yieldbasis_twocrypto_policy",
+    }
 
 
 class FakeClient:
@@ -92,15 +167,15 @@ class FakeClient:
         self.events.append("shutdown")
 
 
-def test_shuffled_blocks_are_balanced_reproducible_and_cover_the_grid() -> None:
-    assignments = _shuffled_block_ranges(64, 4, 4)
+def test_shuffled_leases_are_reproducible_and_cover_the_grid() -> None:
+    assignments = _shuffled_block_leases(64, 4, 8, 2)
 
-    assert assignments == _shuffled_block_ranges(64, 4, 4)
+    assert assignments == _shuffled_block_leases(64, 4, 8, 2)
     assert [[start for start, _stop in worker] for worker in assignments] == [
-        [40, 36, 52, 0],
-        [56, 8, 28, 24],
-        [20, 12, 32, 60],
-        [4, 44, 16, 48],
+        [40, 56, 20, 4],
+        [36, 8, 12, 44],
+        [52, 28, 32, 16],
+        [0, 24, 60, 48],
     ]
     assert sorted(
         ordinal

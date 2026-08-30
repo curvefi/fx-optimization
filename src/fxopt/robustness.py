@@ -183,29 +183,43 @@ def score_robustness(
             "grid cannot measure exact robustness for " + ", ".join(unmeasurable)
         )
 
-    robust = np.full(count, np.nan)
-    complete = np.zeros(count, dtype=bool)
-    member_count = np.zeros(count, dtype=np.int64)
-    worst_ordinal = np.full(count, -1, dtype=np.int64)
-    for ordinal in range(count):
-        coordinate = list(np.unravel_index(ordinal, shape))
-        members = [ordinal]
-        for position, arms in configured:
-            arm = arms[coordinate[position]]
+    score_grid = scores.reshape(shape)
+    robust_grid = score_grid.copy()
+    complete_grid = np.isfinite(score_grid)
+    member_grid = np.ones(shape, dtype=np.int64)
+    ordinal_grid = np.arange(count, dtype=np.int64).reshape(shape)
+    worst_grid = ordinal_grid.copy()
+
+    for position, arms in configured:
+        for center_index, arm in enumerate(arms):
+            destination = [slice(None)] * len(shape)
+            destination[position] = center_index
+            destination = tuple(destination)
             if not arm:
-                break
+                complete_grid[destination] = False
+                continue
+            member_grid[destination] += len(arm)
             for axis_index in arm:
-                neighbor = coordinate.copy()
-                neighbor[position] = axis_index
-                members.append(int(np.ravel_multi_index(tuple(neighbor), shape)))
-        else:
-            values = scores[members]
-            if np.all(np.isfinite(values)):
-                worst = int(np.argmin(values))
-                robust[ordinal] = float(values[worst])
-                complete[ordinal] = True
-                member_count[ordinal] = len(members)
-                worst_ordinal[ordinal] = members[worst]
+                source = list(destination)
+                source[position] = axis_index
+                source = tuple(source)
+                neighbor_scores = score_grid[source]
+                complete_grid[destination] &= np.isfinite(neighbor_scores)
+                worse = neighbor_scores < robust_grid[destination]
+                robust_grid[destination] = np.where(
+                    worse, neighbor_scores, robust_grid[destination]
+                )
+                worst_grid[destination] = np.where(
+                    worse, ordinal_grid[source], worst_grid[destination]
+                )
+
+    robust = robust_grid.reshape(-1)
+    complete = complete_grid.reshape(-1)
+    member_count = member_grid.reshape(-1)
+    worst_ordinal = worst_grid.reshape(-1)
+    robust[~complete] = np.nan
+    member_count[~complete] = 0
+    worst_ordinal[~complete] = -1
 
     rows = ordinal_rows.astype(np.int64, copy=False)
     return RobustnessResult(

@@ -5,6 +5,7 @@ import json
 import platform
 import shutil
 import subprocess
+import sys
 import threading
 import time
 
@@ -21,7 +22,7 @@ from .run import (
     run_config,
     run_distributed_config,
     run_remote_config,
-    run_worker_partition,
+    run_leased_worker,
     stop_remote_run,
 )
 
@@ -36,7 +37,7 @@ def _overwrite_output(config: Path, output: Path) -> None:
         raise ConfigError("--overwrite refuses to remove a configuration ancestor")
     if (destination / REMOTE_JOB_FILENAME).exists():
         raise ConfigError(
-            "--overwrite refuses a detached remote job; use --status or --stop first"
+            "--overwrite refuses a detached remote job; retrieve it or use a different output"
         )
     entries = tuple(destination.iterdir())
     markers = {"run.json", "results.npz", ".results.npz.tmp"}
@@ -131,6 +132,7 @@ class _WorkerReporter:
         self.interval = interval
         self.latest: tuple[int, int, float] | None = None
         self.lock = threading.Lock()
+        self.output_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._heartbeat, daemon=True)
         self.started = False
@@ -149,13 +151,21 @@ class _WorkerReporter:
             if latest is None:
                 continue
             completed, total, calculation_s = latest
-            click.echo(json.dumps({
+            self.emit({
                 "type": "progress",
                 "worker_index": self.worker_index,
                 "completed": completed,
                 "total": total,
                 "calculation_s": calculation_s,
-            }, sort_keys=True, separators=(",", ":")))
+            })
+
+    def emit(self, message: dict[str, object]) -> None:
+        with self.output_lock:
+            click.echo(json.dumps(
+                message,
+                sort_keys=True,
+                separators=(",", ":"),
+            ))
 
     def close(self) -> None:
         self.stop_event.set()
@@ -305,38 +315,64 @@ def cluster_worker_command(
 @click.option("--output", "output_dir", required=True,
               type=click.Path(file_okay=False, path_type=Path))
 @click.option("--worker-index", required=True, type=click.IntRange(min=0))
-@click.option("--worker-count", required=True, type=click.IntRange(min=1))
 def worker_command(
     config: Path,
     output_dir: Path,
     worker_index: int,
-    worker_count: int,
 ) -> None:
-    """Evaluate one deterministic machine-worker partition."""
+    """Evaluate coordinator-assigned deterministic grid leases."""
     reporter = _WorkerReporter(worker_index)
+
+    def commands():
+        for line in sys.stdin:
+            if line.strip():
+                yield json.loads(line)
+
+    def ready(
+        lease_id: int | None,
+        completed: int,
+        total: int,
+        calculation_s: float,
+    ) -> None:
+        message: dict[str, object] = {
+            "type": "ready",
+            "worker_index": worker_index,
+            "completed": completed,
+            "total": total,
+            "calculation_s": calculation_s,
+        }
+        if lease_id is not None:
+            message["completed_lease_id"] = lease_id
+        reporter.emit(message)
+
     try:
-        receipt = run_worker_partition(
+        receipt = run_leased_worker(
             config,
             output_dir,
             worker_index=worker_index,
-            worker_count=worker_count,
+            commands=commands(),
             progress_callback=reporter,
+            ready_callback=ready,
         )
     except (ConfigError, OSError, RuntimeError, TypeError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
         reporter.close()
-    click.echo(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
+    reporter.emit(receipt)
 
 
 @main.command("heatmap")
 @click.argument("run_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option("--x", "x_axis")
 @click.option("--y", "y_axis")
+@click.option("--log-axis", "log_axes", multiple=True,
+              help="Render this numeric grid axis logarithmically; repeat as needed.")
+@click.option("--columns", type=click.IntRange(min=1), default=3, show_default=True)
 @click.option("--metric", "metrics", multiple=True,
-              default=("apy_net_consistency_90d", "detach_energy_ungated", "max_7d_rel_price_diff"),
+              default=("apy_net_robust_90d", "detach_energy_ungated", "max_7d_rel_price_diff"),
               show_default=True)
 @click.option("--max-price-diff-bps", type=float, default=100.0, show_default=True)
+@click.option("--max-detach-energy", type=click.FloatRange(min=0.0))
 @click.option("--max-skew-percent", type=float)
 @click.option("--slippage-bps", type=float)
 @click.option("--final-price-diff-bps", type=float)
@@ -344,16 +380,21 @@ def worker_command(
 @click.option("--show/--no-show", default=True, show_default=True)
 def heatmap_command(
     run_dir: Path, x_axis: str | None, y_axis: str | None,
-    metrics: tuple[str, ...], max_price_diff_bps: float,
-    max_skew_percent: float | None, slippage_bps: float | None,
+    log_axes: tuple[str, ...], columns: int, metrics: tuple[str, ...],
+    max_price_diff_bps: float,
+    max_detach_energy: float | None, max_skew_percent: float | None,
+    slippage_bps: float | None,
     final_price_diff_bps: float | None, output: Path | None, show: bool,
 ) -> None:
     """Open the interactive filtered heatmap explorer."""
+    explorer = None
     try:
         from .explorer import open_fxopt_explorer
         explorer = open_fxopt_explorer(
             run_dir, metrics=metrics, x_axis=x_axis, y_axis=y_axis,
+            log_axes=log_axes, columns=columns,
             max_price_diff_bps=max_price_diff_bps,
+            max_detach_energy=max_detach_energy,
             max_skew_percent=max_skew_percent,
             slippage_bps=slippage_bps,
             final_price_diff_bps=final_price_diff_bps,
@@ -367,6 +408,9 @@ def heatmap_command(
             raise ValueError("--no-show requires --output")
     except (OSError, TypeError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
+    finally:
+        if explorer is not None:
+            explorer.close()
 
 
 @main.command("shiftclick")

@@ -11,9 +11,10 @@ import numpy as np
 from curve_fx_sim.plotting.explorer import HeatmapExplorer
 from curve_fx_sim.plotting.heatmap import HeatmapAxis, HeatmapDataset
 from curve_fx_sim.plotting.masked_metrics import (
-    MASKED_METRIC_SOURCES,
     SKEW_MASKED_METRICS,
     SLIPPAGE_APY_MASK_SOURCES,
+    masked_metric_source,
+    masked_metric_uses_detach,
 )
 from .results import ResultColumns, read_result_columns
 from .shiftclick import shiftclick_figure, trace_stored_candidate
@@ -23,9 +24,9 @@ def _metric_columns(requested: Sequence[str], available: Sequence[str]) -> tuple
     available_set = set(available)
     needed: set[str] = set()
     for name in requested:
-        source = MASKED_METRIC_SOURCES.get(name, name)
-        needed.add(source)
-        if name not in MASKED_METRIC_SOURCES:
+        source = masked_metric_source(name, available_set)
+        needed.add(source or name)
+        if source is None:
             continue
         price_diff = next(
             (item for item in ("max_7d_rel_price_diff", "max_rel_price_diff")
@@ -34,6 +35,8 @@ def _metric_columns(requested: Sequence[str], available: Sequence[str]) -> tuple
         )
         if price_diff is not None:
             needed.add(price_diff)
+        if masked_metric_uses_detach(name, available_set) and "detach_energy_ungated" in available_set:
+            needed.add("detach_energy_ungated")
         if name in SKEW_MASKED_METRICS:
             needed.update(available_set.intersection({"max_7d_skew", "final_rel_price_diff"}))
         slippage = SLIPPAGE_APY_MASK_SOURCES.get(name)
@@ -95,9 +98,12 @@ def open_fxopt_explorer(
     run_dir: str | Path,
     *,
     metrics: Sequence[str],
+    columns: int = 3,
     x_axis: str | None = None,
     y_axis: str | None = None,
+    log_axes: Sequence[str] = (),
     max_price_diff_bps: float | None = 100.0,
+    max_detach_energy: float | None = None,
     max_skew_percent: float | None = None,
     slippage_bps: float | None = None,
     final_price_diff_bps: float | None = None,
@@ -111,16 +117,17 @@ def open_fxopt_explorer(
     except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise ValueError("run has no readable metric manifest") from exc
     selected_columns = _metric_columns(metrics, available_metrics)
-    columns = read_result_columns(root, metrics=selected_columns)
+    results = read_result_columns(root, metrics=selected_columns)
+
     def replay(selection: Any, mode: str) -> Path:
         ordinal = int(selection.index)
-        candidate = columns.candidate_at(ordinal)
+        candidate = results.candidate_at(ordinal)
         if candidate.candidate_id != selection.candidate_id:
             raise ValueError("selected candidate does not match the stored result row")
         output = root / "inspections" / f"ordinal-{ordinal}"
         summary = trace_stored_candidate(
-            columns.run_id,
-            columns.metadata,
+            results.run_id,
+            results.metadata,
             candidate=candidate,
             ordinal=ordinal,
             output_dir=output,
@@ -128,12 +135,12 @@ def open_fxopt_explorer(
             trace_actions=False,
             yb_mode=None if mode == "shift" else "off",
         )
-        figure = shiftclick_figure(summary, title=f"{columns.run_id}: {ordinal}")
+        figure = shiftclick_figure(summary, title=f"{results.run_id}: {ordinal}")
         figure.show()
         return summary
 
-    dataset = _dataset(columns)
-    raw_axes = columns.metadata["axes"]
+    dataset = _dataset(results)
+    raw_axes = results.metadata["axes"]
     aliases = {
         name: axis.key
         for name, axis in zip(sorted(raw_axes), dataset.axes, strict=True)
@@ -141,13 +148,16 @@ def open_fxopt_explorer(
     return HeatmapExplorer(
         dataset,
         metrics=tuple(metrics),
+        ncol=columns,
         x_axis=aliases.get(x_axis, x_axis),
         y_axis=aliases.get(y_axis, y_axis),
+        log_axes=tuple(aliases.get(name, name) for name in log_axes),
         max_pricethr=max_price_diff_bps,
+        max_detach_energy=max_detach_energy,
         skewthr=max_skew_percent,
         slipthr=slippage_bps,
         final_pdiffthr=final_price_diff_bps,
-        run_id=columns.run_id,
+        run_id=results.run_id,
         run_dir=root,
         on_replay=replay,
     )

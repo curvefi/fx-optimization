@@ -20,9 +20,11 @@ from matplotlib.backend_bases import MouseButton, MouseEvent
 from matplotlib.widgets import RadioButtons, Slider
 
 from .masked_metrics import (
-    MASKED_METRIC_SOURCES,
     SKEW_MASKED_METRICS,
     SLIPPAGE_APY_MASK_SOURCES,
+    is_masked_metric,
+    masked_metric_source,
+    masked_metric_uses_detach,
 )
 from .theme import DEFAULT_THEME, PlotTheme, apply_theme
 
@@ -292,6 +294,7 @@ class HeatmapAxis:
 @dataclass(frozen=True)
 class MaskSpec:
     max_price_diff_bps: float | None = None
+    max_detach_energy: float | None = None
     max_skew_percent: float | None = None
     max_final_price_diff_bps: float | None = None
     slippage_thr_bps: float | None = None
@@ -307,11 +310,12 @@ class MaskSpec:
         return any(value is not None for value in self.__dict__.values())
 
     def to_dict(self) -> dict[str, float | None]:
-        # The first three keys are the legacy single-metric mask schema and are
-        # always present (back-compat). Slippage-window thresholds are appended
-        # only when set so the default single-metric state stays byte-identical.
+        # Core visual filters are always explicit in saved explorer state.
+        # Slippage fields remain conditional because most grids do not load
+        # those diagnostics.
         payload: dict[str, float | None] = {
             "max_price_diff_bps": self.max_price_diff_bps,
+            "max_detach_energy": self.max_detach_energy,
             "max_skew_percent": self.max_skew_percent,
             "max_final_price_diff_bps": self.max_final_price_diff_bps,
         }
@@ -404,7 +408,9 @@ class HeatmapDataset:
         to the derived ``*_masked`` family and are intentionally conditional
         on that metric's semantics.
         """
-        source = MASKED_METRIC_SOURCES[name]
+        source = masked_metric_source(name, self.metrics)
+        if source is None:
+            raise HeatmapValidationError(f"unknown masked metric {name!r}")
         if source not in self.metrics:
             raise HeatmapValidationError(
                 f"masked metric {name!r} requires {source!r} in the evaluation table"
@@ -423,6 +429,13 @@ class HeatmapDataset:
             if pdiff is None:
                 raise HeatmapValidationError("price-difference mask metric is unavailable")
             values[np.abs(pdiff) > mask.max_price_diff_bps / 10_000.0] = np.nan
+        if masked_metric_uses_detach(name, self.metrics) and mask.max_detach_energy is not None:
+            if "detach_energy_ungated" not in self.metrics:
+                raise HeatmapValidationError("detachment mask metric is unavailable")
+            detach = np.asarray(self.metrics["detach_energy_ungated"], dtype=float)
+            values[
+                ~np.isfinite(detach) | (detach > mask.max_detach_energy)
+            ] = np.nan
         slippage_source = SLIPPAGE_APY_MASK_SOURCES.get(name)
         if slippage_source is not None and mask.slippage_thr_bps is not None:
             if slippage_source not in self.metrics:
@@ -448,7 +461,7 @@ class HeatmapDataset:
         return values
 
     def metric_array(self, name: str, mask: MaskSpec = MaskSpec()) -> np.ndarray:
-        if name in MASKED_METRIC_SOURCES:
+        if is_masked_metric(name, self.metrics):
             return self._masked_metric_array(name, mask)
         if name not in self.metrics:
             raise HeatmapValidationError(f"unknown heatmap metric {name!r}")
@@ -527,7 +540,7 @@ class HeatmapState:
         keys = tuple(axis.key for axis in self.axes)
         if self.x_axis == self.y_axis or self.x_axis not in keys or self.y_axis not in keys:
             raise HeatmapValidationError("heatmap state requires two distinct declared axes")
-        if self.metric not in self.metrics:
+        if self.metric not in self.metrics and not is_masked_metric(self.metric, self.metrics):
             raise HeatmapValidationError("heatmap state metric is unavailable")
         self.slider_indices = {
             axis.key: int(self.slider_indices.get(axis.key, 0))
@@ -639,7 +652,7 @@ class HeatmapTilesState:
         if not self.tiles:
             raise HeatmapValidationError("tiled heatmap requires at least one metric")
         for tile in self.tiles:
-            if tile not in self.metrics and tile not in MASKED_METRIC_SOURCES:
+            if tile not in self.metrics and not is_masked_metric(tile, self.metrics):
                 raise HeatmapValidationError(
                     f"unknown heatmap metric {tile!r}; available metrics: {', '.join(self.metrics)}"
                 )
@@ -1156,7 +1169,11 @@ class MatplotlibHeatmapTilesView:
             # metrics keep every cell (only success-masked); the *_masked
             # family alone receives the pdiff/slippage caps. Scope the mask to
             # masked tiles so raw panels keep full coverage.
-            tile_mask = self.state.mask if metric in MASKED_METRIC_SOURCES else MaskSpec()
+            tile_mask = (
+                self.state.mask
+                if is_masked_metric(metric, self.dataset.metrics)
+                else MaskSpec()
+            )
             values = self.dataset.slice_metric(
                 metric,
                 x_axis=x_axis.key,

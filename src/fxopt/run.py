@@ -45,9 +45,11 @@ _RUN_KEYS = frozenset({"id", "evaluator", "template", "batch_size", "workers", "
 _PLACEMENT_KEYS = frozenset({"hosts", "numa_nodes"})
 _CANDIDATE_KEYS = frozenset({"defaults", "axes"})
 _SCENARIO_KEYS = frozenset({"id", "market", "chainlink", "yb_mode"})
+_COMPILED_POLICY_KEYS = frozenset({"header", "id"})
 
 ProgressCallback = Callable[[int, int], None]
 WorkerProgressCallback = Callable[[int, int, float], None]
+WorkerReadyCallback = Callable[[int | None, int, int, float], None]
 REMOTE_JOB_FILENAME = ".remote-job.json"
 _BLOCK_SHUFFLE_SEED = 0
 _SCHEDULE_BLOCK_ROWS = 8
@@ -88,6 +90,8 @@ class RunConfig:
     session: Mapping[str, Any]
     scenario: Mapping[str, Any]
     robustness: tuple[RobustnessAxis, ...]
+    compiled_policy_header: Path | None
+    compiled_policy_id: str | None
 
     @classmethod
     def from_toml(cls, path: str | Path) -> "RunConfig":
@@ -202,6 +206,26 @@ class RunConfig:
             raise ConfigError("scenario.yb_mode must be a string")
         if scenario_yb_mode is not None:
             resolved_scenario["yb_mode"] = scenario_yb_mode
+
+        compiled_policy = raw.get("compiled_policy")
+        compiled_policy_header: Path | None = None
+        compiled_policy_id: str | None = None
+        if compiled_policy is not None:
+            if not isinstance(compiled_policy, Mapping):
+                raise ConfigError("[compiled_policy] must be a mapping")
+            unknown_compiled_policy = set(compiled_policy) - _COMPILED_POLICY_KEYS
+            if unknown_compiled_policy:
+                raise ConfigError(
+                    "unknown [compiled_policy] keys: "
+                    f"{sorted(unknown_compiled_policy)}"
+                )
+            compiled_policy_header = _resolve_path(
+                _required_string(compiled_policy, "header", "compiled_policy"),
+                config_path.parent,
+            )
+            compiled_policy_id = _required_string(
+                compiled_policy, "id", "compiled_policy"
+            )
         base = config_path.parent
         config = cls(
             path=config_path,
@@ -219,6 +243,8 @@ class RunConfig:
             robustness=parse_robustness_axes(
                 raw.get("robustness"), required=False
             ),
+            compiled_policy_header=compiled_policy_header,
+            compiled_policy_id=compiled_policy_id,
         )
         if hosts:
             _execution_inputs(config, remote=True)
@@ -258,22 +284,27 @@ def _schedule_block_size(config: RunConfig, total: int) -> int:
     return min(_SCHEDULE_BLOCK_ROWS, _evaluator_batch_size(config, total))
 
 
-def _shuffled_block_ranges(
+def _shuffled_block_leases(
     total: int,
     block_size: int,
-    workers: int,
+    batch_size: int,
+    slots: int,
     *,
     seed: int = _BLOCK_SHUFFLE_SEED,
 ) -> tuple[tuple[tuple[int, int], ...], ...]:
-    """Assign reproducibly shuffled contiguous blocks round-robin."""
-    if total < 1 or block_size < 1 or workers < 1:
-        raise ValueError("total, block size, and worker count must be positive")
+    """Group reproducibly shuffled blocks into machine-sized leases."""
+    if total < 1 or block_size < 1 or batch_size < 1 or slots < 1:
+        raise ValueError("total, block size, batch size, and slots must be positive")
     blocks = [
         (start, min(total, start + block_size))
         for start in range(0, total, block_size)
     ]
     random.Random(seed).shuffle(blocks)
-    return tuple(tuple(blocks[index::workers]) for index in range(workers))
+    blocks_per_lease = max(1, batch_size // block_size) * slots
+    return tuple(
+        tuple(blocks[index:index + blocks_per_lease])
+        for index in range(0, len(blocks), blocks_per_lease)
+    )
 
 
 def _range_count(ranges: Iterable[tuple[int, int]]) -> int:
@@ -303,16 +334,16 @@ def grid_summary(config_path: str | Path) -> str:
         parts.append(f"{_AXIS_LABELS.get(name, name)} {span} ({len(values)} pts)")
     placement = ""
     if config.hosts:
-        blocks = _shuffled_block_ranges(
-            total, _schedule_block_size(config, total), len(config.hosts)
+        batch_size = _evaluator_batch_size(config, total)
+        leases = _shuffled_block_leases(
+            total,
+            _schedule_block_size(config, total),
+            batch_size,
+            max(1, len(config.numa_nodes)),
         )
-        counts = [_range_count(worker) for worker in blocks]
-        allocation = (
-            str(counts[0])
-            if min(counts) == max(counts)
-            else f"{min(counts)}-{max(counts)}"
-        )
-        placement = f" on {len(config.hosts)} workers ({allocation} pools/worker)"
+        lease_counts = [_range_count(lease) for lease in leases]
+        allocation = str(max(lease_counts))
+        placement = f" on {len(config.hosts)} workers ({allocation} pools/lease)"
     suffix = f": {', '.join(parts)}" if parts else ""
     return f"running {total} pools grid{placement}{suffix}"
 
@@ -385,6 +416,8 @@ def _execution_inputs(config: RunConfig, *, remote: bool) -> dict[str, str]:
     }
     if (chainlink := config.scenario.get("chainlink")) is not None:
         inputs["chainlink"] = chainlink
+    if config.compiled_policy_header is not None:
+        inputs["policy_header"] = str(config.compiled_policy_header)
     if remote:
         try:
             optimizer_root = next(
@@ -484,6 +517,11 @@ def run_metadata(
     }
     if config.robustness:
         metadata["robustness"] = robustness_metadata(config.robustness)
+    if config.compiled_policy_header is not None:
+        metadata["compiled_policy"] = {
+            "id": config.compiled_policy_id,
+            "header": inputs["policy_header"],
+        }
     return metadata
 
 
@@ -513,7 +551,12 @@ def prepare_remote(config: RunConfig, *, transfer: bool, rebuild: bool) -> None:
             f"cluster: building {PurePosixPath(inputs['evaluator']).name} on {first}...",
             file=sys.stderr,
         )
-        rebuild_shared_evaluator(first, inputs["evaluator"])
+        rebuild_shared_evaluator(
+            first,
+            inputs["evaluator"],
+            policy_header=inputs.get("policy_header"),
+            policy_id=config.compiled_policy_id,
+        )
     require_shared_evaluator(first, inputs["evaluator"])
     print("cluster: ready", file=sys.stderr)
 
@@ -589,24 +632,21 @@ def _run(
         return writer.finalize()
 
 
-def _run_worker_partition(
+def _run_leased_worker(
     config: RunConfig,
     output_dir: Path,
     *,
     worker_index: int,
-    worker_count: int,
+    commands: Iterable[Mapping[str, Any]],
     progress_callback: WorkerProgressCallback | None = None,
-) -> tuple[ArtifactPaths, float]:
+    ready_callback: WorkerReadyCallback | None = None,
+) -> tuple[ArtifactPaths, float, tuple[int, ...]]:
     grid, compact_grid = _grid_request(config)
     total = len(grid)
     batch_size = _evaluator_batch_size(config, total)
     block_size = _schedule_block_size(config, total)
-    blocks = _shuffled_block_ranges(
-        total, block_size, worker_count
-    )[worker_index]
-    expected_count = _range_count(blocks)
-    if expected_count == 0:
-        raise ValueError("worker has no assigned grid blocks")
+    slots = max(1, len(config.numa_nodes))
+    leases = _shuffled_block_leases(total, block_size, batch_size, slots)
     metric_names = tuple(sorted(config.metric_fields))
     remote_paths = bool(config.hosts)
     lanes = _local_worker_lanes(config, remote_paths=remote_paths)
@@ -614,10 +654,8 @@ def _run_worker_partition(
         output_dir,
         run_id=config.run_id,
         total=total,
-        expected_count=expected_count,
         metadata={
             "worker_index": worker_index,
-            "worker_count": worker_count,
             "block_size": block_size,
             "batch_size": batch_size,
             "seed": _BLOCK_SHUFFLE_SEED,
@@ -636,24 +674,56 @@ def _run_worker_partition(
             fleet.start()
             calculation_started = time.monotonic()
             completed = 0
+            lease_ids: list[int] = []
             if progress_callback is not None:
-                progress_callback(0, expected_count, 0.0)
-            for batch in fleet.iter_grid_ranges(
-                blocks,
-                blocks_per_batch=max(1, batch_size // block_size),
-            ):
-                writer.append_projected(batch.ordinals, batch.projected)
-                completed += batch.count
-                if progress_callback is not None:
-                    progress_callback(
+                progress_callback(0, total, 0.0)
+            if ready_callback is not None:
+                ready_callback(None, 0, total, 0.0)
+            finished = False
+            for command in commands:
+                if not isinstance(command, Mapping):
+                    raise ValueError("worker command must be a mapping")
+                command_type = command.get("type")
+                if command_type == "finish":
+                    finished = True
+                    break
+                if command_type != "lease":
+                    raise ValueError("worker command must be lease or finish")
+                lease_id = command.get("lease_id")
+                if (
+                    isinstance(lease_id, bool)
+                    or not isinstance(lease_id, int)
+                    or lease_id < 0
+                    or lease_id >= len(leases)
+                    or lease_id in lease_ids
+                ):
+                    raise ValueError("worker received an invalid lease ID")
+                lease_ids.append(lease_id)
+                for batch in fleet.iter_grid_ranges(
+                    leases[lease_id],
+                    blocks_per_batch=max(1, batch_size // block_size),
+                ):
+                    writer.append_projected(batch.ordinals, batch.projected)
+                    completed += batch.count
+                    if progress_callback is not None:
+                        progress_callback(
+                            completed,
+                            total,
+                            time.monotonic() - calculation_started,
+                        )
+                if ready_callback is not None:
+                    ready_callback(
+                        lease_id,
                         completed,
-                        expected_count,
+                        total,
                         time.monotonic() - calculation_started,
                     )
+            if not finished:
+                raise RuntimeError("coordinator closed before finishing worker")
         finally:
             fleet.close()
         calculation_s = time.monotonic() - calculation_started
-        return writer.finalize(), calculation_s
+        return writer.finalize_partition(), calculation_s, tuple(lease_ids)
 
 
 def _copy_partition(source: ArtifactPaths, destination: Path) -> None:
@@ -674,26 +744,28 @@ def _copy_partition(source: ArtifactPaths, destination: Path) -> None:
         raise
 
 
-def run_worker_partition(
+def run_leased_worker(
     config_path: str | Path,
     output_dir: str | Path,
     *,
     worker_index: int,
-    worker_count: int,
+    commands: Iterable[Mapping[str, Any]],
     progress_callback: WorkerProgressCallback | None = None,
+    ready_callback: WorkerReadyCallback | None = None,
 ) -> dict[str, Any]:
-    """Evaluate one portable worker assignment and publish one local partition."""
+    """Evaluate coordinator leases and publish one machine-local partition."""
     config = RunConfig.from_toml(config_path)
-    if worker_count < 1 or worker_index < 0 or worker_index >= worker_count:
-        raise ConfigError("worker index must be in [0, worker_count)")
+    if worker_index < 0:
+        raise ConfigError("worker index must be non-negative")
     destination = Path(output_dir).resolve()
     started = time.monotonic()
-    paths, calculation_s = _run_worker_partition(
+    paths, calculation_s, lease_ids = _run_leased_worker(
         config,
         destination,
         worker_index=worker_index,
-        worker_count=worker_count,
+        commands=commands,
         progress_callback=progress_callback,
+        ready_callback=ready_callback,
     )
     receipt = json.loads(paths.run_json.read_text())
     return {
@@ -704,6 +776,7 @@ def run_worker_partition(
         "elapsed_s": time.monotonic() - started,
         "calculation_s": calculation_s,
         "output": str(destination),
+        "lease_ids": list(lease_ids),
     }
 
 
@@ -714,6 +787,7 @@ class _ClusterProgress:
         self.total = total
         self.workers = workers
         self.interval = interval
+        self._started = time.monotonic()
         self._states: dict[int, tuple[int, int, float, bool]] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -739,25 +813,34 @@ class _ClusterProgress:
         if not states:
             return
         completed = sum(state[0] for state in states)
+        producing_workers = sum(state[0] > 0 for state in states)
+        complete_workers = sum(state[3] for state in states)
+        percent = min(100, int(completed * 100 / self.total))
+        elapsed = time.monotonic() - self._started
+        if producing_workers < self.workers and completed < self.total:
+            print(
+                f"run: {completed}/{self.total} ({percent}%) warming "
+                f"({producing_workers}/{self.workers} workers producing; "
+                f"{elapsed:.1f}s elapsed)",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
         rates = [
             done / elapsed
             for done, _total, elapsed, _complete in states
-            if done > 0 and elapsed > 0.0
-        ]
-        eta_values = [
-            (worker_total - done) / (done / elapsed)
-            for done, worker_total, elapsed, complete in states
-            if not complete and done > 0 and elapsed > 0.0
+            if done > 0 and elapsed > 0.0 and (
+                completed >= self.total or not _complete
+            )
         ]
         rate = sum(rates)
-        eta = max(eta_values) if len(states) == self.workers and eta_values else None
-        percent = min(100, int(completed * 100 / self.total))
+        eta = (self.total - completed) / rate if rate > 0.0 else None
         eta_text = "--" if eta is None else f"{eta:.1f}s"
-        complete_workers = sum(state[3] for state in states)
         print(
             f"run: {completed}/{self.total} ({percent}%) "
-            f"{rate:.1f} pools/s ETA {eta_text} "
-            f"({complete_workers}/{self.workers} workers complete)",
+            f"{rate:.1f} pools/s "
+            f"({elapsed:.1f}s elapsed, {eta_text} ETA; "
+            f"{complete_workers}/{self.workers} workers complete)",
             file=sys.stderr,
             flush=True,
         )
@@ -782,12 +865,13 @@ def run_distributed_config(
     total = len(config.candidate.grid())
     batch_size = _evaluator_batch_size(config, total)
     block_size = _schedule_block_size(config, total)
-    blocks = _shuffled_block_ranges(total, block_size, len(config.hosts))
-    active = [
-        (index, host, _range_count(blocks[index]))
-        for index, host in enumerate(config.hosts)
-        if blocks[index]
-    ]
+    leases = _shuffled_block_leases(
+        total,
+        block_size,
+        batch_size,
+        max(1, len(config.numa_nodes)),
+    )
+    active = list(enumerate(config.hosts[:min(len(config.hosts), len(leases))]))
     destination = Path(output_dir).resolve()
     partition_root = destination / ".partitions"
     if partition_root.exists():
@@ -804,14 +888,27 @@ def run_distributed_config(
     )
     coordinator = config.hosts[0]
     progress = _ClusterProgress(total, len(active))
+    lease_lock = threading.Lock()
+    reserved_leases = {index: index for index, _host in active}
+    next_pending_lease = len(active)
 
-    def run_worker(index: int, host: str, expected: int) -> tuple[str, dict[str, Any]]:
+    def acquire_lease(worker_index: int) -> tuple[int, tuple[tuple[int, int], ...]] | None:
+        nonlocal next_pending_lease
+        with lease_lock:
+            lease_id = reserved_leases.pop(worker_index, None)
+            if lease_id is None:
+                if next_pending_lease >= len(leases):
+                    return None
+                lease_id = next_pending_lease
+                next_pending_lease += 1
+        return lease_id, leases[lease_id]
+
+    def run_worker(index: int, host: str) -> tuple[str, dict[str, Any]]:
         partition = f"{destination}.worker-{index:03d}"
         worker = [
             remote_python, "-m", "fxopt.cli", "_worker",
             str(config.path), "--output", str(partition),
             "--worker-index", str(index),
-            "--worker-count", str(len(config.hosts)),
         ]
         remote_script = " ".join((
             "set -euo pipefail;",
@@ -830,14 +927,20 @@ def run_distributed_config(
         )
         process = subprocess.Popen(
             command,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
         )
+        assert process.stdin is not None
         assert process.stdout is not None
         receipt: dict[str, Any] | None = None
         tail: list[str] = []
+        assigned_ids: list[int] = []
+        assigned_count = 0
+        awaiting_lease: int | None = None
+        sent_finish = False
         for raw_line in process.stdout:
             line = raw_line.strip()
             if not line:
@@ -852,6 +955,35 @@ def run_distributed_config(
                 continue
             if message.get("type") == "progress":
                 progress.update(index, message)
+            elif message.get("type") == "ready":
+                progress.update(index, message)
+                completed_lease = message.get("completed_lease_id")
+                if awaiting_lease is None:
+                    if completed_lease is not None:
+                        raise RuntimeError(
+                            f"{host} worker completed an unassigned lease"
+                        )
+                elif completed_lease != awaiting_lease:
+                    raise RuntimeError(
+                        f"{host} worker completed the wrong lease"
+                    )
+                awaiting_lease = None
+                acquired = acquire_lease(index)
+                if acquired is None:
+                    command_message = {"type": "finish"}
+                    sent_finish = True
+                else:
+                    lease_id, ranges = acquired
+                    assigned_ids.append(lease_id)
+                    assigned_count += _range_count(ranges)
+                    awaiting_lease = lease_id
+                    command_message = {"type": "lease", "lease_id": lease_id}
+                process.stdin.write(json.dumps(
+                    command_message,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ) + "\n")
+                process.stdin.flush()
             elif message.get("type") == "complete":
                 receipt = dict(message)
         return_code = process.wait()
@@ -861,14 +993,17 @@ def run_distributed_config(
         if receipt is None:
             raise RuntimeError(f"{host} worker returned an invalid receipt")
         if (
-            receipt.get("count") != expected
+            not sent_finish
+            or awaiting_lease is not None
+            or receipt.get("count") != assigned_count
             or receipt.get("output") != partition
+            or receipt.get("lease_ids") != assigned_ids
         ):
             raise RuntimeError(f"{host} worker receipt does not match its assignment")
         progress.update(index, {
             "type": "complete",
-            "completed": expected,
-            "total": expected,
+            "completed": assigned_count,
+            "total": total,
             "calculation_s": receipt["calculation_s"],
         })
         return host, receipt
@@ -915,8 +1050,9 @@ def run_distributed_config(
     progress_closed = False
     try:
         print(
-            f"coordinator: assigned {sum(len(worker) for worker in blocks)} "
-            f"shuffled blocks to {len(active)} workers...",
+            f"coordinator: queued {len(leases)} shuffled leases "
+            f"({max(_range_count(lease) for lease in leases)} pools max) "
+            f"for {len(active)} workers...",
             file=sys.stderr,
         )
         errors: list[str] = []
@@ -924,8 +1060,8 @@ def run_distributed_config(
         with ThreadPoolExecutor(max_workers=len(active)) as executor, \
                 ThreadPoolExecutor(max_workers=min(4, len(active))) as fetcher:
             futures = {
-                executor.submit(run_worker, index, host, expected): (index, host)
-                for index, host, expected in active
+                executor.submit(run_worker, index, host): (index, host)
+                for index, host in active
             }
             for future in as_completed(futures):
                 index, host = futures[future]
@@ -959,11 +1095,13 @@ def run_distributed_config(
         )
         metadata["placement"] = "machine_workers"
         metadata["execution_order"] = {
-            "kind": "seeded_shuffled_blocks_v1",
+            "kind": "dynamic_shuffled_leases_v1",
             "block_size": block_size,
             "batch_size": batch_size,
+            "lease_size": max(_range_count(lease) for lease in leases),
+            "lease_count": len(leases),
             "seed": _BLOCK_SHUFFLE_SEED,
-            "worker_count": len(config.hosts),
+            "worker_count": len(active),
         }
         metadata["worker_stats"] = [
             {
@@ -972,6 +1110,7 @@ def run_distributed_config(
                 "count": receipt["count"],
                 "elapsed_s": receipt["elapsed_s"],
                 "calculation_s": receipt["calculation_s"],
+                "lease_ids": receipt["lease_ids"],
                 "status_counts": receipt["status_counts"],
             }
             for index, (host, receipt) in sorted(receipts.items())
@@ -989,7 +1128,7 @@ def run_distributed_config(
         print("coordinator: merging worker partitions...", file=sys.stderr)
         paths = merge_grid_partitions(
             output_dir,
-            [partitions[index] for index, _host, _count in active],
+            [partitions[index] for index, _host in active],
             run_id=config.run_id,
             total=total,
             metadata=metadata,
@@ -1472,7 +1611,7 @@ __all__ = [
     "retrieve_remote_run",
     "run_config",
     "run_remote_config",
-    "run_worker_partition",
+    "run_leased_worker",
     "run_metadata",
     "stage_remote_run",
 ]

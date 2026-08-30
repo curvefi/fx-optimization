@@ -523,6 +523,16 @@ class GridResultWriter:
             raise
         return self._paths
 
+    def finalize_partition(self) -> ArtifactPaths:
+        """Publish a dynamically sized partial grid for coordinator merging."""
+        if self._closed:
+            raise RuntimeError("grid result writer is closed")
+        if self._count < 1:
+            raise ValueError("grid partition must contain at least one candidate")
+        self._expected_count = self._count
+        self._partition = True
+        return self.finalize()
+
     def cleanup(self) -> None:
         if not self._closed:
             self._archive.close()

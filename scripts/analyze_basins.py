@@ -20,7 +20,7 @@ from fxopt.robustness import (
 from fxopt.scoring import combined_scores, lp_detach_scores
 
 
-RANKINGS = ("lp-score", "score", "gm", "yb-gm")
+RANKINGS = ("lp-score", "score", "gm", "yb-gm", "apy-net-robust")
 
 
 def _leaves(value: Any, prefix: str = "") -> Iterator[tuple[str, Any]]:
@@ -50,9 +50,9 @@ def _axis_path_values(
     return np.asarray(selected)
 
 
-def _flat_fee_mask(
+def _fee_grids(
     metadata: dict[str, Any], shape: tuple[int, ...]
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     axes = metadata.get("axes")
     defaults = metadata.get("candidate_defaults")
     if not isinstance(axes, dict) or not isinstance(defaults, dict):
@@ -73,7 +73,22 @@ def _flat_fee_mask(
             out = out_values.reshape(view)
     if mid is None or out is None:
         raise ValueError("run metadata does not define both fee coordinates")
-    return np.broadcast_to(np.equal(mid, out), shape).reshape(-1)
+    return (
+        np.broadcast_to(np.asarray(mid, dtype=float), shape).reshape(-1),
+        np.broadcast_to(np.asarray(out, dtype=float), shape).reshape(-1),
+    )
+
+
+def _flat_fee_mask(metadata: dict[str, Any], shape: tuple[int, ...]) -> np.ndarray:
+    mid, out = _fee_grids(metadata, shape)
+    return np.equal(mid, out)
+
+
+def _max_fee_mask(
+    metadata: dict[str, Any], shape: tuple[int, ...], limit_bps: float
+) -> np.ndarray:
+    mid, out = _fee_grids(metadata, shape)
+    return np.maximum(mid, out) * 10_000.0 <= limit_bps
 
 
 def _coordinates(ordinal: int, shape: tuple[int, ...]) -> tuple[int, ...]:
@@ -160,7 +175,10 @@ def main() -> int:
         "--rank",
         choices=RANKINGS,
         default="score",
-        help="LP-detachment score, joint score, geometric LP/YB GM, or YB GM",
+        help=(
+            "LP-detachment score, joint score, geometric LP/YB GM, YB GM, "
+            "or robust 90-day net APY"
+        ),
     )
     parser.add_argument(
         "--gap",
@@ -170,6 +188,18 @@ def main() -> int:
     parser.add_argument("--min-lp-gm", type=float, default=0.0)
     parser.add_argument("--min-yb-gm", type=float, default=0.0)
     parser.add_argument("--max-detach", type=float, default=float("inf"))
+    parser.add_argument(
+        "--max-price-diff-bps",
+        type=float,
+        default=float("inf"),
+        help="maximum absolute 7-day relative price difference in basis points",
+    )
+    parser.add_argument(
+        "--max-fee-bps",
+        type=float,
+        default=float("inf"),
+        help="inclusive upper bound for both mid and out fees in basis points",
+    )
     parser.add_argument("--flat-fee", action="store_true")
     source = parser.add_mutually_exclusive_group()
     source.add_argument(
@@ -194,14 +224,27 @@ def main() -> int:
         or any(not math.isfinite(value) or value < 0 for value in finite_nonnegative)
         or math.isnan(args.max_detach)
         or args.max_detach < 0
+        or math.isnan(args.max_price_diff_bps)
+        or args.max_price_diff_bps < 0
+        or math.isnan(args.max_fee_bps)
+        or args.max_fee_bps < 0
     ):
         parser.error("limits must be non-negative; --top must be positive")
+    apy_robust_rank = args.rank == "apy-net-robust"
+    if apy_robust_rank and (args.min_lp_gm or args.min_yb_gm):
+        parser.error("GM limits do not apply to --rank apy-net-robust")
 
     root = args.run_dir
     try:
-        required = ("apy_net_gm", "detach_energy_ungated")
-        if args.rank != "lp-score":
-            required += ("yb_apy_gm",)
+        required = ["detach_energy_ungated"]
+        if apy_robust_rank:
+            required.append("apy_net_robust_90d")
+        else:
+            required.extend(("apy_net_gm", "apy_net_robust_90d"))
+            if args.rank != "lp-score":
+                required.append("yb_apy_gm")
+        if math.isfinite(args.max_price_diff_bps):
+            required.append("max_7d_rel_price_diff")
         columns = read_result_columns(root, metrics=required)
     except (OSError, KeyError, TypeError, ValueError) as exc:
         parser.error(f"could not read result artifact: {exc}")
@@ -216,31 +259,44 @@ def main() -> int:
     axes = dict(raw_axes) if isinstance(raw_axes, dict) else {}
     shape = tuple(int(size) for size in raw_shape) if isinstance(raw_shape, list) else ()
 
-    lp = np.asarray(columns.metrics["apy_net_gm"], dtype=float)
+    missing = np.full(count, np.nan)
+    lp = np.asarray(columns.metrics.get("apy_net_gm", missing), dtype=float)
+    apy_robust = np.asarray(
+        columns.metrics.get("apy_net_robust_90d", missing), dtype=float
+    )
     detach = np.asarray(columns.metrics["detach_energy_ungated"], dtype=float)
     yb = (
         np.asarray(columns.metrics["yb_apy_gm"], dtype=float)
         if "yb_apy_gm" in columns.metrics
         else np.full(count, np.nan)
     )
-    metrics = {
-        "apy_net_gm": lp,
-        "yb_apy_gm": yb,
-        "detach_energy_ungated": detach,
-    }
-    lp_valid = (
+    price_diff = np.abs(
+        np.asarray(
+            columns.metrics.get("max_7d_rel_price_diff", missing), dtype=float
+        )
+    )
+    base_valid = (
         columns.ok_mask
-        & np.isfinite(lp)
         & np.isfinite(detach)
         & (detach >= 0)
     )
-    valid = lp_valid & np.isfinite(yb)
-    lp_score = lp_detach_scores(metrics)
-    score = combined_scores(metrics)
-    gm = np.sqrt(np.maximum(lp, 0.0) * np.maximum(yb, 0.0))
-    score[~valid] = np.nan
-    gm[~valid] = np.nan
-    lp_score[~lp_valid] = np.nan
+    if apy_robust_rank:
+        apy_robust_valid = base_valid & np.isfinite(apy_robust)
+    else:
+        metrics = {
+            "apy_net_gm": lp,
+            "apy_net_robust_90d": apy_robust,
+            "yb_apy_gm": yb,
+            "detach_energy_ungated": detach,
+        }
+        lp_valid = base_valid & np.isfinite(lp)
+        valid = lp_valid & np.isfinite(yb)
+        lp_score = lp_detach_scores(metrics)
+        score = combined_scores(metrics)
+        gm = np.sqrt(np.maximum(lp, 0.0) * np.maximum(yb, 0.0))
+        score[~valid] = np.nan
+        gm[~valid] = np.nan
+        lp_score[~lp_valid] = np.nan
 
     try:
         if args.robustness_config is not None:
@@ -254,8 +310,33 @@ def main() -> int:
     except (OSError, ValueError) as exc:
         parser.error(f"could not load robustness radii: {exc}")
 
-    robust_results = None
-    if specs:
+    ranking_result = None
+    if specs and apy_robust_rank:
+        try:
+            ranking_result = _robust(
+                apy_robust,
+                valid=apy_robust_valid,
+                ordinals=ordinals,
+                axes=axes,
+                shape=shape,
+                specs=specs,
+            )
+            robust_detach = _robust(
+                detach,
+                valid=apy_robust_valid,
+                ordinals=ordinals,
+                axes=axes,
+                shape=shape,
+                specs=specs,
+                sign=-1.0,
+            )
+        except ValueError as exc:
+            parser.error(f"could not score robustness: {exc}")
+        complete = ranking_result.complete & robust_detach.complete
+        rank_values = ranking_result.robust_score
+        point_rank = apy_robust
+        detach_ceiling = -robust_detach.robust_score
+    elif specs:
         try:
             robust_score = _robust(
                 score, valid=valid, ordinals=ordinals, axes=axes, shape=shape, specs=specs
@@ -307,12 +388,29 @@ def main() -> int:
         lp_floor = robust_lp.robust_score
         yb_floor = robust_yb.robust_score
         detach_ceiling = -robust_detach.robust_score
-        robust_results = {
+        ranking_result = {
             "lp-score": robust_lp_score,
             "score": robust_score,
             "gm": robust_gm,
             "yb-gm": robust_yb,
-        }
+        }[args.rank]
+        rank_values = {
+            "lp-score": lp_score_floor,
+            "score": score_floor,
+            "gm": gm_floor,
+            "yb-gm": yb_floor,
+        }[args.rank]
+        point_rank = {
+            "lp-score": lp_score,
+            "score": score,
+            "gm": gm,
+            "yb-gm": yb,
+        }[args.rank]
+    elif apy_robust_rank:
+        complete = apy_robust_valid
+        rank_values = apy_robust
+        point_rank = apy_robust
+        detach_ceiling = detach
     else:
         complete = lp_valid if args.rank == "lp-score" else valid
         lp_score_floor = lp_score
@@ -321,27 +419,52 @@ def main() -> int:
         lp_floor = lp
         yb_floor = yb
         detach_ceiling = detach
+        rank_values = {
+            "lp-score": lp_score_floor,
+            "score": score_floor,
+            "gm": gm_floor,
+            "yb-gm": yb_floor,
+        }[args.rank]
+        point_rank = {
+            "lp-score": lp_score,
+            "score": score,
+            "gm": gm,
+            "yb-gm": yb,
+        }[args.rank]
 
-    rank_values = {
-        "lp-score": lp_score_floor,
-        "score": score_floor,
-        "gm": gm_floor,
-        "yb-gm": yb_floor,
-    }[args.rank]
-    point_rank = {
-        "lp-score": lp_score,
-        "score": score,
-        "gm": gm,
-        "yb-gm": yb,
-    }[args.rank]
+    price_diff_ceiling = price_diff
+    if specs and math.isfinite(args.max_price_diff_bps):
+        try:
+            robust_price_diff = _robust(
+                price_diff,
+                valid=columns.ok_mask & np.isfinite(price_diff),
+                ordinals=ordinals,
+                axes=axes,
+                shape=shape,
+                specs=specs,
+                sign=-1.0,
+            )
+        except ValueError as exc:
+            parser.error(f"could not score price-difference robustness: {exc}")
+        complete &= robust_price_diff.complete
+        price_diff_ceiling = -robust_price_diff.robust_score
+
     eligible = (
         complete
         & np.isfinite(rank_values)
-        & (lp_floor >= args.min_lp_gm)
         & (detach_ceiling <= args.max_detach)
     )
-    if args.rank != "lp-score":
-        eligible &= yb_floor >= args.min_yb_gm
+    if not apy_robust_rank:
+        eligible &= lp_floor >= args.min_lp_gm
+        if args.rank != "lp-score":
+            eligible &= yb_floor >= args.min_yb_gm
+    if math.isfinite(args.max_price_diff_bps):
+        eligible &= price_diff_ceiling <= args.max_price_diff_bps / 10_000.0
+    if math.isfinite(args.max_fee_bps):
+        try:
+            eligible &= _max_fee_mask(metadata, shape, args.max_fee_bps)
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.flat_fee:
         try:
             eligible &= _flat_fee_mask(metadata, shape)
@@ -371,13 +494,16 @@ def main() -> int:
         filters.append(f"YB GM >= {args.min_yb_gm:g}")
     if math.isfinite(args.max_detach):
         filters.append(f"detach <= {args.max_detach:g}")
+    if math.isfinite(args.max_price_diff_bps):
+        filters.append(f"7d price diff <= {args.max_price_diff_bps:g} bps")
+    if math.isfinite(args.max_fee_bps):
+        filters.append(f"max fee <= {args.max_fee_bps:g} bps")
     if args.flat_fee:
         filters.append("mid_fee == out_fee")
     if filters:
         print("FILTER " + "; ".join(filters))
 
     print("\nBEST ROWS (human review; no automatic optimization)")
-    ranking_result = robust_results[args.rank] if robust_results is not None else None
     for row in ordered[: args.top]:
         candidate = columns.candidate_at(int(ordinals[row]))
         params = _candidate_parameters(
@@ -390,14 +516,23 @@ def main() -> int:
                 f" regret={point_rank[row] - rank_values[row]:.8g}"
                 f" n={int(ranking_result.member_count[row])}"
                 f" worst={int(ranking_result.worst_ordinal[row])}"
-                f" lp_floor={lp_floor[row]:.8g}"
-                f" yb_floor={yb_floor[row]:.8g}"
                 f" detach_ceiling={detach_ceiling[row]:.8g}"
             )
+            if not apy_robust_rank:
+                robust_fields += (
+                    f" lp_floor={lp_floor[row]:.8g}"
+                    f" yb_floor={yb_floor[row]:.8g}"
+                )
+        metric_fields = (
+            f" apy_net_robust_90d={apy_robust[row]:.8g}"
+            if apy_robust_rank
+            else f" lp={lp[row]:.8g} yb={yb[row]:.8g}"
+        )
+        if math.isfinite(args.max_price_diff_bps):
+            metric_fields += f" max_7d_pdiff={price_diff_ceiling[row]:.8g}"
         print(
             f"  ordinal={int(ordinals[row])} {args.rank}={rank_values[row]:.8g}"
-            f"{robust_fields} lp={lp[row]:.8g} yb={yb[row]:.8g}"
-            f" detach={detach[row]:.8g} {params}"
+            f"{robust_fields}{metric_fields} detach={detach[row]:.8g} {params}"
         )
 
     _axis_distributions(axes, shape, ordinals, basin, gap)

@@ -26,11 +26,16 @@ def _dataset() -> HeatmapDataset:
             HeatmapAxis(("scenario",), ("base", "stress"), scale="categorical"),
         ),
         metrics={
+            "apy": (np.arange(8, dtype=float).reshape(shape) + 10) / 100,
             "apy_net": np.arange(8, dtype=float).reshape(shape) / 100,
+            "apy_net_robust_90d": (
+                np.arange(8, dtype=float).reshape(shape) + 20
+            ) / 100,
             "apy_net_gm": np.arange(8, dtype=float).reshape(shape) / 200,
             "max_7d_rel_price_diff": np.array(
                 [[[0.001, 0.002], [0.003, 0.004]], [[0.005, 0.006], [0.007, 0.008]]]
             ),
+            "detach_energy_ungated": np.arange(8, dtype=float).reshape(shape),
             "max_7d_skew": np.array(
                 [[[0.01, 0.02], [0.03, 0.04]], [[0.05, 0.06], [0.07, 0.08]]]
             ),
@@ -55,6 +60,7 @@ def test_dataset_masks_filter_price_skew_final_diff_and_slippage() -> None:
     dataset = _dataset()
     mask = MaskSpec(
         max_price_diff_bps=40,
+        max_detach_energy=2,
         max_skew_percent=5,
         max_final_price_diff_bps=40,
         slippage_thr_bps=20,
@@ -63,6 +69,18 @@ def test_dataset_masks_filter_price_skew_final_diff_and_slippage() -> None:
     apy = dataset.metric_array("apy_1_masked", mask)
     expected = np.array([[[True, True], [False, False]], [[False, False], [False, False]]])
     assert np.array_equal(np.isfinite(apy), expected)
+    earnings_expected = np.array(
+        [[[True, True], [True, False]], [[False, False], [False, False]]]
+    )
+    gross = dataset.metric_array("apy_masked", mask)
+    net = dataset.metric_array("apy_net_masked", mask)
+    robust = dataset.metric_array("apy_net_robust_90d_masked", mask)
+    assert np.array_equal(np.isfinite(gross), earnings_expected)
+    assert np.array_equal(np.isfinite(net), earnings_expected)
+    assert np.array_equal(np.isfinite(robust), earnings_expected)
+    assert gross[0, 0, 0] == 0.1
+    assert net[0, 0, 0] == 0.0
+    assert robust[0, 0, 0] == 0.2
     assert np.array_equal(
         np.isfinite(dataset.metric_array("tw_real_slippage_1pct_masked", mask)),
         np.array([[[True, True], [True, True]], [[False, False], [False, False]]]),

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -5,7 +6,6 @@ from click.testing import CliRunner
 from fxopt import Candidate
 from fxopt.cli import main
 from fxopt.engine import ProjectedBatch
-from fxopt.explorer import open_fxopt_explorer
 from fxopt.results import GridResultWriter
 from fxopt.shiftclick import trace_candidate
 
@@ -93,7 +93,7 @@ def _write_grid(path, *, run_id, metadata, values):
     writer.finalize()
 
 
-def test_heatmap_reads_the_two_file_result(tmp_path):
+def test_heatmap_cli_reads_the_two_file_result_with_requested_columns(tmp_path):
     _write_grid(
         tmp_path / "run",
         run_id="grid",
@@ -105,15 +105,23 @@ def test_heatmap_reads_the_two_file_result(tmp_path):
         },
         values=range(4),
     )
-    explorer = open_fxopt_explorer(
-        tmp_path / "run",
-        metrics=("score",),
-        x_axis="pool.A",
-        y_axis="pool.donation_apy",
-    )
-    output, state = explorer.save(tmp_path / "heatmap.png")
-    explorer.close()
+    output = tmp_path / "heatmap.png"
+    result = CliRunner().invoke(main, [
+        "heatmap", str(tmp_path / "run"),
+        "--metric", "score",
+        "--x", "pool.A",
+        "--y", "pool.donation_apy",
+        "--log-axis", "pool.A",
+        "--columns", "2",
+        "--output", str(output),
+        "--no-show",
+    ])
+    assert result.exit_code == 0, result.output
+    state = output.with_suffix(".state.json")
     assert output.is_file() and state.is_file()
+    saved = json.loads(state.read_text())
+    assert saved["ncol"] == 2
+    assert saved["log_axes"] == ["pool.A"]
 
 
 def test_remote_grid_trace_replays_locally(tmp_path, monkeypatch):

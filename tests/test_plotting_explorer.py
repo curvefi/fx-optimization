@@ -24,8 +24,15 @@ def _dataset() -> HeatmapDataset:
             HeatmapAxis(("scenario",), ("base", "stress"), scale="categorical"),
         ),
         metrics={
+            "apy": (np.arange(8, dtype=float).reshape(shape) + 10) / 100,
             "apy_net": np.arange(8, dtype=float).reshape(shape) / 100,
-            "max_7d_rel_price_diff": np.full(shape, 0.001),
+            "apy_net_robust_90d": (
+                np.arange(8, dtype=float).reshape(shape) + 20
+            ) / 100,
+            "detach_energy_ungated": np.arange(8, dtype=float).reshape(shape),
+            "max_7d_rel_price_diff": (
+                np.arange(1, 9, dtype=float).reshape(shape) / 1_000
+            ),
             "tw_real_slippage_1pct": np.full(shape, 0.001),
         },
         candidate_ids=np.asarray(
@@ -45,7 +52,7 @@ def _event(explorer: HeatmapExplorer, *, button: int = 1, key: str | None = None
     return event
 
 
-def test_dimension_and_axis_sliders_keep_global_color_limits() -> None:
+def test_dimension_and_axis_sliders_rescale_visible_slice() -> None:
     explorer = HeatmapExplorer(_dataset(), metrics=["apy_net"], ncol=1)
     try:
         assert not hasattr(explorer, "fig_metrics")
@@ -66,11 +73,11 @@ def test_dimension_and_axis_sliders_keep_global_color_limits() -> None:
             [shared_labels[name].get_position()[1] for name in ("x", "y", "scenario")],
             x_position.y0 + x_position.height * expected_rows,
         )
-        clims = [mesh.get_clim() for mesh in explorer.meshes]
+        assert explorer.meshes[0].get_clim() == (0.0, 6.0)
         assert dict(explorer.sliders)["scenario"].val == 0
         dict(explorer.sliders)["scenario"].set_val(1)
         assert explorer.state.slider_indices == {"scenario": 1}
-        assert [mesh.get_clim() for mesh in explorer.meshes] == clims
+        assert np.allclose(explorer.meshes[0].get_clim(), (1.0, 7.0))
 
         explorer._swap_axes("x", "scenario")
         assert explorer.state.x_axis == "scenario"
@@ -81,9 +88,28 @@ def test_dimension_and_axis_sliders_keep_global_color_limits() -> None:
 
 
 def test_controls_size_survives_axis_rebuild() -> None:
-    explorer = HeatmapExplorer(_dataset(), metrics=["apy_net"], ncol=1)
+    explorer = HeatmapExplorer(
+        _dataset(), metrics=["apy_net_robust_90d_masked"],
+        ncol=1, max_pricethr=40,
+    )
     try:
-        assert tuple(explorer.fig_controls.get_size_inches()) == (3.2, 6.0)
+        initial_size = tuple(explorer.fig_controls.get_size_inches())
+        assert initial_size[0] == 3.2 and initial_size[1] >= 6.0
+        row_labels = {
+            text.get_text(): text.get_position()[1]
+            for text in explorer.fig_controls.texts
+            if text.get_text() in {
+                "scenario:", "max 7d pdiff thr (bps):", "detach energy max:"
+            }
+        }
+        assert row_labels["scenario:"] - row_labels["max 7d pdiff thr (bps):"] >= 0.09
+        assert (
+            row_labels["max 7d pdiff thr (bps):"]
+            - row_labels["detach energy max:"]
+            >= 0.09
+        )
+        assert explorer.max_price_thr_slider.val == 40
+        assert explorer.max_price_thr_slider.valmax == 80
         user_size = (8.5, 4.25)
         explorer.fig_controls.set_size_inches(*user_size)
         explorer.x_radio.set_active(explorer._radio_keys.index("scenario"))

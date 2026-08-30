@@ -203,10 +203,24 @@ def transfer_workspace(host: str, workspace: str | Path) -> None:
         )
 
 
-def rebuild_shared_evaluator(host: str, evaluator: str) -> None:
+def rebuild_shared_evaluator(
+    host: str,
+    evaluator: str,
+    *,
+    policy_header: str | None = None,
+    policy_id: str | None = None,
+) -> None:
     """Build the configured evaluator once in the shared cluster workspace."""
     remote_host = _token(host, "host")
     executable = PurePosixPath(_token(evaluator, "evaluator"))
+    if (policy_header is None) != (policy_id is None):
+        raise ValueError("compiled policy header and id must be configured together")
+    policy_options = ""
+    if policy_header is not None and policy_id is not None:
+        policy_options = " " + " ".join((
+            f"-DPOLICY_HEADER_PATH={shlex.quote(_token(policy_header, 'policy_header'))}",
+            f"-DPOLICY_ID={shlex.quote(_token(policy_id, 'policy_id'))}",
+        ))
     build_root = REMOTE_BASE / "curve-fx-arb-harness" / "build"
     if executable.parent == build_root or not executable.parent.is_relative_to(build_root):
         raise ValueError(f"evaluator build directory must be below {build_root}")
@@ -225,7 +239,8 @@ def rebuild_shared_evaluator(host: str, evaluator: str) -> None:
         f"rm -rf -- {quoted_build};",
         f'cmake -S "$root/curve-fx-arb-harness" -B {quoted_build}',
         '-DCMAKE_BUILD_TYPE=Release -DCURVE_FX_NATIVE_TUNING=ON',
-        '-DCURVE_FX_ENABLE_IPO=ON -DCMAKE_PREFIX_PATH="$root/twocrypto-cpp/_install";',
+        '-DCURVE_FX_ENABLE_IPO=ON -DCMAKE_PREFIX_PATH="$root/twocrypto-cpp/_install"'
+        f'{policy_options};',
         f'cmake --build {quoted_build} --parallel --target {quoted_target}',
     ))
     command = (

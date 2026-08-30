@@ -8,6 +8,9 @@
 - [`fx-arb-harness`](https://github.com/curvefi/fx-arb-harness) — C++ arbitrage simulation and evaluator protocol; owns market-event execution and raw metrics.
 - [`fx-optimization`](https://github.com/curvefi/fx-optimization) — cluster orchestration, parameter grids, scoring, result storage, robustness analysis, heatmaps, and replay.
 
+The iterative stable-plateau research process is documented in
+[`workflow.md`](workflow.md).
+
 ## Setup
 
 Use Python 3.12 and `uv`. Build the pool and harness first, then install this checkout:
@@ -80,14 +83,17 @@ uv run fxopt run configs/experiments/eurusd-a-donation-rpf-8x8x8.toml \
   --output runs/eurusd-a-donation-rpf-8x8x8
 ```
 
-Remote grids deterministically shuffle contiguous ordinal blocks across one
-worker process per configured machine. Each worker owns its machine-local
-evaluator slots; whichever slot finishes first pulls the next block from their
-shared queue. Every evaluator registers the typed grid once and later receives
-only ordinal ranges. Workers emit low-rate heartbeats and write one local `/tmp`
-partition. The first placement host collects those partitions once, merges the
-typed NPZ members, and sends only the final `run.json` and `results.npz` to the
-Mac. The launcher is SSH-specific; scheduling and worker execution are not.
+Remote grids deterministically shuffle small contiguous ordinal tiles into
+machine-sized leases. One worker process per configured machine reconstructs
+the lease table locally and asks the coordinator only for its next lease ID;
+there are no fixed blade shards. Each worker owns its machine-local evaluator
+slots, and each lease contains one full evaluator batch per slot. Every
+evaluator registers the typed grid once and later receives only ordinal ranges.
+Workers write one local `/tmp` partition. The first placement host is the
+coordinator: it collects the partitions once, verifies complete disjoint
+coverage, merges their typed NPZ members, and sends only the final `run.json`
+and `results.npz` to the Mac. The launcher is SSH-specific; scheduling and
+worker execution are not.
 
 The evaluator session also retains a separate ordinary candidate-batch API.
 That is the extension seam for a future adaptive ask/evaluate/tell controller:
@@ -124,33 +130,71 @@ retrieves on completion. `--retrieve` fetches only an already-complete job.
 the remote directory and local job handle for diagnosis; partial grids are not
 resumable. A small hidden job handle exists locally until successful retrieval,
 after which the run directory again contains exactly `run.json` and `results.npz`.
-`--overwrite` removes an existing completed run directory before starting the
-same grid again. It refuses directories containing a detached-job handle and
-cannot be combined with the four remote job-control flags.
+`--overwrite` removes an existing completed or empty fxopt run directory before
+starting the supplied config. It refuses directories containing a detached-job
+handle and cannot be combined with the four remote job-control flags.
 
 `--transfer` rsyncs the pool, harness, and workflow sources once to the first
-configured blade. `--rebuild` implies transfer and builds the configured long-double
-evaluator once there. Dated market inputs remain copy-if-missing; the small pool
-template is refreshed through ordinary rsync. One aggregate heartbeat reports
-cluster calculation rate and the slowest worker's ETA. Deterministic candidate
-failures remain result rows; an evaluator transport failure is retried locally
-three times and then fails the run rather than publishing an incomplete grid.
-Final `run.json` records the schedule and status counts. Remote manifests must declare
-`run.metric_fields`, which fixes the typed result schema even when the first
-chunk fails. Subsequent runs can omit both preparation flags.
+configured blade. `--rebuild` implies transfer and builds the configured
+evaluator target—f64 or long double—once there. Dated market inputs remain
+copy-if-missing; the small pool template is refreshed through ordinary rsync.
+Workers send compact progress snapshots every two seconds and the coordinator
+prints one aggregate heartbeat every two seconds. Rate and ETA remain hidden
+until every worker has produced a batch; afterward ETA uses the remaining
+global queue and currently active worker rate. Deterministic candidate failures
+remain result rows; an evaluator transport failure is retried locally three
+times and then fails the run rather than publishing an incomplete grid. Final `run.json` records the
+schedule, per-worker timing/status provenance, and aggregate status counts.
+Remote manifests must declare `run.metric_fields`, which fixes the typed result
+schema even when the first chunk fails. Subsequent runs can omit preparation
+flags when the requested evaluator target and sources are already present.
+
+Compiled-policy grids declare the build input explicitly so `--rebuild` selects
+the intended policy rather than the native passthrough:
+
+```toml
+[compiled_policy]
+id = "yieldbasis_twocrypto_policy"
+header = "../../../twocrypto-cpp/include/pools/twocrypto_fx/policies/yieldbasis.hpp"
+```
+
+Use blade f64 for broad discovery and x86-64 blade long double for production
+finalist ranking. Apple ARM `long double` has binary64 width, so local Mac replay
+checks workflow and behavioral stability rather than x86 extended precision.
 
 Open the mature interactive heatmap explorer (or save a PNG and its state):
 
 ```sh
 uv run fxopt heatmap runs/eurusd-a-donation-rpf-8x8x8
 uv run fxopt heatmap runs/eurusd-a-donation-rpf-8x8x8 \
-  --metric apy_net --output runs/eurusd-a-donation-rpf-8x8x8/heatmap.png \
+  --metric apy_masked --metric apy_net_masked --columns 2 \
+  --max-price-diff-bps 1000 \
+  --output runs/eurusd-a-donation-rpf-8x8x8/heatmap.png \
   --no-show
 ```
 
-The explorer supports metric filters, adaptive limits for price difference, skew, slippage, and final price difference, axis selection, and multi-metric views. Clicking a cell selects its exact candidate. Right-click replays that candidate with YieldBasis disabled. Shift-click replays it with the configured YB mode, preserving the run's session setting. These interactions are part of the heatmap workflow; no separate metrics window is required.
+The explorer supports metric filters, slice-local color limits, adaptive limits
+for price difference, skew, slippage, and final price difference, axis selection,
+and multi-metric views. `--columns` controls the panel layout. Clicking a cell
+selects its exact candidate. Right-click replays that candidate with YieldBasis
+disabled. Shift-click replays it with the configured YB mode, preserving the
+run's session setting. These interactions are part of the heatmap workflow; no
+separate metrics window is required.
 
-No-YB discovery ranks `apy_net_consistency_90d` with detachment: the earnings metric is the annualized one-sigma lower bound of daily-sampled 90-day net log returns, and `lp_detach_score` subtracts `2.5 * detach_energy_ungated` from its log-growth form. This avoids the positive floor and hourly power/log work of legacy `apy_net_gm`, which remains available in full reference and YB runs.
+Raw panels never hide observations. Append `_masked` to any stored metric name
+to filter that panel by the interactive 7-day price-difference and detachment
+controls—for example `apy_masked`, `apy_net_masked`, or
+`apy_net_robust_90d_masked`. `--max-price-diff-bps` and
+`--max-detach-energy` set their initial thresholds; unsuffixed diagnostic
+panels remain unmasked.
+
+No-YB discovery ranks `apy_net_robust_90d` with detachment. The earnings
+metric gives equal weight to the mean and worst-5% mean of daily-sampled
+trailing-90-day net log returns, then converts that blended rate to APY.
+Negative weak regimes remain finite and rankable. `lp_detach_score` subtracts
+`2.5 * detach_energy_ungated` from the metric's log-growth form. This avoids
+the positive floor and hourly power/log work of legacy `apy_net_gm`, which
+remains available in full reference and YB runs.
 
 Replay one ordinal with a full trace:
 
@@ -179,6 +223,8 @@ Rank point values or exact axial stars without creating another manifest:
 uv run python scripts/analyze_basins.py runs/RUN --rank score
 uv run python scripts/analyze_basins.py runs/RUN --rank yb-gm \
   --min-lp-gm 0.05 --max-detach 5
+uv run python scripts/analyze_basins.py runs/RUN --rank apy-net-robust \
+  --max-price-diff-bps 2000 --max-fee-bps 200
 ```
 
 For an older run with no embedded radii, repeat `--robust AXIS=RADIUS`, for

@@ -1,17 +1,10 @@
-"""Masked metric derivation shared by heatmap rendering and the CLI.
-
-Semantics are the legacy ``plot_heatmap_nd_opt.py`` masks verbatim: every
-masked metric is its source metric with NaN wherever ``max_7d_rel_price_diff``
-exceeds the price threshold (bps, fractions stored as 1.0 = 100%); the
-``apy_N_masked`` family additionally caps on its own slippage metric
-(``tw_real_slippage_{1,5,10}pct > slipthr`` -> NaN).  ``slipthr-max`` is a
-legacy UI slider range, not a mask bound, and is ignored here.
-"""
+"""Masked metric resolution shared by heatmap rendering and the CLI."""
 
 from __future__ import annotations
 
+from collections.abc import Collection
+
 MASKED_METRIC_SOURCES = {
-    "apy_masked": "apy_net",
     "apy_masked_imbalance": "apy_net",
     "apy_gm_masked": "apy_net_gm",
     "yb_apy_masked": "yb_apy",
@@ -23,6 +16,27 @@ MASKED_METRIC_SOURCES = {
     "apy_5_masked": "apy_net",
     "apy_10_masked": "apy_net",
 }
+
+
+def masked_metric_source(name: str, available: Collection[str]) -> str | None:
+    """Resolve specialized aliases or a literal ``X_masked`` -> ``X`` suffix."""
+    specialized = MASKED_METRIC_SOURCES.get(name)
+    if specialized is not None:
+        return specialized
+    if name.endswith("_masked"):
+        source = name.removesuffix("_masked")
+        if source in available:
+            return source
+    return None
+
+
+def is_masked_metric(name: str, available: Collection[str]) -> bool:
+    return masked_metric_source(name, available) is not None
+
+
+def masked_metric_uses_detach(name: str, available: Collection[str]) -> bool:
+    """Generic suffix masks use core 7dpdif + detachment semantics."""
+    return name not in MASKED_METRIC_SOURCES and is_masked_metric(name, available)
 
 # Slippage metrics whose mask is price-difference only (no self-window).
 PDIFF_ONLY_MASKED_METRICS = frozenset(
@@ -42,10 +56,11 @@ SLIPPAGE_APY_MASK_SOURCES = {
 
 MASKED_METRICS = frozenset(MASKED_METRIC_SOURCES)
 
-# Every masked metric except the price-diff-only family and the slippage-capped
-# apy_N_masked family also honors the skew threshold when one is set.
+# Specialized coupled/YB aliases may also honor skew and final-price thresholds.
 SKEW_MASKED_METRICS = frozenset(
-    MASKED_METRICS - PDIFF_ONLY_MASKED_METRICS - set(SLIPPAGE_APY_MASK_SOURCES)
+    MASKED_METRICS
+    - PDIFF_ONLY_MASKED_METRICS
+    - set(SLIPPAGE_APY_MASK_SOURCES)
 )
 
 __all__ = [
@@ -54,4 +69,7 @@ __all__ = [
     "SLIPPAGE_APY_MASK_SOURCES",
     "MASKED_METRICS",
     "SKEW_MASKED_METRICS",
+    "is_masked_metric",
+    "masked_metric_source",
+    "masked_metric_uses_detach",
 ]

@@ -1,7 +1,7 @@
 [project]
 name = "curve-fx-optimization"
 version = "0.1.0"
-description = "Curve FX optimization workflow and plotting tools"
+description = "Curve FX grid execution, analysis, and plotting tools"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

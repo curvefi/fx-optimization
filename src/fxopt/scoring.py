@@ -11,7 +11,7 @@ import numpy as np
 
 COMBINED_SCORE = "combined_score"
 LP_DETACH_SCORE = "lp_detach_score"
-LP_CONSISTENCY_METRIC = "apy_net_consistency_90d"
+LP_ROBUST_METRIC = "apy_net_robust_90d"
 GM_FLOOR = 1e-4
 DETACH_ENERGY_WEIGHT = 2.5
 COMBINED_SCORE_FORMULA = (
@@ -19,7 +19,7 @@ COMBINED_SCORE_FORMULA = (
     "-2.5*detach_energy_ungated"
 )
 LP_DETACH_SCORE_FORMULA = (
-    "ln(1+apy_net_consistency_90d)-2.5*detach_energy_ungated"
+    "ln(1+apy_net_robust_90d)-2.5*detach_energy_ungated"
 )
 
 
@@ -66,37 +66,37 @@ def combined_scores(metrics: Mapping[str, Any]) -> np.ndarray:
 
 
 def lp_detach_score(metrics: Mapping[str, float]) -> float:
-    """Rank consistent no-YB LP growth after charging E1.5 detachment."""
+    """Rank robust no-YB LP growth after charging E1.5 detachment."""
     try:
-        lp_consistency = float(metrics[LP_CONSISTENCY_METRIC])
+        lp_robust = float(metrics[LP_ROBUST_METRIC])
         detach_energy = float(metrics["detach_energy_ungated"])
     except KeyError as exc:
         raise ValueError(f"lp_detach_score requires metric {exc.args[0]!r}") from exc
-    if not math.isfinite(lp_consistency) or not math.isfinite(detach_energy):
+    if not math.isfinite(lp_robust) or not math.isfinite(detach_energy):
         raise ValueError("lp_detach_score inputs must be finite")
-    if lp_consistency <= -1.0:
-        raise ValueError("lp_detach_score requires apy_net_consistency_90d > -1")
+    if lp_robust <= -1.0:
+        raise ValueError("lp_detach_score requires apy_net_robust_90d > -1")
     if detach_energy < 0.0:
         raise ValueError("lp_detach_score requires non-negative detach_energy_ungated")
-    return math.log1p(lp_consistency) - DETACH_ENERGY_WEIGHT * detach_energy
+    return math.log1p(lp_robust) - DETACH_ENERGY_WEIGHT * detach_energy
 
 
 def lp_detach_scores(metrics: Mapping[str, Any]) -> np.ndarray:
     """Vectorized no-YB LP-detachment score; invalid rows are NaN."""
     try:
-        lp_consistency = np.asarray(metrics[LP_CONSISTENCY_METRIC], dtype=float)
+        lp_robust = np.asarray(metrics[LP_ROBUST_METRIC], dtype=float)
         detach = np.asarray(metrics["detach_energy_ungated"], dtype=float)
     except KeyError as exc:
         raise ValueError(f"lp_detach_score requires metric {exc.args[0]!r}") from exc
-    if lp_consistency.ndim != 1 or lp_consistency.shape != detach.shape:
+    if lp_robust.ndim != 1 or lp_robust.shape != detach.shape:
         raise ValueError("lp_detach_score metrics must be equal-length vectors")
     valid = (
-        np.isfinite(lp_consistency) & np.isfinite(detach) &
-        (lp_consistency > -1.0) & (detach >= 0.0)
+        np.isfinite(lp_robust) & np.isfinite(detach) &
+        (lp_robust > -1.0) & (detach >= 0.0)
     )
-    scores = np.full(lp_consistency.shape, np.nan)
+    scores = np.full(lp_robust.shape, np.nan)
     scores[valid] = (
-        np.log1p(lp_consistency[valid])
+        np.log1p(lp_robust[valid])
         - DETACH_ENERGY_WEIGHT * detach[valid]
     )
     return scores
@@ -107,7 +107,7 @@ __all__ = [
     "COMBINED_SCORE_FORMULA",
     "DETACH_ENERGY_WEIGHT",
     "GM_FLOOR",
-    "LP_CONSISTENCY_METRIC",
+    "LP_ROBUST_METRIC",
     "LP_DETACH_SCORE",
     "LP_DETACH_SCORE_FORMULA",
     "combined_score",
