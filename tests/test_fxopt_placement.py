@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from threading import Barrier, Lock
+import math
 import subprocess
 
 import pytest
@@ -277,6 +278,103 @@ def test_grid_fleet_records_failed_chunk_and_restarts_only_that_lane():
     assert all(not result.metrics for result in results if result.status == "failed")
     assert sum(result.error is not None for result in results) == 1
     assert created == {"a": 2, "b": 1}
+
+
+def test_grid_lane_elapsed_excludes_lazy_session_start(monkeypatch):
+    now = 0.0
+
+    class DelayedStartClient(RecordingClient):
+        def start(self):
+            nonlocal now
+            now += 10.0
+            return super().start()
+
+        def open_session(self, session_id, **request):
+            nonlocal now
+            now += 20.0
+            return super().open_session(session_id, **request)
+
+        def evaluate_batch(self, candidates, **request):
+            nonlocal now
+            now += 2.0
+            return super().evaluate_batch(candidates, **request)
+
+    monkeypatch.setattr(placement.time, "monotonic", lambda: now)
+    elapsed = []
+    client = DelayedStartClient("a", [], [])
+    fleet = placement.EvaluatorFleet(
+        [placement.PlacementLane("a", lambda: client)],
+        session_id="session",
+        batch_size=1,
+        lane_callback=lambda _name, _count, seconds: elapsed.append(seconds),
+    )
+
+    list(fleet.iter_grid((((0, Candidate("p00000000")),),)))
+    fleet.close()
+
+    assert elapsed == [2.0]
+
+
+def test_grid_refills_lane_before_yielding_completed_batch():
+    pulled: list[int] = []
+    client = RecordingClient("a", [], [])
+    fleet = placement.EvaluatorFleet(
+        [placement.PlacementLane("a", lambda: client)],
+        session_id="session",
+        batch_size=1,
+    )
+
+    def assignments():
+        for ordinal in range(2):
+            pulled.append(ordinal)
+            yield ordinal, Candidate(f"p{ordinal:08d}")
+
+    stream = fleet.iter_grid((assignments(),))
+    first = next(stream)
+
+    assert first.ordinals == (0,)
+    assert pulled == [0, 1]
+    assert [batch.ordinals for batch in stream] == [(1,)]
+    fleet.close()
+
+
+def test_projected_grid_recycles_a_lane_after_malformed_metrics():
+    created = 0
+
+    class GridClient(RecordingClient):
+        def evaluate_batch(self, candidates, **request):
+            ordinal = request["ordinals"][0]
+            return {
+                "metric_fields": ["score"],
+                "results": [{
+                    "candidate_id": f"p{ordinal:08d}",
+                    "status": "ok",
+                    "metrics": [math.nan if self.label == "bad" else float(ordinal)],
+                }],
+            }
+
+    def factory():
+        nonlocal created
+        created += 1
+        return GridClient("bad" if created == 1 else "good", [], [])
+
+    fleet = placement.EvaluatorFleet(
+        [placement.PlacementLane("a", factory)],
+        session_id="session",
+        batch_size=1,
+        metric_fields=("score",),
+        projected_grid=True,
+        grid={},
+    )
+
+    completed = list(fleet.iter_grid(((0, 1),)))
+    fleet.close()
+
+    assert [batch.projected.rows[0]["status"] for batch in completed] == [
+        "failed", "ok",
+    ]
+    assert completed[0].error == "ValueError: projected evaluator result has invalid metrics"
+    assert created == 2
 
 
 def test_grid_fleet_quarantines_a_lane_after_three_consecutive_failures():

@@ -104,3 +104,13 @@ def test_engine_normalizes_only_the_requested_metric_array_shape():
     with pytest.raises(ValueError, match="wrong length"):
         engine.evaluate([Candidate("a", [1])])
     engine.close()
+
+    non_finite = ArrayClient(["score", "apy"], [2.0, float("nan")])
+    engine = OptimizerEngine(
+        lambda: non_finite,
+        session_id="non-finite",
+        metric_fields=["score", "apy"],
+    )
+    with pytest.raises(ValueError, match="must be finite"):
+        engine.evaluate([Candidate("a", [1])])
+    engine.close()

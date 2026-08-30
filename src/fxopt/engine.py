@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+import math
 from typing import Any, Protocol
 
+from .candidates import candidate_id
 from .contract import Candidate, CandidateResult
 
 
@@ -23,6 +26,46 @@ class EvaluatorClient(Protocol):
 
 
 ClientFactory = Callable[[], EvaluatorClient]
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectedBatch:
+    """Validated in-order projected rows returned by the evaluator."""
+
+    metric_fields: tuple[str, ...]
+    rows: tuple[Mapping[str, Any], ...]
+
+
+def _projected_row(
+    value: Any,
+    candidate_id: str,
+    metric_count: int,
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or value.get("candidate_id") != candidate_id:
+        raise ValueError("projected evaluator results must preserve input order")
+    status = value.get("status", "ok")
+    if status not in {"ok", "failed", "cancelled"}:
+        raise ValueError("projected evaluator result has an invalid status")
+    metrics = value.get("metrics")
+    if (
+        isinstance(metrics, (str, bytes))
+        or not isinstance(metrics, Sequence)
+        or len(metrics) != metric_count
+        or any(
+            isinstance(metric, bool)
+            or not isinstance(metric, (int, float))
+            or not math.isfinite(metric)
+            for metric in metrics
+        )
+    ):
+        raise ValueError("projected evaluator result has invalid metrics")
+    error = value.get("error")
+    if error is not None and not isinstance(error, str):
+        raise ValueError("projected evaluator result has an invalid error")
+    artifacts = value.get("artifacts")
+    if artifacts is not None and not isinstance(artifacts, Mapping):
+        raise ValueError("projected evaluator result has invalid artifacts")
+    return value
 
 
 def _response_field(value: Any, name: str, default: Any = None) -> Any:
@@ -57,10 +100,17 @@ def _normalize_result(
     if metrics is None:
         metrics = {}
     if metric_fields is not None and not isinstance(metrics, Mapping):
-        values = list(metrics)
+        values = tuple(metrics)
         if len(values) != len(metric_fields):
             raise ValueError("evaluator metric array has the wrong length")
-        metrics = dict(zip(metric_fields, values, strict=True))
+        return CandidateResult(
+            candidate_id=candidate.candidate_id,
+            status=_response_field(value, "status", "ok"),
+            metrics=dict(zip(metric_fields, values, strict=True)),
+            error=_response_field(value, "error"),
+            artifacts=_response_field(value, "artifacts"),
+            ordinal=ordinal,
+        )
     status = _response_field(value, "status", "ok")
     return CandidateResult(
         candidate_id=candidate.candidate_id,
@@ -84,6 +134,7 @@ class OptimizerEngine:
         metric_projection: str | None = None,
         metric_fields: Sequence[str] | None = None,
         observation: Mapping[str, Any] | None = None,
+        grid: Mapping[str, Any] | None = None,
     ) -> None:
         if not callable(client_factory):
             raise TypeError("client_factory must be callable")
@@ -111,8 +162,10 @@ class OptimizerEngine:
             self._metric_fields = fields
             self._batch_request["metric_fields"] = list(fields)
             self._batch_request["metrics_format"] = "array"
+            self._batch_request["trusted_candidates"] = True
         if observation is not None:
             self._batch_request["observation"] = dict(observation)
+        self._grid = None if grid is None else dict(grid)
         self._client: EvaluatorClient | None = None
         self._started = False
         self._session_open = False
@@ -143,11 +196,13 @@ class OptimizerEngine:
         self._session_open = True
         return hello
 
-    def evaluate(self, candidates: Iterable[Candidate]) -> list[CandidateResult]:
-        """Evaluate candidates in input order while preserving one session."""
+    def _request_batch(
+        self,
+        candidates: Iterable[Candidate],
+    ) -> tuple[list[Candidate], int, list[Any], tuple[str, ...] | None]:
         items = list(candidates)
         if not items:
-            return []
+            return [], self._next_ordinal, [], self._metric_fields
         if any(not isinstance(item, Candidate) for item in items):
             raise TypeError("candidates must contain Candidate values")
         candidate_ids = [item.candidate_id for item in items]
@@ -180,24 +235,71 @@ class OptimizerEngine:
             raise ValueError(
                 f"evaluator returned {len(values)} results for {len(items)} candidates"
             )
-        by_id: dict[str, Any] = {}
-        for value in values:
-            candidate_id = _response_field(value, "candidate_id")
-            if candidate_id in by_id:
-                raise ValueError(f"evaluator returned duplicate candidate_id {candidate_id!r}")
-            by_id[candidate_id] = value
-        missing = [item.candidate_id for item in items if item.candidate_id not in by_id]
-        if missing:
-            raise ValueError(f"evaluator omitted candidate IDs: {missing!r}")
+        return items, start, values, response_metric_fields
+
+    def evaluate(self, candidates: Iterable[Candidate]) -> list[CandidateResult]:
+        """Evaluate candidates in input order while preserving one session."""
+        items, start, values, response_metric_fields = self._request_batch(candidates)
+        if not items:
+            return []
+        if all(
+            _response_field(value, "candidate_id") == item.candidate_id
+            for value, item in zip(values, items, strict=True)
+        ):
+            ordered = values
+        else:
+            by_id: dict[str, Any] = {}
+            for value in values:
+                candidate_id = _response_field(value, "candidate_id")
+                if candidate_id in by_id:
+                    raise ValueError(
+                        f"evaluator returned duplicate candidate_id {candidate_id!r}"
+                    )
+                by_id[candidate_id] = value
+            missing = [
+                item.candidate_id
+                for item in items
+                if item.candidate_id not in by_id
+            ]
+            if missing:
+                raise ValueError(f"evaluator omitted candidate IDs: {missing!r}")
+            ordered = [by_id[item.candidate_id] for item in items]
         results = [
             _normalize_result(
-                by_id[item.candidate_id], item, start + index,
+                value, item, start + index,
                 response_metric_fields,
             )
-            for index, item in enumerate(items)
+            for index, (item, value) in enumerate(zip(items, ordered, strict=True))
         ]
         self._next_ordinal += len(items)
         return results
+
+    def evaluate_projected_grid(self, ordinals: Sequence[int]) -> ProjectedBatch:
+        """Evaluate canonical Cartesian ordinals without Python candidates."""
+        if self._grid is None or self._metric_fields is None:
+            raise ValueError("projected grid evaluation requires grid metadata")
+        if not ordinals:
+            return ProjectedBatch(self._metric_fields, ())
+        self.start()
+        assert self._client is not None
+        request = dict(self._batch_request)
+        request["session_id"] = self.session_id
+        request["grid"] = self._grid
+        request["ordinals"] = list(ordinals)
+        response = self._client.evaluate_batch([], **request)
+        if tuple(_response_field(response, "metric_fields") or ()) != self._metric_fields:
+            raise ValueError("evaluator metric_fields do not match the request")
+        values = _response_field(response, "results", response)
+        if isinstance(values, (str, bytes)) or not isinstance(values, Iterable):
+            raise TypeError("evaluator batch response must contain iterable results")
+        rows = tuple(values)
+        if len(rows) != len(ordinals):
+            raise ValueError("evaluator returned the wrong number of grid results")
+        validated = tuple(
+            _projected_row(row, candidate_id(ordinal), len(self._metric_fields))
+            for ordinal, row in zip(ordinals, rows, strict=True)
+        )
+        return ProjectedBatch(self._metric_fields, validated)
 
     def close(self) -> None:
         if self._closed:
@@ -223,4 +325,4 @@ class OptimizerEngine:
         self.close()
 
 
-__all__ = ["ClientFactory", "EvaluatorClient", "OptimizerEngine"]
+__all__ = ["ClientFactory", "EvaluatorClient", "OptimizerEngine", "ProjectedBatch"]

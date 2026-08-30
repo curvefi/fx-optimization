@@ -8,16 +8,20 @@ import orjson
 import shutil
 import tempfile
 import zipfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import numpy as np
 
 from .candidates import candidate_id
 from .contract import Candidate, CandidateResult
 from .grid import CartesianGrid
+
+if TYPE_CHECKING:
+    from .engine import ProjectedBatch
 
 
 SCHEMA_VERSION = "fxopt.results.v2"
@@ -561,18 +565,10 @@ class GridResultWriter:
             ):
                 raise ValueError("grid candidate identity does not match its ordinal")
 
-        ordinals = np.fromiter(
+        ordinals = self._validated_ordinals(
             (result.ordinal for _candidate, result in pairs),
-            dtype=np.int64,
-            count=len(pairs),
+            len(pairs),
         )
-        if (
-            np.any(ordinals < 0)
-            or np.any(ordinals >= self._total)
-            or len(np.unique(ordinals)) != len(ordinals)
-            or np.any(self._written[ordinals])
-        ):
-            raise ValueError("grid result ordinals must be unique and in range")
 
         if self._metric_names is None:
             self._metric_names = tuple(sorted({
@@ -586,15 +582,22 @@ class GridResultWriter:
                 (len(metric_names), self._shard_rows), dtype=np.float64
             )
         metric_columns = {name: index for index, name in enumerate(metric_names)}
-        values = np.full((len(metric_names), len(pairs)), np.nan, dtype=np.float64)
+        values = np.full(
+            (len(metric_names), len(pairs)), np.nan, dtype=np.float64
+        )
         status = np.empty(len(pairs), dtype=np.uint8)
         errors: list[tuple[int, str]] = []
         for row, (_candidate, result) in enumerate(pairs):
             if (
                 any(name not in metric_columns for name in result.metrics)
-                or (result.status == "ok" and len(result.metrics) != len(metric_names))
+                or (
+                    result.status == "ok"
+                    and len(result.metrics) != len(metric_names)
+                )
             ):
-                raise ValueError("grid result metrics do not match the configured fields")
+                raise ValueError(
+                    "grid result metrics do not match the configured fields"
+                )
             for name, value in result.metrics.items():
                 values[metric_columns[name], row] = value
             status[row] = _STATUS_TO_CODE[result.status]
@@ -602,11 +605,93 @@ class GridResultWriter:
             if result.error is not None:
                 errors.append((result.ordinal, result.error))
 
+        self._append_encoded(ordinals, status, values, errors)
+
+    def append_projected(
+        self,
+        ordinals: Sequence[int],
+        batch: "ProjectedBatch",
+    ) -> None:
+        """Append one fixed-field evaluator batch without materializing maps."""
+        if self._closed:
+            raise RuntimeError("grid result writer is closed")
+        metric_names = self._metric_names
+        if metric_names is None or batch.metric_fields != metric_names:
+            raise ValueError("projected metrics do not match the configured fields")
+        rows = batch.rows
+        pairs = tuple(zip(ordinals, rows, strict=True))
+        if not pairs:
+            return
+        for ordinal, row in pairs:
+            if (
+                row.get("candidate_id") != candidate_id(ordinal)
+            ):
+                raise ValueError("grid candidate identity does not match its ordinal")
+
+        ordinal_values = self._validated_ordinals(
+            (ordinal for ordinal, _row in pairs),
+            len(pairs),
+        )
+        values = np.asarray(
+            [row["metrics"] for _ordinal, row in pairs],
+            dtype=np.float64,
+        )
+        if values.shape != (len(pairs), len(metric_names)):
+            raise ValueError("projected metric arrays have the wrong shape")
+        values = values.T
+        try:
+            status = np.fromiter(
+                (
+                    _STATUS_TO_CODE[row.get("status", "ok")]
+                    for _ordinal, row in pairs
+                ),
+                dtype=np.uint8,
+                count=len(pairs),
+            )
+        except KeyError as exc:
+            raise ValueError(f"unsupported result status: {exc.args[0]}") from exc
+        values[:, status != _STATUS_TO_CODE["ok"]] = np.nan
+        errors = [
+            (ordinal, str(row["error"]))
+            for ordinal, row in pairs
+            if row.get("error") is not None
+        ]
+        for code, count in zip(*np.unique(status, return_counts=True), strict=True):
+            self._status_counts[_CODE_TO_STATUS[int(code)]] += int(count)
+        self._append_encoded(ordinal_values, status, values, errors)
+
+    def _validated_ordinals(
+        self,
+        ordinals: Iterable[int],
+        count: int,
+    ) -> np.ndarray:
+        values = np.fromiter(ordinals, dtype=np.int64, count=count)
+        if (
+            np.any(values < 0)
+            or np.any(values >= self._total)
+            or len(np.unique(values)) != len(values)
+            or np.any(self._written[values])
+        ):
+            raise ValueError("grid result ordinals must be unique and in range")
+        return values
+
+    def _append_encoded(
+        self,
+        ordinals: np.ndarray,
+        status: np.ndarray,
+        values: np.ndarray,
+        errors: Sequence[tuple[int, str]],
+    ) -> None:
+        if self._buffer_values is None:
+            self._buffer_values = np.empty(
+                (values.shape[0], self._shard_rows), dtype=np.float64
+            )
+
         error_by_ordinal = dict(errors)
         offset = 0
-        while offset < len(pairs):
+        while offset < len(ordinals):
             space = self._shard_rows - self._buffer_count
-            take = min(space, len(pairs) - offset)
+            take = min(space, len(ordinals) - offset)
             target = slice(self._buffer_count, self._buffer_count + take)
             source = slice(offset, offset + take)
             self._buffer_index["ordinal"][target] = ordinals[source]
@@ -623,7 +708,7 @@ class GridResultWriter:
             if self._buffer_count == self._shard_rows:
                 self._flush()
         self._written[ordinals] = True
-        self._count += len(pairs)
+        self._count += len(ordinals)
 
     def _flush(self) -> None:
         if not self._buffer_count:

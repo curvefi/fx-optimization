@@ -3,6 +3,7 @@ import zipfile
 
 import numpy as np
 from fxopt import Candidate, CandidateResult, ResultBundle, read_results, write_results
+from fxopt.engine import ProjectedBatch
 from fxopt.results import GridResultWriter, ResultWriter, read_result_columns
 
 
@@ -67,13 +68,13 @@ def test_result_writer_finalize_reads_spool_once(tmp_path):
 def test_grid_writer_streams_typed_shards_and_reconstructs_candidates(tmp_path):
     metadata = {
         "candidate_defaults": {"policy_params": [], "pool": {}},
-        "axes": {"pool.A": [1, 2]},
-        "shape": [2],
+        "axes": {"pool.A": [1, 2, 3]},
+        "shape": [3],
     }
     writer = GridResultWriter(
         tmp_path,
         run_id="grid",
-        total=2,
+        total=3,
         metadata=metadata,
         metric_names=("score",),
     )
@@ -86,6 +87,18 @@ def test_grid_writer_streams_typed_shards_and_reconstructs_candidates(tmp_path):
             CandidateResult("p00000000", metrics={"score": 3.0}, ordinal=0),
         ),
     )
+    writer.append_projected(
+        (2,),
+        ProjectedBatch(
+            ("score",),
+            ({
+                "candidate_id": "p00000002",
+                "status": "failed",
+                "error": "quarantined",
+                "metrics": [-1.0],
+            },),
+        ),
+    )
     writer.finalize()
 
     columns = read_result_columns(tmp_path, metrics=("score",))
@@ -94,6 +107,9 @@ def test_grid_writer_streams_typed_shards_and_reconstructs_candidates(tmp_path):
     assert columns.error_at(1) == "collapsed"
     assert columns.metrics["score"][0] == 3.0
     assert np.isnan(columns.metrics["score"][1])
+    assert columns.status_at(2) == "failed"
+    assert columns.error_at(2) == "quarantined"
+    assert np.isnan(columns.metrics["score"][2])
     assert {path.name for path in tmp_path.iterdir()} == {"run.json", "results.npz"}
     with zipfile.ZipFile(tmp_path / "results.npz") as archive:
         assert archive.namelist() == [

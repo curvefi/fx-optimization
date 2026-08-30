@@ -7,7 +7,7 @@ search, and scoring remain callers' concerns.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, replace
 from itertools import islice
 from os import PathLike, fspath
@@ -20,8 +20,9 @@ from typing import Any
 
 from curve_fx_harness_client import EvaluatorClient
 
+from .candidates import candidate_id
 from .contract import Candidate, CandidateResult
-from .engine import ClientFactory, OptimizerEngine
+from .engine import ClientFactory, OptimizerEngine, ProjectedBatch
 
 
 SSH_OPTIONS = (
@@ -333,10 +334,16 @@ class LaneBatchResult:
     """One bounded lane batch, returned as soon as that lane is free."""
 
     lane: str
+    ordinals: tuple[int, ...]
     candidates: tuple[Candidate, ...]
     results: tuple[CandidateResult, ...]
     elapsed: float
     error: str | None = None
+    projected: ProjectedBatch | None = None
+
+    @property
+    def count(self) -> int:
+        return len(self.ordinals)
 
 
 class EvaluatorFleet:
@@ -359,6 +366,8 @@ class EvaluatorFleet:
         metric_fields: Sequence[str] | None = None,
         observation: Mapping[str, Any] | None = None,
         lane_callback: Callable[[str, int, float], None] | None = None,
+        projected_grid: bool = False,
+        grid: Mapping[str, Any] | None = None,
     ) -> None:
         if not lanes:
             raise ValueError("fleet requires at least one lane")
@@ -383,6 +392,7 @@ class EvaluatorFleet:
             "metric_projection": metric_projection,
             "metric_fields": metric_fields,
             "observation": observation,
+            "grid": grid,
         }
         self._engines = [self._new_engine(index) for index in range(len(self.lanes))]
         self._started = False
@@ -391,6 +401,7 @@ class EvaluatorFleet:
         self._next_lane = 0
         self._evaluation_lock = Lock()
         self._lane_callback = lane_callback
+        self._projected_grid = projected_grid
 
     @property
     def engines(self) -> tuple[OptimizerEngine, ...]:
@@ -438,7 +449,7 @@ class EvaluatorFleet:
 
     def iter_grid(
         self,
-        assignments: Sequence[Iterable[tuple[int, Candidate]]],
+        assignments: Sequence[Iterable[int | tuple[int, Candidate]]],
     ) -> Iterator[LaneBatchResult]:
         """Run fixed lane stripes without barriers, recycling failed lanes."""
         if len(assignments) != len(self.lanes):
@@ -448,7 +459,7 @@ class EvaluatorFleet:
 
     def _iter_grid(
         self,
-        assignments: Sequence[Iterable[tuple[int, Candidate]]],
+        assignments: Sequence[Iterable[int | tuple[int, Candidate]]],
     ) -> Iterator[LaneBatchResult]:
         if self._closed:
             raise RuntimeError("fleet is closed")
@@ -456,66 +467,136 @@ class EvaluatorFleet:
         consecutive_failures = [0] * len(self.lanes)
         quarantined = [False] * len(self.lanes)
 
-        def next_batch(lane_index: int) -> tuple[tuple[int, Candidate], ...]:
+        def next_batch(lane_index: int) -> tuple[Any, ...]:
             items = tuple(islice(iterators[lane_index], self.batch_size))
-            for ordinal, candidate in items:
-                if (
+            if self._projected_grid:
+                if any(
                     isinstance(ordinal, bool)
                     or not isinstance(ordinal, int)
                     or ordinal < 0
-                    or not isinstance(candidate, Candidate)
+                    for ordinal in items
                 ):
-                    raise TypeError(
-                        "grid assignments must contain non-negative ordinal/Candidate pairs"
-                    )
+                    raise TypeError("projected grid assignments must contain ordinals")
+            else:
+                for ordinal, candidate in items:
+                    if (
+                        isinstance(ordinal, bool)
+                        or not isinstance(ordinal, int)
+                        or ordinal < 0
+                        or not isinstance(candidate, Candidate)
+                    ):
+                        raise TypeError(
+                            "grid assignments must contain non-negative "
+                            "ordinal/Candidate pairs"
+                        )
             return items
 
         def run_lane(
             lane_index: int,
-            items: tuple[tuple[int, Candidate], ...],
+            items: tuple[Any, ...],
         ) -> LaneBatchResult:
-            ordinals, candidates = zip(*items, strict=True)
-            started_at = time.monotonic()
+            if self._projected_grid:
+                ordinals = items
+                candidates: tuple[Candidate, ...] = ()
+            else:
+                ordinals, candidates = zip(*items, strict=True)
+            started_at: float | None = None
             error: str | None = None
+            projected: ProjectedBatch | None = None
             try:
-                evaluated = self._engines[lane_index].evaluate(candidates)
-                if len(evaluated) != len(candidates):
-                    raise ValueError("lane returned the wrong number of results")
-                results = tuple(
-                    replace(result, ordinal=ordinal)
-                    for ordinal, result in zip(ordinals, evaluated, strict=True)
-                )
+                engine = self._engines[lane_index]
+                engine.start()
+                started_at = time.monotonic()
+                if self._projected_grid:
+                    projected = engine.evaluate_projected_grid(ordinals)
+                    if len(projected.rows) != len(ordinals):
+                        raise ValueError("lane returned the wrong number of results")
+                    results = ()
+                else:
+                    evaluated = engine.evaluate(candidates)
+                    if len(evaluated) != len(candidates):
+                        raise ValueError("lane returned the wrong number of results")
+                    results = tuple(
+                        replace(result, ordinal=ordinal)
+                        for ordinal, result in zip(ordinals, evaluated, strict=True)
+                    )
             except Exception as exc:
                 detail = " | ".join(str(exc).splitlines()).strip()
                 error = f"{type(exc).__name__}: {detail}"[:500]
-                results = tuple(
-                    CandidateResult(
-                        candidate_id=candidate.candidate_id,
-                        status="failed",
-                        error=error if index == 0 else None,
-                        ordinal=ordinal,
+                if self._projected_grid:
+                    metric_fields = tuple(self._engine_options["metric_fields"] or ())
+                    projected = ProjectedBatch(
+                        metric_fields,
+                        tuple(
+                            {
+                                "candidate_id": candidate_id(ordinal),
+                                "status": "failed",
+                                "error": error if index == 0 else None,
+                                "metrics": [-1.0] * len(metric_fields),
+                            }
+                            for index, ordinal in enumerate(ordinals)
+                        ),
                     )
-                    for index, (ordinal, candidate) in enumerate(items)
-                )
+                    results = ()
+                else:
+                    results = tuple(
+                        CandidateResult(
+                            candidate_id=candidate.candidate_id,
+                            status="failed",
+                            error=error if index == 0 else None,
+                            ordinal=ordinal,
+                        )
+                        for index, (ordinal, candidate) in enumerate(items)
+                    )
                 self._recycle_engine(lane_index)
             return LaneBatchResult(
                 lane=self.lanes[lane_index].name,
+                ordinals=tuple(ordinals),
                 candidates=tuple(candidates),
                 results=results,
-                elapsed=time.monotonic() - started_at,
+                elapsed=(
+                    time.monotonic() - started_at
+                    if started_at is not None
+                    else 0.0
+                ),
                 error=error,
+                projected=projected,
             )
 
         def failed_lane(
             lane_index: int,
-            items: tuple[tuple[int, Candidate], ...],
+            items: tuple[Any, ...],
         ) -> LaneBatchResult:
             error = (
                 f"lane quarantined after {_MAX_CONSECUTIVE_GRID_FAILURES} "
                 "consecutive chunk failures"
             )
+            if self._projected_grid:
+                ordinals = tuple(items)
+                metric_fields = tuple(self._engine_options["metric_fields"] or ())
+                return LaneBatchResult(
+                    lane=self.lanes[lane_index].name,
+                    ordinals=ordinals,
+                    candidates=(),
+                    results=(),
+                    elapsed=0.0,
+                    error=error,
+                    projected=ProjectedBatch(
+                        metric_fields,
+                        tuple(
+                            {
+                                "candidate_id": candidate_id(ordinal),
+                                "status": "failed",
+                                "error": error if index == 0 else None,
+                                "metrics": [-1.0] * len(metric_fields),
+                            }
+                            for index, ordinal in enumerate(ordinals)
+                        ),
+                    ),
+                )
             return LaneBatchResult(
                 lane=self.lanes[lane_index].name,
+                ordinals=tuple(ordinal for ordinal, _candidate in items),
                 candidates=tuple(candidate for _ordinal, candidate in items),
                 results=tuple(
                     CandidateResult(
@@ -541,26 +622,30 @@ class EvaluatorFleet:
                 if items := next_batch(lane_index):
                     futures[submit(executor, lane_index, items)] = lane_index
             while futures:
-                future = next(as_completed(futures))
-                lane_index = futures.pop(future)
-                completed = future.result()
-                if completed.error is None:
-                    consecutive_failures[lane_index] = 0
-                elif not quarantined[lane_index]:
-                    consecutive_failures[lane_index] += 1
-                    quarantined[lane_index] = (
-                        consecutive_failures[lane_index]
-                        >= _MAX_CONSECUTIVE_GRID_FAILURES
-                    )
-                if self._lane_callback is not None:
-                    self._lane_callback(
-                        completed.lane,
-                        len(completed.results),
-                        completed.elapsed,
-                    )
-                yield completed
-                if items := next_batch(lane_index):
-                    futures[submit(executor, lane_index, items)] = lane_index
+                done, _pending = wait(futures, return_when=FIRST_COMPLETED)
+                ready: list[LaneBatchResult] = []
+                for future in sorted(done, key=futures.__getitem__):
+                    lane_index = futures.pop(future)
+                    completed = future.result()
+                    if completed.error is None:
+                        consecutive_failures[lane_index] = 0
+                    elif not quarantined[lane_index]:
+                        consecutive_failures[lane_index] += 1
+                        quarantined[lane_index] = (
+                            consecutive_failures[lane_index]
+                            >= _MAX_CONSECUTIVE_GRID_FAILURES
+                        )
+                    if items := next_batch(lane_index):
+                        futures[submit(executor, lane_index, items)] = lane_index
+                    ready.append(completed)
+                for completed in ready:
+                    if self._lane_callback is not None:
+                        self._lane_callback(
+                            completed.lane,
+                            completed.count,
+                            completed.elapsed,
+                        )
+                    yield completed
         finally:
             executor.shutdown(wait=True)
 

@@ -146,6 +146,8 @@ uv run fxopt heatmap runs/eurusd-a-donation-rpf-8x8x8 \
 
 The explorer supports metric filters, adaptive limits for price difference, skew, slippage, and final price difference, axis selection, and multi-metric views. Clicking a cell selects its exact candidate. Right-click replays that candidate with YieldBasis disabled. Shift-click replays it with the configured YB mode, preserving the run's session setting. These interactions are part of the heatmap workflow; no separate metrics window is required.
 
+No-YB discovery ranks `apy_net_consistency_90d` with detachment: the earnings metric is the annualized one-sigma lower bound of daily-sampled 90-day net log returns, and `lp_detach_score` subtracts `2.5 * detach_energy_ungated` from its log-growth form. This avoids the positive floor and hourly power/log work of legacy `apy_net_gm`, which remains available in full reference and YB runs.
+
 Replay one ordinal with a full trace:
 
 ```sh

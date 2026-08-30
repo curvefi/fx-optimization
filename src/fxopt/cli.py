@@ -51,7 +51,9 @@ class _ProgressReporter:
         self.baseline_completed: int | None = None
         self.blade_completed = 0
         self.blade_total = 0
-        self.blade_rates: dict[str, float] = {}
+        self.blade_lane_started_at: dict[str, float] = {}
+        self.blade_lane_completed_at: dict[str, float] = {}
+        self.blade_lane_completed: dict[str, int] = {}
 
     def start(self) -> None:
         if self.started:
@@ -89,9 +91,15 @@ class _ProgressReporter:
         with self.lock:
             if self.stream_blade is None or name.split(":", 1)[0] != self.stream_blade:
                 return
+            now = time.monotonic()
+            if elapsed > 0.0:
+                self.blade_lane_started_at.setdefault(name, now - elapsed)
+                self.blade_lane_completed_at[name] = now
+                self.blade_lane_completed[name] = (
+                    self.blade_lane_completed.get(name, 0) + count
+                )
             self.blade_completed = min(self.blade_total, self.blade_completed + count)
-            self.blade_rates[name] = count / elapsed if elapsed > 0 else 0.0
-            self._write_blade()
+            self._write_blade(now=now)
 
     def _blade_share(self, total: int) -> int:
         lane_count = self.blade_count * self.lanes_per_blade
@@ -110,15 +118,16 @@ class _ProgressReporter:
                     if not stale:
                         self.last_reported_completed = completed
 
-    def _write_blade(self) -> None:
-        elapsed = max(0.0, time.monotonic() - self.started_at)
-        if not self.blade_rates:
+    def _write_blade(self, *, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        if not self.blade_lane_started_at:
+            elapsed = max(0.0, now - self.started_at)
             click.echo(
                 f"{self.stream_blade}: waiting for first batch... elapsed {elapsed:.1f}s",
                 err=True,
             )
             return
-        rate = sum(self.blade_rates.values())
+        rate = self._blade_rate()
         remaining = max(0, self.blade_total - self.blade_completed)
         eta = remaining / rate if rate > 0 else None
         eta_text = "--" if eta is None else f"{eta:.1f}s"
@@ -132,6 +141,17 @@ class _ProgressReporter:
             f"({percent}%) {rate:.1f} pools/s ETA {eta_text}",
             err=True,
         )
+
+    def _blade_rate(self) -> float:
+        rate = 0.0
+        for name, completed in self.blade_lane_completed.items():
+            elapsed = (
+                self.blade_lane_completed_at[name]
+                - self.blade_lane_started_at[name]
+            )
+            if elapsed > 0.0:
+                rate += completed / elapsed
+        return rate
 
     def _write(self, completed: int, total: int, *, working: bool = False) -> None:
         now = time.monotonic()
@@ -159,6 +179,22 @@ class _ProgressReporter:
         self.stop_event.set()
         if self.thread.is_alive():
             self.thread.join()
+
+    def completion_summary(self, counts: dict[str, int]) -> str:
+        elapsed = max(0.0, time.monotonic() - self.started_at)
+        total = sum(counts.values())
+        cluster_rate = total / elapsed if elapsed > 0 else 0.0
+        blade_rate = self._blade_rate()
+        summary = (
+            f"complete {total} pools in {elapsed:.1f}s, "
+            f"{cluster_rate:.1f} pools/s cluster wall"
+        )
+        if self.stream_blade is not None:
+            summary += f", {blade_rate:.1f} pools/s {self.stream_blade} calc"
+        return (
+            summary
+            + f" ({counts.get('ok', 0)} ok, {counts.get('failed', 0)} failed)"
+        )
 
 
 @click.group()
@@ -310,9 +346,9 @@ def cluster_worker_command(
         reporter.close()
     payload = json.loads(paths.run_json.read_text())
     counts = payload.get("status_counts", {})
+    click.echo(f"coordinator: {reporter.completion_summary(counts)}", err=True)
     click.echo(
-        f"coordinator: wrote {paths.run_json} and {paths.results_npz} "
-        f"({counts.get('ok', 0)} ok, {counts.get('failed', 0)} failed)",
+        f"coordinator: wrote {paths.run_json} and {paths.results_npz}",
         err=True,
     )
 
@@ -340,7 +376,7 @@ def optimize_command(config: Path, output_dir: Path) -> None:
 @click.option("--x", "x_axis")
 @click.option("--y", "y_axis")
 @click.option("--metric", "metrics", multiple=True,
-              default=("apy_net_gm", "detach_energy_ungated", "max_7d_rel_price_diff", "max_7d_skew"),
+              default=("apy_net_consistency_90d", "detach_energy_ungated", "max_7d_rel_price_diff"),
               show_default=True)
 @click.option("--max-price-diff-bps", type=float, default=100.0, show_default=True)
 @click.option("--max-skew-percent", type=float)

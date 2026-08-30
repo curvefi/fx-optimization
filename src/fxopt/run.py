@@ -551,6 +551,7 @@ def _run(
         raise ConfigError("remote grid runs require run.metric_fields")
     lanes = placement_lanes(config, client_factory, stage_inputs=stage_inputs)
     candidate_grid = config.candidate.grid()
+    candidate_from_spec(candidate_grid.candidate_at(0))
     lane_count = len(lanes)
     effective_batch = min(config.batch_size, (len(candidate_grid) + lane_count - 1) // lane_count)
     metadata = run_metadata(
@@ -568,12 +569,26 @@ def _run(
         metadata["placement"] = "injected"
     open_session = metadata["open_session"]
     total = len(candidate_grid)
+    metric_names = tuple(sorted(config.metric_fields)) or None
+    grid_request = (
+        {
+            "candidate_defaults": config.candidate.defaults,
+            "axes": {
+                name: list(candidate_grid.axes[name])
+                for name in sorted(candidate_grid.axes)
+            },
+            "axis_order": list(sorted(candidate_grid.axes)),
+            "shape": list(candidate_grid.shape),
+        }
+        if metric_names is not None
+        else None
+    )
     writer = GridResultWriter(
         output_dir,
         run_id=config.run_id,
         total=total,
         metadata=metadata,
-        metric_names=config.metric_fields or None,
+        metric_names=metric_names,
     )
     with writer:
         completed = 0
@@ -586,8 +601,10 @@ def _run(
             batch_size=effective_batch,
             start_ordinal=completed,
             open_session=open_session,
-            metric_fields=config.metric_fields or None,
+            metric_fields=metric_names,
             lane_callback=lane_callback,
+            projected_grid=metric_names is not None,
+            grid=grid_request,
         )
 
         def stripe(index: int):
@@ -596,7 +613,16 @@ def _run(
             ):
                 yield ordinal, candidate_from_spec(spec)
 
-        assignments = tuple(stripe(index) for index in range(lane_count))
+        assignments = (
+            tuple(
+                candidate_grid.iter_stripe_ordinals(
+                    effective_batch, lane_count, index
+                )
+                for index in range(lane_count)
+            )
+            if metric_names is not None
+            else tuple(stripe(index) for index in range(lane_count))
+        )
         try:
             for batch in fleet.iter_grid(assignments):
                 if batch.error is not None:
@@ -605,11 +631,17 @@ def _run(
                     if failures <= 4 or failures % 100 == 0:
                         print(
                             f"{batch.lane}: failed chunk {failures} "
-                            f"({len(batch.results)} pools): {batch.error}",
+                            f"({batch.count} pools): {batch.error}",
                             file=sys.stderr,
                         )
-                writer.append(batch.candidates, batch.results)
-                completed += len(batch.results)
+                if batch.projected is None:
+                    writer.append(batch.candidates, batch.results)
+                else:
+                    writer.append_projected(
+                        batch.ordinals,
+                        batch.projected,
+                    )
+                completed += batch.count
                 if progress_callback is not None:
                     progress_callback(completed, total)
         finally:

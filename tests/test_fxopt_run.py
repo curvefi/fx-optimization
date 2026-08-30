@@ -40,7 +40,27 @@ class FakeClient:
 
     def evaluate_batch(self, candidates: list[dict[str, object]], **request: object) -> dict[str, object]:
         self.events.append("evaluate")
+        if ordinals := request.get("ordinals"):
+            candidates = [
+                {
+                    "candidate_id": f"p{int(ordinal):08d}",
+                    "ordinal": index,
+                }
+                for index, ordinal in enumerate(ordinals)
+            ]
         self.batches.append(candidates)
+        if request.get("metrics_format") == "array":
+            return {
+                "metric_fields": request["metric_fields"],
+                "results": [
+                    {
+                        "candidate_id": candidate["candidate_id"],
+                        "status": "ok",
+                        "metrics": [float(candidate["ordinal"])],
+                    }
+                    for candidate in candidates
+                ],
+            }
         return {
             "results": [
                 {
@@ -194,6 +214,7 @@ pool = {}
     assert metadata["evaluator"] == "/home/heswithme/arb/curve-fx-arb-harness/build/evaluator"
     assert metadata["template"] == "/home/heswithme/arb/curve-fx-optimization/template.json"
     assert metadata["market"] == "/home/heswithme/arb/curve-fx-optimization/market.json"
+    assert json.loads((output / "run.json").read_text())["status_counts"]["ok"] == 256
     config.write_text(config.read_text().replace(
         'evaluator = "../../curve-fx-arb-harness/build/evaluator"',
         'evaluator = "/outside/evaluator"',
@@ -464,7 +485,12 @@ pool = {}
     assert "ETA" in result.output
 
 
-def test_progress_reporter_streams_one_blade_without_numa_noise(capsys) -> None:
+def test_progress_reporter_streams_one_blade_without_numa_noise(
+    capsys,
+    monkeypatch,
+) -> None:
+    now = 0.0
+    monkeypatch.setattr("fxopt.cli.time.monotonic", lambda: now)
     reporter = _ProgressReporter(
         "run",
         stream_blade="blade-a5",
@@ -473,17 +499,23 @@ def test_progress_reporter_streams_one_blade_without_numa_noise(capsys) -> None:
         lanes_per_blade=2,
     )
     reporter(0, 8)
-    reporter.lane("blade-a5:numa0", 2, 1.0)
-    reporter.lane("blade-b1:numa0", 2, 1.0)
+    now = 12.0
+    reporter.lane("blade-a5:numa0", 2, 2.0)
+    reporter.lane("blade-b1:numa0", 2, 2.0)
     reporter(2, 8)
-    reporter.lane("blade-a5:numa1", 2, 1.0)
+    now = 14.0
+    reporter.lane("blade-a5:numa1", 2, 2.0)
     reporter.close()
 
     output = capsys.readouterr().err
-    assert "blade-a5: 2/4 (50%) 2.0 pools/s ETA 1.0s" in output
-    assert "blade-a5: 4/4 (100%) 4.0 pools/s ETA 0.0s" in output
+    assert "blade-a5: 2/4 (50%) 1.0 pools/s ETA 2.0s" in output
+    assert "blade-a5: 4/4 (100%) 2.0 pools/s ETA 0.0s" in output
     assert "working..." not in output
     assert output.count("waiting for first batch") == 1
     assert "numa" not in output
     assert "global" not in output
     assert "run:" not in output
+    assert reporter.completion_summary({"ok": 8, "failed": 0}) == (
+        "complete 8 pools in 14.0s, 0.6 pools/s cluster wall, "
+        "2.0 pools/s blade-a5 calc (8 ok, 0 failed)"
+    )
