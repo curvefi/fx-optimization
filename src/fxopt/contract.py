@@ -1,4 +1,4 @@
-"""Small, dependency-free contracts shared by optimizer execution surfaces."""
+"""Small dependency-free contracts shared by grids and replay."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ def _copy_json_value(value: Any, *, label: str) -> Any:
 
 @dataclass(frozen=True, slots=True)
 class Candidate:
-    """One optimizer proposal, independent of grid or search strategy."""
+    """One materialized pool candidate."""
 
     candidate_id: str
     policy_params: tuple[float, ...] = ()
@@ -66,7 +66,7 @@ class Candidate:
 
 @dataclass(frozen=True, slots=True)
 class CandidateResult:
-    """Compact normalized result returned by :class:`OptimizerEngine`."""
+    """Compact normalized result returned by an evaluator session."""
 
     candidate_id: str
     status: str = "ok"

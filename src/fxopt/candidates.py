@@ -1,8 +1,8 @@
-"""Portable candidate values shared by grids and adaptive search."""
+"""Portable candidate values used by Cartesian grids and replay."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -116,31 +116,11 @@ class CandidateSpec:
         return {"candidate_id": self.candidate_id, "payload": dict(self.payload)}
 
 
-def compile_batch(
-    proposals: Iterable[Mapping[str, Any]],
-    *,
-    defaults: Mapping[str, Any] | None = None,
-) -> tuple[CandidateSpec, ...]:
-    """Compile an adaptive optimizer's proposals into one bounded batch.
-
-    Only the requested iterable is consumed; callers can pass a generator from an
-    optimizer without constructing a full search space.
-    """
-    base = {} if defaults is None else canonical_payload(defaults)
-    result: list[CandidateSpec] = []
-    for ordinal, proposal in enumerate(proposals):
-        if not isinstance(proposal, Mapping):
-            raise CandidateError("each proposal must be a mapping")
-        result.append(CandidateSpec.from_payload(merge_payload(base, proposal), ordinal=ordinal))
-    return tuple(result)
-
-
 __all__ = [
     "CandidateError",
     "CandidateSpec",
     "candidate_id",
     "canonical_payload",
-    "compile_batch",
     "merge_payload",
     "path_parts",
 ]

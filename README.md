@@ -1,6 +1,6 @@
 # curve-fx-optimization (`fxopt`)
 
-`curve-fx-optimization` is the small, user-facing workflow layer for Curve FX experiments. It owns candidate grids, optimization, result files, interactive heatmaps, and trace replay. It calls the evaluator supplied by `curve-fx-arb-harness`; pool mechanics remain in `twocrypto-cpp`.
+`curve-fx-optimization` is the small, user-facing workflow layer for Curve FX experiments. It owns candidate grids, cluster execution, result files, interactive heatmaps, and trace replay. It calls the evaluator supplied by `curve-fx-arb-harness`; pool mechanics remain in `twocrypto-cpp`.
 
 ## Repository split
 
@@ -64,14 +64,14 @@ node. Remote runs map config-relative sibling-workspace paths under the shared
 through the first shared-NFS host, while existing files are kept; the evaluator
 is never copied.
 
-## The four commands
+## Workflow
 
-`run` and `optimize` write a compact result bundle containing exactly `run.json`
-and `results.npz`; heatmap and Shift-click add their own image/state or trace
-artifacts. Grid results stream as typed shards into one temporary NPZ and are
-published atomically only after the full grid succeeds. Interrupted grids are
-recomputed. The output directory is the durable hand-off between running,
-plotting, and replaying.
+`run` writes a compact result bundle containing exactly `run.json` and
+`results.npz`; heatmap and Shift-click add their own image/state or trace
+artifacts. Grid results are buffered as typed NPZ shards and published only
+after complete ordinal coverage is verified. Interrupted grids are recomputed.
+The output directory is the durable hand-off between running, plotting, and
+replaying.
 
 Run a Cartesian candidate grid in bounded batches:
 
@@ -80,20 +80,30 @@ uv run fxopt run configs/experiments/eurusd-a-donation-rpf-8x8x8.toml \
   --output runs/eurusd-a-donation-rpf-8x8x8
 ```
 
-Remote grids use deterministic rotating blocks, so early throughput and ETA
-sample the full parameter box while final results retain canonical Cartesian
-ordinals. The first placement host is the coordinator: it fans fixed stripes
-out to persistent per-NUMA evaluator lanes over the cluster LAN, streams one
-representative blade's progress, writes the only temporary NPZ on its local
-`/tmp`, and rsyncs `run.json` plus `results.npz` to the Mac once at the end.
-The remote Python environment is a small lockfile-backed uv group run through
-`shell.nix`; it is shared and becomes a no-op after its first sync. Source
+Remote grids deterministically shuffle contiguous ordinal blocks across one
+worker process per configured machine. Each worker owns its machine-local
+evaluator slots; whichever slot finishes first pulls the next block from their
+shared queue. Every evaluator registers the typed grid once and later receives
+only ordinal ranges. Workers emit low-rate heartbeats and write one local `/tmp`
+partition. The first placement host collects those partitions once, merges the
+typed NPZ members, and sends only the final `run.json` and `results.npz` to the
+Mac. The launcher is SSH-specific; scheduling and worker execution are not.
+
+The evaluator session also retains a separate ordinary candidate-batch API.
+That is the extension seam for a future adaptive ask/evaluate/tell controller:
+the controller may keep one machine worker alive per host and submit arbitrary
+point batches, while grid execution continues to use its cheaper registered
+ordinal-range path. Optimizer libraries and optimizer state do not belong in
+the evaluator or the grid runner.
+
+The shared managed Python runtime is entered through `scripts/cluster-python`
+and `shell.nix`; it does not synchronize an environment for each run. Source
 transfer and compilation happen once through shared home:
 
 ```sh
 uv run fxopt run configs/autoresearch/btcusd-flat-no-yb-smoke-8.toml \
   --output runs/btcusd-flat-no-yb-smoke-8 \
-  --transfer --rebuild --stream-blade blade-a5
+  --transfer --rebuild
 ```
 
 The coordinator is detached before the command follows its log, so a Mac or
@@ -114,26 +124,20 @@ retrieves on completion. `--retrieve` fetches only an already-complete job.
 the remote directory and local job handle for diagnosis; partial grids are not
 resumable. A small hidden job handle exists locally until successful retrieval,
 after which the run directory again contains exactly `run.json` and `results.npz`.
+`--overwrite` removes an existing completed run directory before starting the
+same grid again. It refuses directories containing a detached-job handle and
+cannot be combined with the four remote job-control flags.
 
-`--transfer` rsyncs the pool, harness, and optimizer sources once to the first
+`--transfer` rsyncs the pool, harness, and workflow sources once to the first
 configured blade. `--rebuild` implies transfer and builds the configured long-double
 evaluator once there. Dated market inputs remain copy-if-missing; the small pool
-template is refreshed through ordinary rsync. `--stream-blade` reports that
-blade's balanced share with its NUMA rates combined; the other blades stay
-quiet. Lanes have no global batch barrier: a collapsed chunk is stored as failed
-rows with NaN metrics, that lane is restarted, and its next chunk proceeds.
-After three consecutive chunk failures the lane is quarantined and the rest of
-its fixed stripe is marked failed without further connection waits.
-Final `run.json` records the status counts. Remote manifests must declare
+template is refreshed through ordinary rsync. One aggregate heartbeat reports
+cluster calculation rate and the slowest worker's ETA. Deterministic candidate
+failures remain result rows; an evaluator transport failure is retried locally
+three times and then fails the run rather than publishing an incomplete grid.
+Final `run.json` records the schedule and status counts. Remote manifests must declare
 `run.metric_fields`, which fixes the typed result schema even when the first
 chunk fails. Subsequent runs can omit both preparation flags.
-
-Run adaptive Nevergrad optimization through the same evaluator fleet:
-
-```sh
-uv run fxopt optimize configs/experiments/eurusd-a-donation-rpf-8x8x8.toml \
-  --output runs/eurusd-a-donation-rpf-8x8x8-opt
-```
 
 Open the mature interactive heatmap explorer (or save a PNG and its state):
 

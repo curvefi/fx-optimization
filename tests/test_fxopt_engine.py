@@ -1,6 +1,6 @@
 import pytest
 
-from fxopt import Candidate, OptimizerEngine
+from fxopt import Candidate, EvaluatorSession
 
 
 class FakeClient:
@@ -32,7 +32,7 @@ class FakeClient:
 
 def test_engine_reuses_one_client_session_and_orders_repeated_batches():
     fake = FakeClient()
-    engine = OptimizerEngine(
+    engine = EvaluatorSession(
         lambda: fake,
         session_id="session-1",
         open_session={"n_candles": 3},
@@ -73,7 +73,7 @@ def test_engine_normalizes_only_the_requested_metric_array_shape():
             }
 
     good = ArrayClient(["score", "apy"], [2.0, 0.1])
-    engine = OptimizerEngine(
+    engine = EvaluatorSession(
         lambda: good,
         session_id="metric-arrays",
         metric_fields=["score", "apy"],
@@ -86,7 +86,7 @@ def test_engine_normalizes_only_the_requested_metric_array_shape():
     assert dict(result.metrics) == {"score": 2.0, "apy": 0.1}
 
     wrong_fields = ArrayClient(["apy", "score"], [0.1, 2.0])
-    engine = OptimizerEngine(
+    engine = EvaluatorSession(
         lambda: wrong_fields,
         session_id="wrong-fields",
         metric_fields=["score", "apy"],
@@ -96,7 +96,7 @@ def test_engine_normalizes_only_the_requested_metric_array_shape():
     engine.close()
 
     wrong_length = ArrayClient(["score", "apy"], [2.0])
-    engine = OptimizerEngine(
+    engine = EvaluatorSession(
         lambda: wrong_length,
         session_id="wrong-length",
         metric_fields=["score", "apy"],
@@ -106,7 +106,7 @@ def test_engine_normalizes_only_the_requested_metric_array_shape():
     engine.close()
 
     non_finite = ArrayClient(["score", "apy"], [2.0, float("nan")])
-    engine = OptimizerEngine(
+    engine = EvaluatorSession(
         lambda: non_finite,
         session_id="non-finite",
         metric_fields=["score", "apy"],

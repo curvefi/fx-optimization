@@ -1,14 +1,11 @@
-"""Lean optimizer execution and result-artifact API."""
+"""Cartesian-grid execution and result-artifact API."""
 
 from .contract import Candidate, CandidateResult
-from .engine import ClientFactory, EvaluatorClient, OptimizerEngine
+from .engine import ClientFactory, EvaluatorClient, EvaluatorSession
 from .results import (
     ArtifactPaths,
     GridResultWriter,
-    ResultWriter,
-    ResultBundle,
-    read_results,
-    write_results,
+    read_result_columns,
 )
 from .run import RunConfig, run_config
 
@@ -19,11 +16,8 @@ __all__ = [
     "ClientFactory",
     "EvaluatorClient",
     "GridResultWriter",
-    "OptimizerEngine",
-    "ResultBundle",
-    "ResultWriter",
+    "EvaluatorSession",
     "RunConfig",
-    "read_results",
-    "write_results",
+    "read_result_columns",
     "run_config",
 ]

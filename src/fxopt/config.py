@@ -1,8 +1,8 @@
-"""TOML-friendly configuration and compilation entry points."""
+"""TOML-friendly Cartesian-grid configuration."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 import math
@@ -12,8 +12,6 @@ from typing import Any
 
 from .candidates import (
     CandidateError,
-    CandidateSpec,
-    compile_batch,
     merge_payload,
     path_parts,
 )
@@ -154,6 +152,12 @@ class CandidateConfig:
             if not isinstance(explicit, Mapping):
                 raise ConfigError("defaults must be a mapping")
             defaults.update(explicit)
+        if set(defaults) != {"policy_params", "pool"}:
+            raise ConfigError("defaults must contain exactly policy_params and pool")
+        if not isinstance(defaults["policy_params"], list):
+            raise ConfigError("defaults.policy_params must be an array")
+        if not isinstance(defaults["pool"], Mapping):
+            raise ConfigError("defaults.pool must be a mapping")
 
         axes: dict[str, tuple[Any, ...]] = {}
         raw_axes = data.get("axes", {})
@@ -174,6 +178,13 @@ class CandidateConfig:
                     raise ConfigError(f"axis {name} mapping values must not be empty")
                 try:
                     value_paths = [path_parts(key) for key in updates]
+                    if any(
+                        len(path) < 2 or path[0] not in {"policy_params", "pool"}
+                        for path in value_paths
+                    ):
+                        raise CandidateError(
+                            "axes must target policy_params.<index> or pool.<field>"
+                        )
                     _validate_update_paths(value_paths)
                     merge_payload(defaults, updates)
                 except CandidateError as exc:
@@ -203,41 +214,8 @@ class CandidateConfig:
         with Path(path).open("rb") as stream:
             return cls.from_mapping(tomllib.load(stream))
 
-    def point(self, overrides: Mapping[str, Any] | None = None) -> CandidateSpec:
-        return CandidateSpec.from_payload(merge_payload(self.defaults, overrides or {}))
-
     def grid(self) -> CartesianGrid:
         return CartesianGrid(dict(self.defaults), self.axes)
 
-    def batch(self, proposals: Iterable[Mapping[str, Any]]) -> tuple[CandidateSpec, ...]:
-        return compile_batch(proposals, defaults=self.defaults)
 
-
-def load_config(source: Mapping[str, Any] | str | Path) -> CandidateConfig:
-    return (
-        CandidateConfig.from_mapping(source)
-        if isinstance(source, Mapping)
-        else CandidateConfig.from_toml(source)
-    )
-
-
-def compile_candidates(
-    source: CandidateConfig | Mapping[str, Any] | str | Path,
-    mode: str = "point",
-    *,
-    overrides: Mapping[str, Any] | None = None,
-    proposals: Iterable[Mapping[str, Any]] | None = None,
-) -> CandidateSpec | CartesianGrid | tuple[CandidateSpec, ...]:
-    config = source if isinstance(source, CandidateConfig) else load_config(source)
-    if mode == "point":
-        return config.point(overrides)
-    if mode == "grid":
-        return config.grid()
-    if mode == "batch":
-        if proposals is None:
-            raise ConfigError("batch compilation requires proposals")
-        return config.batch(proposals)
-    raise ConfigError(f"unknown compilation mode: {mode}")
-
-
-__all__ = ["CandidateConfig", "ConfigError", "compile_candidates", "load_config"]
+__all__ = ["CandidateConfig", "ConfigError"]

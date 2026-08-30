@@ -11,8 +11,8 @@ import tempfile
 from typing import Any
 
 from .contract import Candidate
-from .placement import EvaluatorFleet, PlacementLane, local_client_factory
-from .engine import ClientFactory
+from .placement import local_client_factory
+from .engine import ClientFactory, EvaluatorSession
 from .run import (
     RunConfig,
     open_session_request,
@@ -110,10 +110,9 @@ def _trace_candidate(
     factory = client_factory or local_client_factory(
         replay.evaluator, work_dir=replay.work_dir, workers=1
     )
-    with EvaluatorFleet(
-        (PlacementLane("injected" if client_factory else "local", factory),),
+    with EvaluatorSession(
+        factory,
         session_id=f"{replay.run_id}-trace-{ordinal}",
-        batch_size=1,
         open_session=open_session,
         metric_projection="full",
         observation={
@@ -122,8 +121,8 @@ def _trace_candidate(
             "trace_actions": trace_actions,
             "artifact_dir": str(destination),
         },
-    ) as fleet:
-        result = fleet.evaluate((candidate,))[0]
+    ) as session:
+        result = session.evaluate((candidate,))[0]
 
     summary = destination / "shiftclick.json"
     _atomic_json(summary, {

@@ -1,28 +1,21 @@
-"""Evaluator placement primitives built on top of :mod:`fxopt.engine`.
-
-Placement deliberately knows about processes and lanes only.  Candidate creation,
-search, and scoring remain callers' concerns.
-"""
+"""Process placement and shared range queues for Cartesian-grid workers."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
-from dataclasses import dataclass, replace
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from itertools import islice
 from os import PathLike, fspath
 from pathlib import Path, PurePosixPath
 import shlex
 import subprocess
 from threading import Lock
-import time
 from typing import Any
 
 from curve_fx_harness_client import EvaluatorClient
 
-from .candidates import candidate_id
-from .contract import Candidate, CandidateResult
-from .engine import ClientFactory, OptimizerEngine, ProjectedBatch
+from .engine import ClientFactory, EvaluatorSession, ProjectedBatch
 
 
 SSH_OPTIONS = (
@@ -91,6 +84,7 @@ def local_client_factory(
     *,
     work_dir: str | PathLike[str] | None = None,
     workers: int = 1,
+    launch_prefix: Sequence[str | PathLike[str]] = (),
     client_options: Mapping[str, Any] | None = None,
     **options: Any,
 ) -> ClientFactory:
@@ -99,65 +93,15 @@ def local_client_factory(
         raise ValueError("workers must be a positive integer")
     executable = _token(executable_path, "executable_path")
     directory = None if work_dir is None else _token(work_dir, "work_dir")
+    prefix = [
+        _argv_token(value, f"launch_prefix[{index}]")
+        for index, value in enumerate(launch_prefix)
+    ]
     fixed = {
         "executable_path": executable,
         "work_dir": directory,
-        "launch_argv": [executable, "serve", "--workers", str(workers)],
+        "launch_argv": [*prefix, executable, "serve", "--workers", str(workers)],
         "verify_local_inputs": True,
-    }
-
-    def create() -> EvaluatorClient:
-        return EvaluatorClient(
-            **_client_options(client_options, options, fixed=fixed),
-        )
-
-    return create
-
-
-def ssh_client_factory(
-    host: str,
-    executable_path: str | PathLike[str],
-    *,
-    workers: int = 1,
-    remote_prefix: Sequence[str | PathLike[str]] = (),
-    ssh_path: str | PathLike[str] = "ssh",
-    verify_local_inputs: bool = False,
-    client_options: Mapping[str, Any] | None = None,
-    **options: Any,
-) -> ClientFactory:
-    """Return a factory launching the evaluator directly through ``ssh``.
-
-    The remote process receives exactly ``<evaluator> serve``.  In particular,
-    no optimizer or Python worker command is composed into the SSH argv.
-    """
-    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
-        raise ValueError("workers must be a positive integer")
-    remote_host = _token(host, "host")
-    executable = _token(executable_path, "executable_path")
-    ssh = _token(ssh_path, "ssh_path")
-    if isinstance(remote_prefix, (str, bytes)):
-        raise TypeError("remote_prefix must be a sequence of argv tokens")
-    prefix = [
-        _argv_token(value, f"remote_prefix[{index}]")
-        for index, value in enumerate(remote_prefix)
-    ]
-    if not isinstance(verify_local_inputs, bool):
-        raise TypeError("verify_local_inputs must be a boolean")
-    fixed = {
-        "executable_path": executable,
-        "work_dir": None,
-        "launch_argv": [
-            ssh,
-            *SSH_OPTIONS,
-            "--",
-            remote_host,
-            *prefix,
-            executable,
-            "serve",
-            "--workers",
-            str(workers),
-        ],
-        "verify_local_inputs": verify_local_inputs,
     }
 
     def create() -> EvaluatorClient:
@@ -331,15 +275,10 @@ class PlacementLane:
 
 @dataclass(frozen=True, slots=True)
 class LaneBatchResult:
-    """One bounded lane batch, returned as soon as that lane is free."""
+    """One completed registered-grid range batch."""
 
-    lane: str
     ordinals: tuple[int, ...]
-    candidates: tuple[Candidate, ...]
-    results: tuple[CandidateResult, ...]
-    elapsed: float
-    error: str | None = None
-    projected: ProjectedBatch | None = None
+    projected: ProjectedBatch
 
     @property
     def count(self) -> int:
@@ -347,34 +286,19 @@ class LaneBatchResult:
 
 
 class EvaluatorFleet:
-    """Run bounded batches over persistent evaluator/session lanes.
-
-    Batches are assigned round-robin; each lane processes its assigned sequence
-    serially while participating lanes execute concurrently.  A fleet can be
-    reused for multiple ``evaluate`` calls within one session.
-    """
+    """Feed one shared registered-grid range queue to persistent local slots."""
 
     def __init__(
         self,
         lanes: Sequence[PlacementLane | ClientFactory],
         *,
         session_id: str,
-        batch_size: int,
-        start_ordinal: int = 0,
         open_session: Mapping[str, Any] | None = None,
-        metric_projection: str | None = None,
-        metric_fields: Sequence[str] | None = None,
-        observation: Mapping[str, Any] | None = None,
-        lane_callback: Callable[[str, int, float], None] | None = None,
-        projected_grid: bool = False,
-        grid: Mapping[str, Any] | None = None,
+        metric_fields: Sequence[str],
+        grid: Mapping[str, Any],
     ) -> None:
         if not lanes:
             raise ValueError("fleet requires at least one lane")
-        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
-            raise ValueError("batch_size must be a positive integer")
-        if isinstance(start_ordinal, bool) or not isinstance(start_ordinal, int) or start_ordinal < 0:
-            raise ValueError("start_ordinal must be a non-negative integer")
         normalized: list[PlacementLane] = []
         for index, lane in enumerate(lanes):
             if isinstance(lane, PlacementLane):
@@ -385,31 +309,19 @@ class EvaluatorFleet:
                 raise TypeError("lanes must contain PlacementLane or client factories")
         self.lanes = tuple(normalized)
         self.session_id = session_id
-        self.batch_size = batch_size
         self._engine_options = {
             "session_id": session_id,
             "open_session": open_session,
-            "metric_projection": metric_projection,
             "metric_fields": metric_fields,
-            "observation": observation,
             "grid": grid,
         }
         self._engines = [self._new_engine(index) for index in range(len(self.lanes))]
         self._started = False
         self._closed = False
-        self._next_ordinal = start_ordinal
-        self._next_lane = 0
         self._evaluation_lock = Lock()
-        self._lane_callback = lane_callback
-        self._projected_grid = projected_grid
 
-    @property
-    def engines(self) -> tuple[OptimizerEngine, ...]:
-        """Read-only access to lane engines for diagnostics."""
-        return tuple(self._engines)
-
-    def _new_engine(self, lane_index: int) -> OptimizerEngine:
-        return OptimizerEngine(
+    def _new_engine(self, lane_index: int) -> EvaluatorSession:
+        return EvaluatorSession(
             self.lanes[lane_index].client_factory,
             **self._engine_options,
         )
@@ -442,312 +354,97 @@ class EvaluatorFleet:
             raise
         self._started = True
 
-    def evaluate(self, candidates: Iterable[Candidate]) -> list[CandidateResult]:
-        # A fleet may be reused by callers, but an engine must never receive two
-        # requests concurrently; lane-level workers provide the useful parallelism.
-        return [result for wave in self.iter_evaluate(candidates) for result in wave]
-
-    def iter_grid(
+    def iter_grid_ranges(
         self,
-        assignments: Sequence[Iterable[int | tuple[int, Candidate]]],
+        blocks: Iterable[tuple[int, int]],
+        *,
+        blocks_per_batch: int = 1,
     ) -> Iterator[LaneBatchResult]:
-        """Run fixed lane stripes without barriers, recycling failed lanes."""
-        if len(assignments) != len(self.lanes):
-            raise ValueError("grid assignments must match the fleet lane count")
+        """Let every projected evaluator lane pull from one shared block queue."""
+        if (
+            isinstance(blocks_per_batch, bool)
+            or not isinstance(blocks_per_batch, int)
+            or blocks_per_batch < 1
+        ):
+            raise ValueError("blocks_per_batch must be a positive integer")
         with self._evaluation_lock:
-            yield from self._iter_grid(assignments)
+            iterator = iter(blocks)
 
-    def _iter_grid(
-        self,
-        assignments: Sequence[Iterable[int | tuple[int, Candidate]]],
-    ) -> Iterator[LaneBatchResult]:
-        if self._closed:
-            raise RuntimeError("fleet is closed")
-        iterators = tuple(iter(items) for items in assignments)
-        consecutive_failures = [0] * len(self.lanes)
-        quarantined = [False] * len(self.lanes)
-
-        def next_batch(lane_index: int) -> tuple[Any, ...]:
-            items = tuple(islice(iterators[lane_index], self.batch_size))
-            if self._projected_grid:
+            def next_ranges() -> tuple[tuple[int, int], ...]:
+                selected = tuple(islice(iterator, blocks_per_batch))
+                if not selected:
+                    return ()
                 if any(
-                    isinstance(ordinal, bool)
-                    or not isinstance(ordinal, int)
-                    or ordinal < 0
-                    for ordinal in items
+                    isinstance(start, bool)
+                    or isinstance(stop, bool)
+                    or not isinstance(start, int)
+                    or not isinstance(stop, int)
+                    or start < 0
+                    or stop <= start
+                    for start, stop in selected
                 ):
-                    raise TypeError("projected grid assignments must contain ordinals")
-            else:
-                for ordinal, candidate in items:
-                    if (
-                        isinstance(ordinal, bool)
-                        or not isinstance(ordinal, int)
-                        or ordinal < 0
-                        or not isinstance(candidate, Candidate)
-                    ):
-                        raise TypeError(
-                            "grid assignments must contain non-negative "
-                            "ordinal/Candidate pairs"
-                        )
-            return items
+                    raise ValueError("grid blocks must be non-empty ordinal ranges")
+                ordered = sorted(selected)
+                if any(start < previous_stop for (_previous_start, previous_stop), (start, _stop)
+                       in zip(ordered, ordered[1:], strict=False)):
+                    raise ValueError("grid blocks must not overlap")
+                merged: list[tuple[int, int]] = []
+                for start, stop in ordered:
+                    if merged and start == merged[-1][0] + merged[-1][1]:
+                        merged[-1] = (merged[-1][0], merged[-1][1] + stop - start)
+                    else:
+                        merged.append((start, stop - start))
+                return tuple(merged)
 
-        def run_lane(
-            lane_index: int,
-            items: tuple[Any, ...],
-        ) -> LaneBatchResult:
-            if self._projected_grid:
-                ordinals = items
-                candidates: tuple[Candidate, ...] = ()
-            else:
-                ordinals, candidates = zip(*items, strict=True)
-            started_at: float | None = None
-            error: str | None = None
-            projected: ProjectedBatch | None = None
-            try:
-                engine = self._engines[lane_index]
-                engine.start()
-                started_at = time.monotonic()
-                if self._projected_grid:
-                    projected = engine.evaluate_projected_grid(ordinals)
-                    if len(projected.rows) != len(ordinals):
-                        raise ValueError("lane returned the wrong number of results")
-                    results = ()
-                else:
-                    evaluated = engine.evaluate(candidates)
-                    if len(evaluated) != len(candidates):
-                        raise ValueError("lane returned the wrong number of results")
-                    results = tuple(
-                        replace(result, ordinal=ordinal)
-                        for ordinal, result in zip(ordinals, evaluated, strict=True)
-                    )
-            except Exception as exc:
-                detail = " | ".join(str(exc).splitlines()).strip()
-                error = f"{type(exc).__name__}: {detail}"[:500]
-                if self._projected_grid:
-                    metric_fields = tuple(self._engine_options["metric_fields"] or ())
-                    projected = ProjectedBatch(
-                        metric_fields,
-                        tuple(
-                            {
-                                "candidate_id": candidate_id(ordinal),
-                                "status": "failed",
-                                "error": error if index == 0 else None,
-                                "metrics": [-1.0] * len(metric_fields),
-                            }
-                            for index, ordinal in enumerate(ordinals)
-                        ),
-                    )
-                    results = ()
-                else:
-                    results = tuple(
-                        CandidateResult(
-                            candidate_id=candidate.candidate_id,
-                            status="failed",
-                            error=error if index == 0 else None,
-                            ordinal=ordinal,
-                        )
-                        for index, (ordinal, candidate) in enumerate(items)
-                    )
-                self._recycle_engine(lane_index)
-            return LaneBatchResult(
-                lane=self.lanes[lane_index].name,
-                ordinals=tuple(ordinals),
-                candidates=tuple(candidates),
-                results=results,
-                elapsed=(
-                    time.monotonic() - started_at
-                    if started_at is not None
-                    else 0.0
-                ),
-                error=error,
-                projected=projected,
-            )
-
-        def failed_lane(
-            lane_index: int,
-            items: tuple[Any, ...],
-        ) -> LaneBatchResult:
-            error = (
-                f"lane quarantined after {_MAX_CONSECUTIVE_GRID_FAILURES} "
-                "consecutive chunk failures"
-            )
-            if self._projected_grid:
-                ordinals = tuple(items)
-                metric_fields = tuple(self._engine_options["metric_fields"] or ())
-                return LaneBatchResult(
-                    lane=self.lanes[lane_index].name,
-                    ordinals=ordinals,
-                    candidates=(),
-                    results=(),
-                    elapsed=0.0,
-                    error=error,
-                    projected=ProjectedBatch(
-                        metric_fields,
-                        tuple(
-                            {
-                                "candidate_id": candidate_id(ordinal),
-                                "status": "failed",
-                                "error": error if index == 0 else None,
-                                "metrics": [-1.0] * len(metric_fields),
-                            }
-                            for index, ordinal in enumerate(ordinals)
-                        ),
-                    ),
+            def run_lane(
+                lane_index: int,
+                ranges: tuple[tuple[int, int], ...],
+            ) -> LaneBatchResult:
+                ordinals = tuple(
+                    ordinal
+                    for start, count in ranges
+                    for ordinal in range(start, start + count)
                 )
-            return LaneBatchResult(
-                lane=self.lanes[lane_index].name,
-                ordinals=tuple(ordinal for ordinal, _candidate in items),
-                candidates=tuple(candidate for _ordinal, candidate in items),
-                results=tuple(
-                    CandidateResult(
-                        candidate_id=candidate.candidate_id,
-                        status="failed",
-                        error=error if index == 0 else None,
-                        ordinal=ordinal,
-                    )
-                    for index, (ordinal, candidate) in enumerate(items)
-                ),
-                elapsed=0.0,
-                error=error,
-            )
-
-        def submit(executor, lane_index, items):
-            task = failed_lane if quarantined[lane_index] else run_lane
-            return executor.submit(task, lane_index, items)
-
-        executor = ThreadPoolExecutor(max_workers=len(self.lanes))
-        futures = {}
-        try:
-            for lane_index in range(len(self.lanes)):
-                if items := next_batch(lane_index):
-                    futures[submit(executor, lane_index, items)] = lane_index
-            while futures:
-                done, _pending = wait(futures, return_when=FIRST_COMPLETED)
-                ready: list[LaneBatchResult] = []
-                for future in sorted(done, key=futures.__getitem__):
-                    lane_index = futures.pop(future)
-                    completed = future.result()
-                    if completed.error is None:
-                        consecutive_failures[lane_index] = 0
-                    elif not quarantined[lane_index]:
-                        consecutive_failures[lane_index] += 1
-                        quarantined[lane_index] = (
-                            consecutive_failures[lane_index]
-                            >= _MAX_CONSECUTIVE_GRID_FAILURES
-                        )
-                    if items := next_batch(lane_index):
-                        futures[submit(executor, lane_index, items)] = lane_index
-                    ready.append(completed)
-                for completed in ready:
-                    if self._lane_callback is not None:
-                        self._lane_callback(
-                            completed.lane,
-                            completed.count,
-                            completed.elapsed,
-                        )
-                    yield completed
-        finally:
-            executor.shutdown(wait=True)
-
-    def iter_evaluate(self, candidates: Iterable[Candidate]) -> Iterator[list[CandidateResult]]:
-        """Yield globally ordered waves; cross-batch ID uniqueness is caller-owned."""
-        with self._evaluation_lock:
-            yield from self._iter_evaluate(candidates)
-
-    def _iter_evaluate(self, candidates: Iterable[Candidate]) -> Iterator[list[CandidateResult]]:
-        """Evaluate candidates in global input order with global ordinals."""
-        if self._closed:
-            raise RuntimeError("fleet is closed")
-        base_ordinal = self._next_ordinal
-        lane_count = len(self._engines)
-        capacity = lane_count * self.batch_size
-        iterator = iter(candidates)
-        total = 0
-        started = False
-
-        def next_wave() -> list[Candidate]:
-            wave: list[Candidate] = []
-            while len(wave) < capacity:
-                try:
-                    candidate = next(iterator)
-                except StopIteration:
-                    break
-                if not isinstance(candidate, Candidate):
-                    raise TypeError("candidates must contain Candidate values")
-                wave.append(candidate)
-            return wave
-
-        executor: ThreadPoolExecutor | None = None
-        try:
-            while True:
-                wave = next_wave()
-                if not wave:
-                    break
-                if not started:
-                    self.start()
-                    started = True
-                assignments: dict[int, list[tuple[int, Candidate]]] = {}
-                active_lanes = min(lane_count, len(wave))
-                lane_indices = tuple(
-                    (self._next_lane + index) % lane_count
-                    for index in range(active_lanes)
-                )
-                for lane_index in lane_indices:
-                    assignments[lane_index] = []
-                for offset, candidate in enumerate(wave):
-                    assignments[lane_indices[offset % active_lanes]].append(
-                        (offset, candidate)
-                    )
-                self._next_lane = (self._next_lane + active_lanes) % lane_count
-                if executor is None:
-                    executor = ThreadPoolExecutor(max_workers=lane_count)
-
-                def run_lane(
-                    lane_index: int, assignment: list[tuple[int, Candidate]]
-                ) -> tuple[list[tuple[int, CandidateResult]], float]:
-                    offsets, batch = zip(*assignment, strict=True)
-                    engine = self._engines[lane_index]
-                    started_at = time.monotonic()
+                last_error: Exception | None = None
+                for attempt in range(_MAX_CONSECUTIVE_GRID_FAILURES):
                     try:
-                        results = engine.evaluate(batch)
-                    except Exception as exc:
-                        first = base_ordinal + total + offsets[0]
-                        last = base_ordinal + total + offsets[-1]
-                        raise RuntimeError(
-                            f"lane {self.lanes[lane_index].name} failed for "
-                            f"{len(batch)} striped candidates spanning ordinals {first}..{last}"
-                        ) from exc
-                    if len(results) != len(batch):  # Defensive seam for injected engines.
-                        raise ValueError("lane returned the wrong number of results")
-                    return (
-                        [
-                            (offset, replace(result, ordinal=base_ordinal + total + offset))
-                            for offset, result in zip(offsets, results, strict=True)
-                        ],
-                        time.monotonic() - started_at,
-                    )
-
-                ordered: list[CandidateResult | None] = [None] * len(wave)
-                futures = {
-                    executor.submit(run_lane, lane, assignment): lane
-                    for lane, assignment in assignments.items()
-                }
-                for future in as_completed(futures):
-                    lane_index = futures[future]
-                    lane_results, elapsed = future.result()
-                    if self._lane_callback is not None:
-                        self._lane_callback(
-                            self.lanes[lane_index].name,
-                            len(lane_results),
-                            elapsed,
+                        engine = self._engines[lane_index]
+                        engine.start()
+                        projected = engine.evaluate_projected_ranges(ranges)
+                        if len(projected.rows) != len(ordinals):
+                            raise ValueError("lane returned the wrong number of results")
+                        return LaneBatchResult(
+                            ordinals=ordinals,
+                            projected=projected,
                         )
-                    for offset, result in lane_results:
-                        ordered[offset] = result
-                total += len(wave)
-                self._next_ordinal += len(wave)
-                yield [result for result in ordered if result is not None]
-        finally:
-            if executor is not None:
+                    except Exception as exc:
+                        last_error = exc
+                        self._recycle_engine(lane_index)
+                        if attempt + 1 == _MAX_CONSECUTIVE_GRID_FAILURES:
+                            break
+                assert last_error is not None
+                raise RuntimeError(
+                    f"lane {self.lanes[lane_index].name} failed grid ranges "
+                    f"after {_MAX_CONSECUTIVE_GRID_FAILURES} attempts"
+                ) from last_error
+
+            executor = ThreadPoolExecutor(max_workers=len(self.lanes))
+            futures: dict[Any, int] = {}
+            try:
+                for lane_index in range(len(self.lanes)):
+                    if ranges := next_ranges():
+                        futures[executor.submit(run_lane, lane_index, ranges)] = lane_index
+                while futures:
+                    done, _pending = wait(futures, return_when=FIRST_COMPLETED)
+                    ready: list[LaneBatchResult] = []
+                    for future in sorted(done, key=futures.__getitem__):
+                        lane_index = futures.pop(future)
+                        completed = future.result()
+                        if ranges := next_ranges():
+                            futures[executor.submit(run_lane, lane_index, ranges)] = lane_index
+                        ready.append(completed)
+                    yield from ready
+            finally:
                 executor.shutdown(wait=True)
 
     def close(self) -> None:
@@ -787,5 +484,4 @@ __all__ = [
     "SSH_OPTIONS",
     "ensure_remote_file",
     "local_client_factory",
-    "ssh_client_factory",
 ]

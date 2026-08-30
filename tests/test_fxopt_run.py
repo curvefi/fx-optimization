@@ -9,12 +9,12 @@ from click.testing import CliRunner
 import pytest
 
 from fxopt.cli import _ProgressReporter, main
-from fxopt.config import ConfigError
 from fxopt import placement
-from fxopt.results import ArtifactPaths, read_results
+from fxopt.results import ArtifactPaths, read_result_columns
 from fxopt.run import (
     REMOTE_JOB_FILENAME,
     RunConfig,
+    _shuffled_block_ranges,
     follow_remote_run,
     open_session_request,
     remote_run_status,
@@ -38,15 +38,27 @@ class FakeClient:
         assert request["scenario_id"] == "scenario-1"
         assert str(request["market_path"]).endswith("market.json")
 
+    def register_grid(self, grid_id: str, grid: object, **request: object) -> object:
+        self.events.append(("grid", grid_id))
+        count = 1
+        for length in grid["shape"]:
+            count *= length
+        return {"candidate_count": count}
+
     def evaluate_batch(self, candidates: list[dict[str, object]], **request: object) -> dict[str, object]:
         self.events.append("evaluate")
-        if ordinals := request.get("ordinals"):
+        if ranges := request.get("ranges"):
+            ordinals = [
+                ordinal
+                for start, count in ranges
+                for ordinal in range(int(start), int(start) + int(count))
+            ]
             candidates = [
                 {
                     "candidate_id": f"p{int(ordinal):08d}",
-                    "ordinal": index,
+                    "ordinal": int(ordinal),
                 }
-                for index, ordinal in enumerate(ordinals)
+                for ordinal in ordinals
             ]
         self.batches.append(candidates)
         if request.get("metrics_format") == "array":
@@ -54,6 +66,7 @@ class FakeClient:
                 "metric_fields": request["metric_fields"],
                 "results": [
                     {
+                        "ordinal": candidate["ordinal"],
                         "candidate_id": candidate["candidate_id"],
                         "status": "ok",
                         "metrics": [float(candidate["ordinal"])],
@@ -79,6 +92,24 @@ class FakeClient:
         self.events.append("shutdown")
 
 
+def test_shuffled_blocks_are_balanced_reproducible_and_cover_the_grid() -> None:
+    assignments = _shuffled_block_ranges(64, 4, 4)
+
+    assert assignments == _shuffled_block_ranges(64, 4, 4)
+    assert [[start for start, _stop in worker] for worker in assignments] == [
+        [40, 36, 52, 0],
+        [56, 8, 28, 24],
+        [20, 12, 32, 60],
+        [4, 44, 16, 48],
+    ]
+    assert sorted(
+        ordinal
+        for worker in assignments
+        for start, stop in worker
+        for ordinal in range(start, stop)
+    ) == list(range(64))
+
+
 def test_run_uses_one_session_and_writes_only_two_artifacts(tmp_path: Path) -> None:
     config = tmp_path / "run.toml"
     config.write_text(
@@ -89,6 +120,7 @@ evaluator = "evaluator"
 template = "template.json"
 batch_size = 2
 workers = 3
+metric_fields = ["score"]
 [session]
 n_candles = 3
 [scenario]
@@ -117,6 +149,7 @@ pool = {}
     assert fake.events.count("start") == 1
     assert [event[0] for event in fake.events if isinstance(event, tuple)] == [
         "open",
+        "grid",
         "close",
     ]
     assert fake.events[-1] == "shutdown"
@@ -126,101 +159,7 @@ pool = {}
     run_payload = json.loads((output / "run.json").read_text())
     assert run_payload["candidate_count"] == 4
     assert "candidates" not in run_payload
-    assert len(read_results(output).results) == 4
-
-
-def test_run_uses_two_placement_lanes_with_direct_open_session(
-    tmp_path: Path, monkeypatch
-) -> None:
-    workspace = tmp_path / "curve-fx-sim"
-    config = workspace / "curve-fx-optimization" / "configs" / "run.toml"
-    config.parent.mkdir(parents=True)
-    (workspace / "curve-fx-optimization" / "market.json").write_text("[]")
-    config.write_text(
-        """
-[run]
-id = "remote-run"
-evaluator = "../../curve-fx-arb-harness/build/evaluator"
-template = "../template.json"
-batch_size = 256
-workers = 2
-metric_fields = ["score"]
-[placement]
-hosts = ["blade-b6", "blade-b7"]
-[session]
-n_candles = 1
-[scenario]
-id = "scenario-1"
-market = "../market.json"
-chainlink = "../chainlink.json"
-[candidate.defaults]
-policy_params = []
-pool = {}
-[candidate.axes]
-"pool.A" = { start = 1, stop = 16, count = 16 }
-"pool.donation_apy" = { start = 0, stop = 0.15, count = 16 }
-"pool.mid_fee" = [0.0003]
-"pool.out_fee" = [0.0003]
-"""
-    )
-    clients: dict[str, FakeClient] = {}
-    calls: list[tuple[str, str, bool]] = []
-    ensured = []
-
-    def fake_ssh(
-        host: str,
-        evaluator: str,
-        *,
-        workers: int,
-        timeout: float,
-        verify_local_inputs: bool,
-    ):
-        assert timeout == 600.0
-        calls.append((host, str(evaluator), verify_local_inputs))
-        clients[host] = FakeClient()
-        return lambda: clients[host]
-
-    monkeypatch.setattr("fxopt.run.ssh_client_factory", fake_ssh)
-    monkeypatch.setattr("fxopt.run.prepare_remote", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        "fxopt.run.ensure_remote_file",
-        lambda *args, **kwargs: ensured.append((*args, kwargs.get("replace", False))),
-    )
-    output = tmp_path / "output"
-    run_config(config, output)
-
-    assert calls == [
-        ("blade-b6", "/home/heswithme/arb/curve-fx-arb-harness/build/evaluator", False),
-        ("blade-b7", "/home/heswithme/arb/curve-fx-arb-harness/build/evaluator", False),
-    ]
-    assert ensured == [
-        ("blade-b6", str(config.parent / "../template.json"), "/home/heswithme/arb/curve-fx-optimization/template.json", True),
-        ("blade-b6", str(config.parent / "../market.json"), "/home/heswithme/arb/curve-fx-optimization/market.json", False),
-        ("blade-b6", str(config.parent / "../chainlink.json"), "/home/heswithme/arb/curve-fx-optimization/chainlink.json", False),
-        ("blade-b6", config, "/home/heswithme/arb/curve-fx-optimization/configs/run.toml", True),
-    ]
-    for client in clients.values():
-        opened = next(event for event in client.events if isinstance(event, tuple) and event[0] == "open")
-        assert opened[2]["template_path"] == "/home/heswithme/arb/curve-fx-optimization/template.json"
-        assert opened[2]["market_path"] == "/home/heswithme/arb/curve-fx-optimization/market.json"
-        assert opened[2]["chainlink_path"] == "/home/heswithme/arb/curve-fx-optimization/chainlink.json"
-    assert sorted(len(batch) for client in clients.values() for batch in client.batches) == [128, 128]
-    assert {path.name for path in output.iterdir()} == {"run.json", "results.npz"}
-    metadata = json.loads((output / "run.json").read_text())["metadata"]
-    assert metadata["placement"] == "ssh"
-    assert metadata["hosts"] == ["blade-b6", "blade-b7"]
-    assert metadata["batch_size"] == 256
-    assert metadata["effective_batch_size"] == 128
-    assert metadata["evaluator"] == "/home/heswithme/arb/curve-fx-arb-harness/build/evaluator"
-    assert metadata["template"] == "/home/heswithme/arb/curve-fx-optimization/template.json"
-    assert metadata["market"] == "/home/heswithme/arb/curve-fx-optimization/market.json"
-    assert json.loads((output / "run.json").read_text())["status_counts"]["ok"] == 256
-    config.write_text(config.read_text().replace(
-        'evaluator = "../../curve-fx-arb-harness/build/evaluator"',
-        'evaluator = "/outside/evaluator"',
-    ))
-    with pytest.raises(ConfigError, match="remote evaluator path must be inside"):
-        RunConfig.from_toml(config)
+    assert read_result_columns(output).row_count == 4
 
 
 def test_run_config_preserves_absolute_inputs_and_anchors_relative_market(
@@ -234,6 +173,7 @@ id = "path-run"
 evaluator = "/home/heswithme/evaluator"
 template = "/home/heswithme/template.json"
 batch_size = 1
+metric_fields = ["score"]
 [scenario]
 id = "scenario-1"
 market = "/home/heswithme/market.json"
@@ -326,7 +266,7 @@ pool = {}
     monkeypatch.setattr("fxopt.run.subprocess.run", fake_run)
     output = tmp_path / "result"
     with pytest.raises(subprocess.CalledProcessError):
-        run_remote_config(config, output, stream_blade="blade-a5")
+        run_remote_config(config, output)
 
     assert (output / REMOTE_JOB_FILENAME).is_file()
     status = remote_run_status(config, output)
@@ -430,6 +370,7 @@ id = "test-run"
 evaluator = "evaluator"
 template = "template.json"
 batch_size = 4
+metric_fields = ["score"]
 [scenario]
 id = "scenario-1"
 market = "market.json"
@@ -442,7 +383,11 @@ pool = {}
 "pool.reserved_profit_fraction" = { start = 0, stop = 1, count = 8 }
 """
     )
-    paths = ArtifactPaths(tmp_path / "run.json", tmp_path / "results.npz")
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "run.json").write_text("old")
+    (output / "stale.txt").write_text("old")
+    paths = ArtifactPaths(output / "run.json", output / "results.npz")
     heartbeat_seen = threading.Event()
     zero_reports = 0
     original_write = _ProgressReporter._write
@@ -461,14 +406,20 @@ pool = {}
     )
 
     def fake_run_config(*_args, progress_callback=None, **_kwargs):
+        assert not output.exists()
+        output.mkdir()
         progress_callback(0, 4)
         assert heartbeat_seen.wait(1.0)
         progress_callback(2, 4)
         progress_callback(4, 4)
+        paths.run_json.write_text("new")
+        paths.results_npz.write_bytes(b"npz")
         return paths
 
     monkeypatch.setattr("fxopt.cli.run_config", fake_run_config)
-    result = CliRunner().invoke(main, ["run", str(config), "--output", str(tmp_path / "out")])
+    result = CliRunner().invoke(
+        main, ["run", str(config), "--output", str(output), "--overwrite"]
+    )
 
     assert result.exit_code == 0, result.output
     assert "run: saved 0/4 (0%)" in result.output
@@ -483,39 +434,39 @@ pool = {}
     ) in result.output
     assert "pools/s" in result.output
     assert "ETA" in result.output
+    assert not (output / "stale.txt").exists()
 
 
-def test_progress_reporter_streams_one_blade_without_numa_noise(
-    capsys,
-    monkeypatch,
-) -> None:
-    now = 0.0
-    monkeypatch.setattr("fxopt.cli.time.monotonic", lambda: now)
-    reporter = _ProgressReporter(
-        "run",
-        stream_blade="blade-a5",
-        blade_index=0,
-        blade_count=2,
-        lanes_per_blade=2,
+def test_overwrite_refuses_a_detached_remote_job(tmp_path) -> None:
+    config = tmp_path / "curve-fx-optimization" / "configs" / "run.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        """
+[run]
+id = "test-run"
+evaluator = "evaluator"
+template = "template.json"
+batch_size = 1
+metric_fields = ["score"]
+[placement]
+hosts = ["blade-a5"]
+[scenario]
+id = "scenario"
+market = "market.json"
+[candidate.defaults]
+policy_params = []
+pool = {}
+"""
     )
-    reporter(0, 8)
-    now = 12.0
-    reporter.lane("blade-a5:numa0", 2, 2.0)
-    reporter.lane("blade-b1:numa0", 2, 2.0)
-    reporter(2, 8)
-    now = 14.0
-    reporter.lane("blade-a5:numa1", 2, 2.0)
-    reporter.close()
+    output = tmp_path / "out"
+    output.mkdir()
+    handle = output / REMOTE_JOB_FILENAME
+    handle.write_text("{}")
 
-    output = capsys.readouterr().err
-    assert "blade-a5: 2/4 (50%) 1.0 pools/s ETA 2.0s" in output
-    assert "blade-a5: 4/4 (100%) 2.0 pools/s ETA 0.0s" in output
-    assert "working..." not in output
-    assert output.count("waiting for first batch") == 1
-    assert "numa" not in output
-    assert "global" not in output
-    assert "run:" not in output
-    assert reporter.completion_summary({"ok": 8, "failed": 0}) == (
-        "complete 8 pools in 14.0s, 0.6 pools/s cluster wall, "
-        "2.0 pools/s blade-a5 calc (8 ok, 0 failed)"
+    result = CliRunner().invoke(
+        main, ["run", str(config), "--output", str(output), "--overwrite"]
     )
+
+    assert result.exit_code != 0
+    assert "refuses a detached remote job" in result.output
+    assert handle.is_file()

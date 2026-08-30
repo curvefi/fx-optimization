@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from fxopt.candidates import CandidateSpec
-from fxopt.config import CandidateConfig, ConfigError, compile_candidates
+from fxopt.config import CandidateConfig, ConfigError
 
 
 def _config(*, reverse_axes: bool = False) -> CandidateConfig:
@@ -24,19 +24,9 @@ def _config(*, reverse_axes: bool = False) -> CandidateConfig:
     )
 
 
-def test_one_point_and_lazy_cartesian_grid_share_candidate_contract() -> None:
+def test_lazy_cartesian_grid_uses_the_candidate_contract() -> None:
     config = _config()
-    point = compile_candidates(config, "point")
-    assert isinstance(point, CandidateSpec)
-    assert point.payload == {
-        "policy_params": [0.5, 0.0003],
-        "pool": {"A": 100, "donation_apy": 0.08},
-    }
-    override = config.point({"pool.A": 101})
-    assert override.payload["pool"] == {"A": 101, "donation_apy": 0.08}
-    assert config.defaults["pool"] == {"A": 100, "donation_apy": 0.08}
-
-    grid = compile_candidates(_config(), "grid")
+    grid = config.grid()
     assert len(grid) == 16 * 16
     assert grid.candidate_at(0).payload["pool"]["A"] == 10_000
     assert grid.candidate_at(len(grid) - 1).payload["pool"]["A"] == 160_000
@@ -46,14 +36,17 @@ def test_one_point_and_lazy_cartesian_grid_share_candidate_contract() -> None:
 
 
 def test_ids_and_payloads_are_independent_of_axis_order_and_batch_size() -> None:
-    forward = compile_candidates(_config(), "grid")
-    reverse = compile_candidates(_config(reverse_axes=True), "grid")
+    forward = _config().grid()
+    reverse = _config(reverse_axes=True).grid()
     forward_rows = [(item.candidate_id, dict(item.payload)) for item in forward]
     reverse_rows = [(item.candidate_id, dict(item.payload)) for item in reverse]
     assert forward_rows == reverse_rows
 
     with pytest.raises(ConfigError, match="collision"):
-        CandidateConfig.from_mapping({"axes": {"pool": [1], "pool.A": [2]}})
+        CandidateConfig.from_mapping({
+            "defaults": {"policy_params": [], "pool": {}},
+            "axes": {"pool.A": [1], "pool.A.gamma": [2]},
+        })
 
     batched_rows = [
         (item.candidate_id, dict(item.payload))

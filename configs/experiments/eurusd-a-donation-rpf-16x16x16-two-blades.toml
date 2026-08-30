@@ -4,6 +4,10 @@ evaluator = "../../../curve-fx-arb-harness/build/native/arb_evaluator_f64"
 template = "../templates/eurusd-2024-monorepo.json"
 batch_size = 256
 workers = 128
+metric_fields = [
+  "apy_net_consistency_90d", "detach_energy_ungated",
+  "max_7d_rel_price_diff", "avg_imbalance", "trades", "elapsed_ms",
+]
 
 [session]
 n_candles = 0
@@ -29,13 +33,6 @@ pool = { mid_fee = 0.0003, out_fee = 0.0003 }
 "pool.A" = { start = 1, stop = 200, count = 16, multiply = 10000 }
 "pool.donation_apy" = { start = 0, stop = 0.10, count = 16 }
 "pool.reserved_profit_fraction" = { start = 0, stop = 1, count = 16 }
-
-[optimization]
-budget = 128
-batch_size = 32
-metric = "apy_net_gm"
-maximize = true
-seed = 42
 
 [placement]
 hosts = ["blade-b6", "blade-b7"]

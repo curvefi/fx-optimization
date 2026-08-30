@@ -2,21 +2,23 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import json
 import os
 from pathlib import Path, PurePosixPath
+import random
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import tomllib
 from typing import Any
 
-from .candidates import CandidateSpec
 from .config import CandidateConfig, ConfigError
-from .contract import Candidate
 from .engine import ClientFactory
 from .placement import (
     EvaluatorFleet,
@@ -29,10 +31,9 @@ from .placement import (
     rebuild_shared_evaluator,
     require_reachable_hosts,
     require_shared_evaluator,
-    ssh_client_factory,
     transfer_workspace,
 )
-from .results import ArtifactPaths, GridResultWriter
+from .results import ArtifactPaths, GridResultWriter, merge_grid_partitions
 from .robustness import (
     RobustnessAxis,
     parse_robustness_axes,
@@ -46,8 +47,10 @@ _CANDIDATE_KEYS = frozenset({"defaults", "axes"})
 _SCENARIO_KEYS = frozenset({"id", "market", "chainlink", "yb_mode"})
 
 ProgressCallback = Callable[[int, int], None]
-LaneCallback = Callable[[str, int, float], None]
+WorkerProgressCallback = Callable[[int, int, float], None]
 REMOTE_JOB_FILENAME = ".remote-job.json"
+_BLOCK_SHUFFLE_SEED = 0
+_SCHEDULE_BLOCK_ROWS = 8
 
 _AXIS_LABELS = {
     "pool.A": "A",
@@ -111,10 +114,11 @@ class RunConfig:
         if (
             isinstance(raw_metric_fields, (str, bytes))
             or not isinstance(raw_metric_fields, list)
+            or not raw_metric_fields
             or any(not isinstance(name, str) or not name for name in raw_metric_fields)
             or len(set(raw_metric_fields)) != len(raw_metric_fields)
         ):
-            raise ConfigError("run.metric_fields must be an array of unique non-empty strings")
+            raise ConfigError("run.metric_fields must contain unique non-empty strings")
 
         placement = raw.get("placement", {})
         if not isinstance(placement, Mapping):
@@ -245,6 +249,37 @@ def _display_value(value: object) -> str:
     return f"{value:g}" if isinstance(value, float) else str(value)
 
 
+def _evaluator_batch_size(config: RunConfig, total: int) -> int:
+    lanes = max(1, len(config.hosts)) * max(1, len(config.numa_nodes))
+    return min(config.batch_size, max(1, (total + lanes - 1) // lanes))
+
+
+def _schedule_block_size(config: RunConfig, total: int) -> int:
+    return min(_SCHEDULE_BLOCK_ROWS, _evaluator_batch_size(config, total))
+
+
+def _shuffled_block_ranges(
+    total: int,
+    block_size: int,
+    workers: int,
+    *,
+    seed: int = _BLOCK_SHUFFLE_SEED,
+) -> tuple[tuple[tuple[int, int], ...], ...]:
+    """Assign reproducibly shuffled contiguous blocks round-robin."""
+    if total < 1 or block_size < 1 or workers < 1:
+        raise ValueError("total, block size, and worker count must be positive")
+    blocks = [
+        (start, min(total, start + block_size))
+        for start in range(0, total, block_size)
+    ]
+    random.Random(seed).shuffle(blocks)
+    return tuple(tuple(blocks[index::workers]) for index in range(workers))
+
+
+def _range_count(ranges: Iterable[tuple[int, int]]) -> int:
+    return sum(stop - start for start, stop in ranges)
+
+
 def grid_summary(config_path: str | Path) -> str:
     """Describe the configured Cartesian axes in their operator-facing units."""
     config = RunConfig.from_toml(config_path)
@@ -268,50 +303,18 @@ def grid_summary(config_path: str | Path) -> str:
         parts.append(f"{_AXIS_LABELS.get(name, name)} {span} ({len(values)} pts)")
     placement = ""
     if config.hosts:
-        lanes_per_blade = len(config.numa_nodes) or 1
-        per_lane, extra = divmod(total, len(config.hosts) * lanes_per_blade)
-        counts = [
-            per_lane * lanes_per_blade
-            + min(lanes_per_blade, max(0, extra - index * lanes_per_blade))
-            for index in range(len(config.hosts))
-        ]
+        blocks = _shuffled_block_ranges(
+            total, _schedule_block_size(config, total), len(config.hosts)
+        )
+        counts = [_range_count(worker) for worker in blocks]
         allocation = (
             str(counts[0])
             if min(counts) == max(counts)
             else f"{min(counts)}-{max(counts)}"
         )
-        placement = f" on {len(config.hosts)} blades ({allocation} pools/blade)"
+        placement = f" on {len(config.hosts)} workers ({allocation} pools/worker)"
     suffix = f": {', '.join(parts)}" if parts else ""
     return f"running {total} pools grid{placement}{suffix}"
-
-
-def candidate_from_spec(spec: CandidateSpec) -> Candidate:
-    payload = spec.payload
-    expected = {"policy_params", "pool"}
-    unknown = set(payload) - expected
-    missing = expected - set(payload)
-    if unknown or missing:
-        details = []
-        if missing:
-            details.append(f"missing {sorted(missing)}")
-        if unknown:
-            details.append(f"unknown {sorted(unknown)}")
-        raise ConfigError(
-            "candidate payload must contain only policy_params and pool ("
-            + "; ".join(details)
-            + ")"
-        )
-    policy_params = payload["policy_params"]
-    pool = payload["pool"]
-    if not isinstance(policy_params, (list, tuple)):
-        raise ConfigError("candidate.policy_params must be an array")
-    if not isinstance(pool, Mapping):
-        raise ConfigError("candidate.pool must be a mapping")
-    return Candidate(
-        candidate_id=spec.candidate_id,
-        policy_params=tuple(policy_params),
-        pool_overrides=pool,
-    )
 
 
 def stage_remote_run(config: RunConfig) -> str:
@@ -341,57 +344,36 @@ def stage_remote_run(config: RunConfig) -> str:
     return remote_config
 
 
-def placement_lanes(
+def _local_worker_lanes(
     config: RunConfig,
-    client_factory: ClientFactory | None = None,
     *,
-    stage_inputs: bool = True,
+    remote_paths: bool,
 ) -> tuple[PlacementLane, ...]:
-    """Resolve local, injected, or SSH evaluator lanes once for every workflow."""
-    if client_factory is not None:
-        return (PlacementLane("injected", client_factory),)
-    if config.hosts:
-        inputs = _execution_inputs(config, remote=True)
-        if stage_inputs:
-            stage_remote_run(config)
-        nodes: tuple[int | None, ...] = config.numa_nodes or (None,)
-        if config.workers < len(nodes):
-            raise ConfigError("run.workers must cover every configured NUMA node")
-        workers, extra = divmod(config.workers, len(nodes))
-        return tuple(
-            PlacementLane(
-                host if node is None else f"{host}:numa{node}",
-                ssh_client_factory(
-                    host,
-                    inputs["evaluator"],
-                    workers=workers + (index < extra),
-                    **(
-                        {}
-                        if node is None
-                        else {
-                            "remote_prefix": (
-                                "numactl",
-                                f"--cpunodebind={node}",
-                                f"--membind={node}",
-                            )
-                        }
-                    ),
-                    timeout=600.0,
-                    verify_local_inputs=False,
-                ),
-            )
-            for host in config.hosts
-            for index, node in enumerate(nodes)
-        )
-    return (
+    """Create the evaluator slots owned by one machine-local worker."""
+    inputs = _execution_inputs(config, remote=remote_paths)
+    nodes: tuple[int | None, ...] = config.numa_nodes or (None,)
+    if config.workers < len(nodes):
+        raise ConfigError("run.workers must cover every configured NUMA node")
+    workers, extra = divmod(config.workers, len(nodes))
+    return tuple(
         PlacementLane(
-            "local",
+            "local" if node is None else f"numa{node}",
             local_client_factory(
-                config.evaluator,
-                work_dir=config.path.parent,
-                workers=config.workers,
+                inputs["evaluator"],
+                work_dir=None if remote_paths else config.path.parent,
+                workers=workers + (index < extra),
+                launch_prefix=(
+                    (("env", "-u", "LD_LIBRARY_PATH") if remote_paths else ())
+                    + (() if node is None else (
+                        "numactl",
+                        f"--cpunodebind={node}",
+                        f"--membind={node}",
+                    ))
+                ),
+                timeout=600.0,
             ),
-        ),
+        )
+        for index, node in enumerate(nodes)
     )
 
 
@@ -536,117 +518,494 @@ def prepare_remote(config: RunConfig, *, transfer: bool, rebuild: bool) -> None:
     print("cluster: ready", file=sys.stderr)
 
 
+def _grid_request(config: RunConfig) -> tuple[Any, dict[str, Any]]:
+    grid = config.candidate.grid()
+    return grid, {
+        "candidate_defaults": config.candidate.defaults,
+        "axes": {
+            name: list(grid.axes[name])
+            for name in sorted(grid.axes)
+        },
+        "axis_order": list(sorted(grid.axes)),
+        "shape": list(grid.shape),
+    }
+
+
 def _run(
     config: RunConfig,
     output_dir: str | Path,
     *,
     client_factory: ClientFactory | None,
     progress_callback: ProgressCallback | None,
-    lane_callback: LaneCallback | None,
-    stage_inputs: bool,
-    origin_workspace: Path | None,
-    origin_config: Path | None,
 ) -> ArtifactPaths:
-    if config.hosts and not config.metric_fields:
-        raise ConfigError("remote grid runs require run.metric_fields")
-    lanes = placement_lanes(config, client_factory, stage_inputs=stage_inputs)
-    candidate_grid = config.candidate.grid()
-    candidate_from_spec(candidate_grid.candidate_at(0))
-    lane_count = len(lanes)
-    effective_batch = min(config.batch_size, (len(candidate_grid) + lane_count - 1) // lane_count)
-    metadata = run_metadata(
-        config,
-        effective_batch=effective_batch,
-        origin_workspace=origin_workspace,
-        origin_config=origin_config,
-    )
+    if config.hosts:
+        raise ConfigError("remote grids require the detached cluster runner")
+    grid, compact_grid = _grid_request(config)
+    total = len(grid)
+    batch_size = min(config.batch_size, total)
+    metadata = run_metadata(config, effective_batch=batch_size)
     metadata["execution_order"] = {
-        "kind": "rotating_blocks_striped_v1",
-        "block_size": effective_batch,
-        "rotations": lane_count,
+        "kind": "contiguous_ranges_v1",
+        "block_size": batch_size,
     }
+    factory = client_factory or local_client_factory(
+        config.evaluator,
+        work_dir=config.path.parent,
+        workers=config.workers,
+    )
     if client_factory is not None:
         metadata["placement"] = "injected"
-    open_session = metadata["open_session"]
-    total = len(candidate_grid)
-    metric_names = tuple(sorted(config.metric_fields)) or None
-    grid_request = (
-        {
-            "candidate_defaults": config.candidate.defaults,
-            "axes": {
-                name: list(candidate_grid.axes[name])
-                for name in sorted(candidate_grid.axes)
-            },
-            "axis_order": list(sorted(candidate_grid.axes)),
-            "shape": list(candidate_grid.shape),
-        }
-        if metric_names is not None
-        else None
-    )
     writer = GridResultWriter(
         output_dir,
         run_id=config.run_id,
         total=total,
         metadata=metadata,
-        metric_names=metric_names,
+        metric_names=config.metric_fields,
+    )
+    fleet = EvaluatorFleet(
+        (PlacementLane("injected" if client_factory else "local", factory),),
+        session_id=config.run_id,
+        open_session=metadata["open_session"],
+        metric_fields=tuple(sorted(config.metric_fields)),
+        grid=compact_grid,
     )
     with writer:
-        completed = 0
-        lane_failures: dict[str, int] = {}
-        if progress_callback is not None:
-            progress_callback(completed, total)
-        fleet = EvaluatorFleet(
-            lanes,
-            session_id=config.run_id,
-            batch_size=effective_batch,
-            start_ordinal=completed,
-            open_session=open_session,
-            metric_fields=metric_names,
-            lane_callback=lane_callback,
-            projected_grid=metric_names is not None,
-            grid=grid_request,
-        )
-
-        def stripe(index: int):
-            for ordinal, spec in candidate_grid.iter_stripe(
-                effective_batch, lane_count, index
-            ):
-                yield ordinal, candidate_from_spec(spec)
-
-        assignments = (
-            tuple(
-                candidate_grid.iter_stripe_ordinals(
-                    effective_batch, lane_count, index
-                )
-                for index in range(lane_count)
-            )
-            if metric_names is not None
-            else tuple(stripe(index) for index in range(lane_count))
-        )
         try:
-            for batch in fleet.iter_grid(assignments):
-                if batch.error is not None:
-                    failures = lane_failures.get(batch.lane, 0) + 1
-                    lane_failures[batch.lane] = failures
-                    if failures <= 4 or failures % 100 == 0:
-                        print(
-                            f"{batch.lane}: failed chunk {failures} "
-                            f"({batch.count} pools): {batch.error}",
-                            file=sys.stderr,
-                        )
-                if batch.projected is None:
-                    writer.append(batch.candidates, batch.results)
-                else:
-                    writer.append_projected(
-                        batch.ordinals,
-                        batch.projected,
-                    )
+            fleet.start()
+            completed = 0
+            if progress_callback is not None:
+                progress_callback(0, total)
+            blocks = (
+                (start, min(total, start + batch_size))
+                for start in range(0, total, batch_size)
+            )
+            for batch in fleet.iter_grid_ranges(blocks):
+                writer.append_projected(batch.ordinals, batch.projected)
                 completed += batch.count
                 if progress_callback is not None:
                     progress_callback(completed, total)
         finally:
             fleet.close()
         return writer.finalize()
+
+
+def _run_worker_partition(
+    config: RunConfig,
+    output_dir: Path,
+    *,
+    worker_index: int,
+    worker_count: int,
+    progress_callback: WorkerProgressCallback | None = None,
+) -> tuple[ArtifactPaths, float]:
+    grid, compact_grid = _grid_request(config)
+    total = len(grid)
+    batch_size = _evaluator_batch_size(config, total)
+    block_size = _schedule_block_size(config, total)
+    blocks = _shuffled_block_ranges(
+        total, block_size, worker_count
+    )[worker_index]
+    expected_count = _range_count(blocks)
+    if expected_count == 0:
+        raise ValueError("worker has no assigned grid blocks")
+    metric_names = tuple(sorted(config.metric_fields))
+    remote_paths = bool(config.hosts)
+    lanes = _local_worker_lanes(config, remote_paths=remote_paths)
+    writer = GridResultWriter(
+        output_dir,
+        run_id=config.run_id,
+        total=total,
+        expected_count=expected_count,
+        metadata={
+            "worker_index": worker_index,
+            "worker_count": worker_count,
+            "block_size": block_size,
+            "batch_size": batch_size,
+            "seed": _BLOCK_SHUFFLE_SEED,
+        },
+        metric_names=metric_names,
+    )
+    with writer:
+        fleet = EvaluatorFleet(
+            lanes,
+            session_id=config.run_id,
+            open_session=open_session_request(config, remote=remote_paths),
+            metric_fields=metric_names,
+            grid=compact_grid,
+        )
+        try:
+            fleet.start()
+            calculation_started = time.monotonic()
+            completed = 0
+            if progress_callback is not None:
+                progress_callback(0, expected_count, 0.0)
+            for batch in fleet.iter_grid_ranges(
+                blocks,
+                blocks_per_batch=max(1, batch_size // block_size),
+            ):
+                writer.append_projected(batch.ordinals, batch.projected)
+                completed += batch.count
+                if progress_callback is not None:
+                    progress_callback(
+                        completed,
+                        expected_count,
+                        time.monotonic() - calculation_started,
+                    )
+        finally:
+            fleet.close()
+        calculation_s = time.monotonic() - calculation_started
+        return writer.finalize(), calculation_s
+
+
+def _copy_partition(source: ArtifactPaths, destination: Path) -> None:
+    if destination.exists():
+        raise FileExistsError(f"worker partition already exists: {destination}")
+    destination.mkdir(parents=True)
+    try:
+        for source_path, name in (
+            (source.results_npz, "results.npz"),
+            (source.run_json, "run.json"),
+        ):
+            target = destination / name
+            temporary = destination / f".{name}.tmp"
+            shutil.copyfile(source_path, temporary)
+            os.replace(temporary, target)
+    except BaseException:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
+
+
+def run_worker_partition(
+    config_path: str | Path,
+    output_dir: str | Path,
+    *,
+    worker_index: int,
+    worker_count: int,
+    progress_callback: WorkerProgressCallback | None = None,
+) -> dict[str, Any]:
+    """Evaluate one portable worker assignment and publish one local partition."""
+    config = RunConfig.from_toml(config_path)
+    if worker_count < 1 or worker_index < 0 or worker_index >= worker_count:
+        raise ConfigError("worker index must be in [0, worker_count)")
+    destination = Path(output_dir).resolve()
+    started = time.monotonic()
+    paths, calculation_s = _run_worker_partition(
+        config,
+        destination,
+        worker_index=worker_index,
+        worker_count=worker_count,
+        progress_callback=progress_callback,
+    )
+    receipt = json.loads(paths.run_json.read_text())
+    return {
+        "type": "complete",
+        "worker_index": worker_index,
+        "count": receipt["partition_count"],
+        "status_counts": receipt["status_counts"],
+        "elapsed_s": time.monotonic() - started,
+        "calculation_s": calculation_s,
+        "output": str(destination),
+    }
+
+
+class _ClusterProgress:
+    """Aggregate low-rate worker heartbeats into one stable cluster ETA."""
+
+    def __init__(self, total: int, workers: int, interval: float = 2.0) -> None:
+        self.total = total
+        self.workers = workers
+        self.interval = interval
+        self._states: dict[int, tuple[int, int, float, bool]] = {}
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._heartbeat, daemon=True)
+        self._thread.start()
+
+    def update(self, worker: int, message: Mapping[str, Any]) -> None:
+        with self._lock:
+            self._states[worker] = (
+                int(message["completed"]),
+                int(message["total"]),
+                float(message["calculation_s"]),
+                message.get("type") == "complete",
+            )
+
+    def _heartbeat(self) -> None:
+        while not self._stop.wait(self.interval):
+            self.write()
+
+    def write(self) -> None:
+        with self._lock:
+            states = tuple(self._states.values())
+        if not states:
+            return
+        completed = sum(state[0] for state in states)
+        rates = [
+            done / elapsed
+            for done, _total, elapsed, _complete in states
+            if done > 0 and elapsed > 0.0
+        ]
+        eta_values = [
+            (worker_total - done) / (done / elapsed)
+            for done, worker_total, elapsed, complete in states
+            if not complete and done > 0 and elapsed > 0.0
+        ]
+        rate = sum(rates)
+        eta = max(eta_values) if len(states) == self.workers and eta_values else None
+        percent = min(100, int(completed * 100 / self.total))
+        eta_text = "--" if eta is None else f"{eta:.1f}s"
+        complete_workers = sum(state[3] for state in states)
+        print(
+            f"run: {completed}/{self.total} ({percent}%) "
+            f"{rate:.1f} pools/s ETA {eta_text} "
+            f"({complete_workers}/{self.workers} workers complete)",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join()
+        self.write()
+
+
+def run_distributed_config(
+    config_path: str | Path,
+    output_dir: str | Path,
+    *,
+    origin_workspace: str | Path | None = None,
+    origin_config: str | Path | None = None,
+) -> ArtifactPaths:
+    """Launch one portable machine worker per placement and merge its partition."""
+    config = RunConfig.from_toml(config_path)
+    if not config.hosts or not config.metric_fields:
+        raise ConfigError("distributed grids require hosts and metric fields")
+    total = len(config.candidate.grid())
+    batch_size = _evaluator_batch_size(config, total)
+    block_size = _schedule_block_size(config, total)
+    blocks = _shuffled_block_ranges(total, block_size, len(config.hosts))
+    active = [
+        (index, host, _range_count(blocks[index]))
+        for index, host in enumerate(config.hosts)
+        if blocks[index]
+    ]
+    destination = Path(output_dir).resolve()
+    partition_root = destination / ".partitions"
+    if partition_root.exists():
+        raise FileExistsError(f"partition staging already exists: {partition_root}")
+    partition_root.mkdir(parents=True)
+
+    remote_project = str(REMOTE_BASE / "curve-fx-optimization")
+    remote_shell = f"{remote_project}/shell.nix"
+    remote_python = f"{remote_project}/scripts/cluster-python"
+    python_path = (
+        f"{remote_project}/src:"
+        f"{REMOTE_BASE}/curve-fx-arb-harness/python/src:"
+        f"{remote_project}/.venv-cluster/lib/python3.12/site-packages"
+    )
+    coordinator = config.hosts[0]
+    progress = _ClusterProgress(total, len(active))
+
+    def run_worker(index: int, host: str, expected: int) -> tuple[str, dict[str, Any]]:
+        partition = f"{destination}.worker-{index:03d}"
+        worker = [
+            remote_python, "-m", "fxopt.cli", "_worker",
+            str(config.path), "--output", str(partition),
+            "--worker-index", str(index),
+            "--worker-count", str(len(config.hosts)),
+        ]
+        remote_script = " ".join((
+            "set -euo pipefail;",
+            f"export PYTHONPATH={shlex.quote(python_path)};",
+            "export PYTHONNOUSERSITE=1;",
+            "exec " + shlex.join(worker),
+        ))
+        remote_command = (
+            f"nix-shell {shlex.quote(remote_shell)} "
+            f"--run {shlex.quote(remote_script)}"
+        )
+        command = (
+            ["/bin/sh", "-lc", remote_script]
+            if host == coordinator
+            else ["ssh", *SSH_OPTIONS, "--", host, remote_command]
+        )
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert process.stdout is not None
+        receipt: dict[str, Any] | None = None
+        tail: list[str] = []
+        for raw_line in process.stdout:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                tail = [*tail[-4:], line]
+                continue
+            if not isinstance(message, Mapping) or message.get("worker_index") != index:
+                tail = [*tail[-4:], line]
+                continue
+            if message.get("type") == "progress":
+                progress.update(index, message)
+            elif message.get("type") == "complete":
+                receipt = dict(message)
+        return_code = process.wait()
+        if return_code != 0:
+            detail = " | ".join(tail[-5:])
+            raise RuntimeError(f"{host} worker failed: {detail}")
+        if receipt is None:
+            raise RuntimeError(f"{host} worker returned an invalid receipt")
+        if (
+            receipt.get("count") != expected
+            or receipt.get("output") != partition
+        ):
+            raise RuntimeError(f"{host} worker receipt does not match its assignment")
+        progress.update(index, {
+            "type": "complete",
+            "completed": expected,
+            "total": expected,
+            "calculation_s": receipt["calculation_s"],
+        })
+        return host, receipt
+
+    def fetch_partition(index: int, host: str, receipt: Mapping[str, Any]) -> Path:
+        source = Path(str(receipt["output"]))
+        if (
+            not str(source).startswith("/tmp/fxopt-grid.")
+            or source.name != f"{destination.name}.worker-{index:03d}"
+        ):
+            raise RuntimeError(f"{host} returned an invalid partition path")
+        target = partition_root / f"worker-{index:03d}"
+        if host == coordinator:
+            _copy_partition(
+                ArtifactPaths(source / "run.json", source / "results.npz"),
+                target,
+            )
+            shutil.rmtree(source)
+            return target
+        target.mkdir()
+        fetched = subprocess.run(
+            [
+                "rsync", "-a", "--partial",
+                "--include=/run.json", "--include=/results.npz", "--exclude=*",
+                "-e", RSYNC_SSH, "--", f"{host}:{source}/", f"{target}/",
+            ],
+            check=False,
+        )
+        if fetched.returncode != 0:
+            raise subprocess.CalledProcessError(fetched.returncode, fetched.args)
+        if not (target / "run.json").is_file() or not (target / "results.npz").is_file():
+            raise RuntimeError(f"{host} partition fetch is incomplete")
+        cleanup = subprocess.run(
+            ["ssh", *SSH_OPTIONS, "--", host, "rm", "-rf", "--", str(source)],
+            check=False,
+        )
+        if cleanup.returncode != 0:
+            print(f"cluster: warning: retained {host}:{source}", file=sys.stderr)
+        return target
+
+    started = time.monotonic()
+    partitions: dict[int, Path] = {}
+    receipts: dict[int, tuple[str, dict[str, Any]]] = {}
+    progress_closed = False
+    try:
+        print(
+            f"coordinator: assigned {sum(len(worker) for worker in blocks)} "
+            f"shuffled blocks to {len(active)} workers...",
+            file=sys.stderr,
+        )
+        errors: list[str] = []
+        fetches: dict[Any, int] = {}
+        with ThreadPoolExecutor(max_workers=len(active)) as executor, \
+                ThreadPoolExecutor(max_workers=min(4, len(active))) as fetcher:
+            futures = {
+                executor.submit(run_worker, index, host, expected): (index, host)
+                for index, host, expected in active
+            }
+            for future in as_completed(futures):
+                index, host = futures[future]
+                try:
+                    _host, receipt = future.result()
+                except Exception as exc:
+                    errors.append(f"{host}: {exc}")
+                    continue
+                receipts[index] = (host, receipt)
+                fetches[fetcher.submit(fetch_partition, index, host, receipt)] = index
+            for future in as_completed(fetches):
+                index = fetches[future]
+                try:
+                    partitions[index] = future.result()
+                except Exception as exc:
+                    errors.append(f"worker {index} fetch: {exc}")
+        if errors:
+            raise RuntimeError("cluster worker failure: " + " | ".join(errors))
+        progress.close()
+        progress_closed = True
+
+        metadata = run_metadata(
+            config,
+            effective_batch=batch_size,
+            origin_workspace=(
+                None if origin_workspace is None else Path(origin_workspace).resolve()
+            ),
+            origin_config=(
+                None if origin_config is None else Path(origin_config).resolve()
+            ),
+        )
+        metadata["placement"] = "machine_workers"
+        metadata["execution_order"] = {
+            "kind": "seeded_shuffled_blocks_v1",
+            "block_size": block_size,
+            "batch_size": batch_size,
+            "seed": _BLOCK_SHUFFLE_SEED,
+            "worker_count": len(config.hosts),
+        }
+        metadata["worker_stats"] = [
+            {
+                "worker_index": index,
+                "host": host,
+                "count": receipt["count"],
+                "elapsed_s": receipt["elapsed_s"],
+                "calculation_s": receipt["calculation_s"],
+                "status_counts": receipt["status_counts"],
+            }
+            for index, (host, receipt) in sorted(receipts.items())
+        ]
+        metadata["transport"] = "heartbeat_and_partition"
+        calculation_times = [
+            float(receipt["calculation_s"])
+            for _host, receipt in receipts.values()
+        ]
+        print(
+            f"coordinator: worker calculation range "
+            f"{min(calculation_times):.1f}-{max(calculation_times):.1f}s",
+            file=sys.stderr,
+        )
+        print("coordinator: merging worker partitions...", file=sys.stderr)
+        paths = merge_grid_partitions(
+            output_dir,
+            [partitions[index] for index, _host, _count in active],
+            run_id=config.run_id,
+            total=total,
+            metadata=metadata,
+            metric_names=config.metric_fields,
+        )
+        elapsed = time.monotonic() - started
+        print(
+            f"coordinator: complete {total} pools in {elapsed:.1f}s "
+            f"({total / elapsed:.1f} pools/s wall)",
+            file=sys.stderr,
+        )
+        return paths
+    finally:
+        if not progress_closed:
+            progress.close()
+        shutil.rmtree(partition_root, ignore_errors=True)
 
 
 def _remote_paths(output_dir: str | Path) -> tuple[Path, ArtifactPaths, Path]:
@@ -716,7 +1075,6 @@ def _start_remote_job(
     *,
     transfer: bool,
     rebuild: bool,
-    stream_blade: str | None,
 ) -> RemoteJob:
     destination, paths, job_path = _remote_paths(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
@@ -752,30 +1110,21 @@ def _start_remote_job(
     )
     workspace = optimizer_root.parent.resolve()
     remote_project = str(REMOTE_BASE / "curve-fx-optimization")
-    remote_uv = "/home/heswithme/.nix-profile/bin/uv"
-    remote_python = "/home/heswithme/.nix-profile/bin/python3"
-    remote_venv = f"{remote_project}/.venv-cluster"
     worker = [
-        f"{remote_venv}/bin/python",
+        f"{remote_project}/scripts/cluster-python",
         "-m", "fxopt.cli", "_cluster-worker", remote_config,
         "--output", remote_output,
         "--origin-workspace", str(workspace),
         "--origin-config", str(config.path),
     ]
-    if stream_blade is not None:
-        worker.extend(("--stream-blade", stream_blade))
     remote_script = " ".join((
         "set -euo pipefail;",
-        f"export UV_PROJECT_ENVIRONMENT={shlex.quote(remote_venv)};",
-        f"export UV_CACHE_DIR={shlex.quote('/tmp/uv-cache')};",
-        f"{shlex.quote(remote_uv)} sync --quiet --project "
-        f"{shlex.quote(remote_project)} --only-group cluster --frozen "
-        f"--python {shlex.quote(remote_python)} --no-python-downloads "
-        "--link-mode copy;",
         "export PYTHONPATH=" + shlex.quote(
             f"{remote_project}/src:"
-            f"{REMOTE_BASE}/curve-fx-arb-harness/python/src"
+            f"{REMOTE_BASE}/curve-fx-arb-harness/python/src:"
+            f"{remote_project}/.venv-cluster/lib/python3.12/site-packages"
         ) + ";",
+        "export PYTHONNOUSERSITE=1;",
         "exec " + shlex.join(worker),
     ))
     remote_command = (
@@ -1075,20 +1424,16 @@ def run_remote_config(
     *,
     transfer: bool = False,
     rebuild: bool = False,
-    stream_blade: str | None = None,
 ) -> ArtifactPaths:
     """Launch, follow, and retrieve one disconnect-safe remote grid."""
     config = RunConfig.from_toml(config_path)
     if not config.hosts:
         raise ConfigError("remote coordinator requires placement hosts")
-    if stream_blade is not None and stream_blade not in config.hosts:
-        raise ConfigError(f"--stream-blade is not a placement host: {stream_blade}")
     job = _start_remote_job(
         config,
         output_dir,
         transfer=transfer,
         rebuild=rebuild,
-        stream_blade=stream_blade,
     )
     destination = Path(output_dir).expanduser().resolve()
     return _follow_and_retrieve(config, destination, job, from_start=True)
@@ -1100,37 +1445,18 @@ def run_config(
     *,
     client_factory: ClientFactory | None = None,
     progress_callback: ProgressCallback | None = None,
-    lane_callback: LaneCallback | None = None,
     transfer: bool = False,
     rebuild: bool = False,
-    prepared: bool = False,
-    origin_workspace: str | Path | None = None,
-    origin_config: str | Path | None = None,
 ) -> ArtifactPaths:
-    """Run every grid point in bounded batches and publish the two artifacts."""
+    """Run one local grid and atomically publish its two artifacts."""
     config = RunConfig.from_toml(config_path)
-    if client_factory is None and prepared and config.hosts:
-        print(
-            f"coordinator: checking {len(config.hosts)} direct blades...",
-            file=sys.stderr,
-        )
-        require_reachable_hosts(config.hosts)
-    if client_factory is None and not prepared:
-        prepare_remote(config, transfer=transfer, rebuild=rebuild)
-    output_path = Path(output_dir).expanduser().resolve()
+    if transfer or rebuild:
+        raise ConfigError("--transfer and --rebuild require remote placement hosts")
     return _run(
         config,
-        output_path,
+        Path(output_dir).expanduser().resolve(),
         client_factory=client_factory,
         progress_callback=progress_callback,
-        lane_callback=lane_callback,
-        stage_inputs=not prepared,
-        origin_workspace=(
-            None if origin_workspace is None else Path(origin_workspace).expanduser().resolve()
-        ),
-        origin_config=(
-            None if origin_config is None else Path(origin_config).expanduser().resolve()
-        ),
     )
 
 
@@ -1139,15 +1465,14 @@ __all__ = [
     "RunConfig",
     "RemoteRunStatus",
     "REMOTE_JOB_FILENAME",
-    "candidate_from_spec",
     "grid_summary",
     "open_session_request",
-    "placement_lanes",
     "ProgressCallback",
     "remote_run_status",
     "retrieve_remote_run",
     "run_config",
     "run_remote_config",
+    "run_worker_partition",
     "run_metadata",
     "stage_remote_run",
 ]

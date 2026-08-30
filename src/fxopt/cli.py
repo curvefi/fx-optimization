@@ -1,8 +1,9 @@
-"""One small CLI for grids, optimization, heatmaps, and Shift-click replay."""
+"""One small CLI for grids, heatmaps, and Shift-click replay."""
 
 from pathlib import Path
 import json
 import platform
+import shutil
 import subprocess
 import threading
 import time
@@ -11,15 +12,37 @@ import click
 
 from .config import ConfigError
 from .run import (
+    REMOTE_JOB_FILENAME,
     RunConfig,
     follow_remote_run,
     grid_summary,
     remote_run_status,
     retrieve_remote_run,
     run_config,
+    run_distributed_config,
     run_remote_config,
+    run_worker_partition,
     stop_remote_run,
 )
+
+
+def _overwrite_output(config: Path, output: Path) -> None:
+    destination = output.expanduser().resolve()
+    if not destination.exists():
+        return
+    if not destination.is_dir():
+        raise ConfigError("--overwrite output must be a directory")
+    if destination in config.resolve().parents:
+        raise ConfigError("--overwrite refuses to remove a configuration ancestor")
+    if (destination / REMOTE_JOB_FILENAME).exists():
+        raise ConfigError(
+            "--overwrite refuses a detached remote job; use --status or --stop first"
+        )
+    entries = tuple(destination.iterdir())
+    markers = {"run.json", "results.npz", ".results.npz.tmp"}
+    if entries and not any((destination / name).exists() for name in markers):
+        raise ConfigError("--overwrite target is not an fxopt run directory")
+    shutil.rmtree(destination)
 
 
 class _ProgressReporter:
@@ -27,17 +50,9 @@ class _ProgressReporter:
         self,
         label: str,
         *,
-        stream_blade: str | None = None,
-        blade_index: int = 0,
-        blade_count: int = 1,
-        lanes_per_blade: int = 1,
         _interval: float = 10.0,
     ) -> None:
         self.label = label
-        self.stream_blade = stream_blade
-        self.blade_index = blade_index
-        self.blade_count = blade_count
-        self.lanes_per_blade = lanes_per_blade
         self.interval = _interval
         self.started_at = time.monotonic()
         self.latest: tuple[int, int] | None = None
@@ -49,19 +64,13 @@ class _ProgressReporter:
         self.thread = threading.Thread(target=self._heartbeat, daemon=True)
         self.started = False
         self.baseline_completed: int | None = None
-        self.blade_completed = 0
-        self.blade_total = 0
-        self.blade_lane_started_at: dict[str, float] = {}
-        self.blade_lane_completed_at: dict[str, float] = {}
-        self.blade_lane_completed: dict[str, int] = {}
 
     def start(self) -> None:
         if self.started:
             return
         self.started = True
         self.started_at = time.monotonic()
-        if self.stream_blade is None:
-            self.thread.start()
+        self.thread.start()
 
     def __call__(self, completed: int, total: int) -> None:
         self.start()
@@ -69,44 +78,14 @@ class _ProgressReporter:
             if self.baseline_completed is None:
                 self.baseline_completed = completed
             self.latest = (completed, total)
-            if self.stream_blade is not None:
-                self.blade_total = self._blade_share(total)
             final = completed >= total
             if self.finished:
-                return
-            if self.stream_blade is not None:
-                if not self.initial_printed:
-                    self._write_blade()
-                    self.initial_printed = True
-                self.finished = final
                 return
             if not self.initial_printed or final:
                 self._write(completed, total)
                 self.last_reported_completed = completed
                 self.initial_printed = True
             self.finished = final
-
-    def lane(self, name: str, count: int, elapsed: float) -> None:
-        """Aggregate completed NUMA batches for one representative blade."""
-        with self.lock:
-            if self.stream_blade is None or name.split(":", 1)[0] != self.stream_blade:
-                return
-            now = time.monotonic()
-            if elapsed > 0.0:
-                self.blade_lane_started_at.setdefault(name, now - elapsed)
-                self.blade_lane_completed_at[name] = now
-                self.blade_lane_completed[name] = (
-                    self.blade_lane_completed.get(name, 0) + count
-                )
-            self.blade_completed = min(self.blade_total, self.blade_completed + count)
-            self._write_blade(now=now)
-
-    def _blade_share(self, total: int) -> int:
-        lane_count = self.blade_count * self.lanes_per_blade
-        per_lane, extra = divmod(total, lane_count)
-        first_lane = self.blade_index * self.lanes_per_blade
-        blade_extra = min(self.lanes_per_blade, max(0, extra - first_lane))
-        return per_lane * self.lanes_per_blade + blade_extra
 
     def _heartbeat(self) -> None:
         while not self.stop_event.wait(self.interval):
@@ -117,41 +96,6 @@ class _ProgressReporter:
                     self._write(completed, total, working=stale)
                     if not stale:
                         self.last_reported_completed = completed
-
-    def _write_blade(self, *, now: float | None = None) -> None:
-        now = time.monotonic() if now is None else now
-        if not self.blade_lane_started_at:
-            elapsed = max(0.0, now - self.started_at)
-            click.echo(
-                f"{self.stream_blade}: waiting for first batch... elapsed {elapsed:.1f}s",
-                err=True,
-            )
-            return
-        rate = self._blade_rate()
-        remaining = max(0, self.blade_total - self.blade_completed)
-        eta = remaining / rate if rate > 0 else None
-        eta_text = "--" if eta is None else f"{eta:.1f}s"
-        percent = (
-            min(100, int(self.blade_completed * 100 / self.blade_total))
-            if self.blade_total
-            else 100
-        )
-        click.echo(
-            f"{self.stream_blade}: {self.blade_completed}/{self.blade_total} "
-            f"({percent}%) {rate:.1f} pools/s ETA {eta_text}",
-            err=True,
-        )
-
-    def _blade_rate(self) -> float:
-        rate = 0.0
-        for name, completed in self.blade_lane_completed.items():
-            elapsed = (
-                self.blade_lane_completed_at[name]
-                - self.blade_lane_started_at[name]
-            )
-            if elapsed > 0.0:
-                rate += completed / elapsed
-        return rate
 
     def _write(self, completed: int, total: int, *, working: bool = False) -> None:
         now = time.monotonic()
@@ -180,21 +124,43 @@ class _ProgressReporter:
         if self.thread.is_alive():
             self.thread.join()
 
-    def completion_summary(self, counts: dict[str, int]) -> str:
-        elapsed = max(0.0, time.monotonic() - self.started_at)
-        total = sum(counts.values())
-        cluster_rate = total / elapsed if elapsed > 0 else 0.0
-        blade_rate = self._blade_rate()
-        summary = (
-            f"complete {total} pools in {elapsed:.1f}s, "
-            f"{cluster_rate:.1f} pools/s cluster wall"
-        )
-        if self.stream_blade is not None:
-            summary += f", {blade_rate:.1f} pools/s {self.stream_blade} calc"
-        return (
-            summary
-            + f" ({counts.get('ok', 0)} ok, {counts.get('failed', 0)} failed)"
-        )
+
+class _WorkerReporter:
+    def __init__(self, worker_index: int, interval: float = 2.0) -> None:
+        self.worker_index = worker_index
+        self.interval = interval
+        self.latest: tuple[int, int, float] | None = None
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._heartbeat, daemon=True)
+        self.started = False
+
+    def __call__(self, completed: int, total: int, calculation_s: float) -> None:
+        with self.lock:
+            self.latest = (completed, total, calculation_s)
+            if not self.started:
+                self.started = True
+                self.thread.start()
+
+    def _heartbeat(self) -> None:
+        while not self.stop_event.wait(self.interval):
+            with self.lock:
+                latest = self.latest
+            if latest is None:
+                continue
+            completed, total, calculation_s = latest
+            click.echo(json.dumps({
+                "type": "progress",
+                "worker_index": self.worker_index,
+                "completed": completed,
+                "total": total,
+                "calculation_s": calculation_s,
+            }, sort_keys=True, separators=(",", ":")))
+
+    def close(self) -> None:
+        self.stop_event.set()
+        if self.thread.is_alive():
+            self.thread.join()
 
 
 @click.group()
@@ -213,21 +179,21 @@ def main() -> None:
 )
 @click.option("--transfer", is_flag=True, help="Rsync workspace sources once into shared home.")
 @click.option("--rebuild", is_flag=True, help="Transfer and rebuild the shared evaluator once.")
-@click.option("--stream-blade", help="Show progress and ETA for one representative blade.")
 @click.option("--status", "status_only", is_flag=True, help="Check detached remote state once.")
 @click.option("--follow", is_flag=True, help="Follow a detached job, then retrieve it.")
 @click.option("--retrieve", is_flag=True, help="Retrieve an already-complete remote job.")
 @click.option("--stop", "stop_only", is_flag=True, help="Stop a detached remote job.")
+@click.option("--overwrite", is_flag=True, help="Replace an existing completed run directory.")
 def run_command(
     config: Path,
     output_dir: Path,
     transfer: bool,
     rebuild: bool,
-    stream_blade: str | None,
     status_only: bool,
     follow: bool,
     retrieve: bool,
     stop_only: bool,
+    overwrite: bool,
 ) -> None:
     """Run CONFIG or manage its detached remote coordinator."""
     reporter: _ProgressReporter | None = None
@@ -238,10 +204,12 @@ def run_command(
             raise ConfigError(
                 "--status, --follow, --retrieve, and --stop are mutually exclusive"
             )
+        if overwrite and modes:
+            raise ConfigError("--overwrite cannot be combined with remote job controls")
         if modes and not config_value.hosts:
             raise ConfigError("remote job controls require placement hosts")
-        if stream_blade is not None and stream_blade not in config_value.hosts:
-            raise ConfigError(f"--stream-blade is not a placement host: {stream_blade}")
+        if overwrite:
+            _overwrite_output(config, output_dir)
         if status_only:
             status = remote_run_status(config, output_dir)
             location = (
@@ -276,7 +244,6 @@ def run_command(
                 output_dir,
                 transfer=transfer,
                 rebuild=rebuild,
-                stream_blade=stream_blade,
             )
         elif not modes:
             reporter = _ProgressReporter("run")
@@ -284,7 +251,6 @@ def run_command(
                 config,
                 output_dir,
                 progress_callback=reporter,
-                lane_callback=reporter.lane,
                 transfer=transfer,
                 rebuild=rebuild,
             )
@@ -307,68 +273,60 @@ def run_command(
 @click.argument("config", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--output", "output_dir", required=True,
               type=click.Path(file_okay=False, path_type=Path))
-@click.option("--stream-blade")
 @click.option("--origin-workspace", required=True, type=click.Path(path_type=Path))
 @click.option("--origin-config", required=True, type=click.Path(path_type=Path))
 def cluster_worker_command(
     config: Path,
     output_dir: Path,
-    stream_blade: str | None,
     origin_workspace: Path,
     origin_config: Path,
 ) -> None:
-    """Run one already-staged grid from a coordinator blade."""
-    config_value = RunConfig.from_toml(config)
-    if stream_blade is not None and stream_blade not in config_value.hosts:
-        raise click.ClickException(
-            f"--stream-blade is not a placement host: {stream_blade}"
-        )
-    reporter = _ProgressReporter(
-        "run",
-        stream_blade=stream_blade,
-        blade_index=(config_value.hosts.index(stream_blade) if stream_blade else 0),
-        blade_count=max(1, len(config_value.hosts)),
-        lanes_per_blade=max(1, len(config_value.numa_nodes)),
-    )
+    """Coordinate one portable worker process per configured placement."""
     try:
-        paths = run_config(
+        paths = run_distributed_config(
             config,
             output_dir,
-            progress_callback=reporter,
-            lane_callback=reporter.lane,
-            prepared=True,
             origin_workspace=origin_workspace,
             origin_config=origin_config,
         )
     except (ConfigError, OSError, RuntimeError, TypeError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
-    finally:
-        reporter.close()
     payload = json.loads(paths.run_json.read_text())
     counts = payload.get("status_counts", {})
-    click.echo(f"coordinator: {reporter.completion_summary(counts)}", err=True)
     click.echo(
-        f"coordinator: wrote {paths.run_json} and {paths.results_npz}",
+        f"coordinator: wrote {paths.run_json} and {paths.results_npz} "
+        f"({counts.get('ok', 0)} ok, {counts.get('failed', 0)} failed)",
         err=True,
     )
 
 
-@main.command("optimize")
+@main.command("_worker", hidden=True)
 @click.argument("config", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--output", "output_dir", required=True,
               type=click.Path(file_okay=False, path_type=Path))
-def optimize_command(config: Path, output_dir: Path) -> None:
-    """Run Nevergrad from CONFIG through the same evaluator fleet."""
-    from .optimize import OptimizationError, optimize_config
-
-    reporter = _ProgressReporter("optimize")
+@click.option("--worker-index", required=True, type=click.IntRange(min=0))
+@click.option("--worker-count", required=True, type=click.IntRange(min=1))
+def worker_command(
+    config: Path,
+    output_dir: Path,
+    worker_index: int,
+    worker_count: int,
+) -> None:
+    """Evaluate one deterministic machine-worker partition."""
+    reporter = _WorkerReporter(worker_index)
     try:
-        paths = optimize_config(config, output_dir, progress_callback=reporter)
-    except (ConfigError, OptimizationError, OSError, TypeError, ValueError) as exc:
+        receipt = run_worker_partition(
+            config,
+            output_dir,
+            worker_index=worker_index,
+            worker_count=worker_count,
+            progress_callback=reporter,
+        )
+    except (ConfigError, OSError, RuntimeError, TypeError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
         reporter.close()
-    click.echo(f"wrote {paths.run_json} and {paths.results_npz}")
+    click.echo(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
 
 
 @main.command("heatmap")

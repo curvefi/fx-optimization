@@ -1,4 +1,4 @@
-"""Current research score used by adaptive optimization."""
+"""Research scores derived from completed Cartesian grids."""
 
 from __future__ import annotations
 

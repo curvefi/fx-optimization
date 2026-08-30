@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+python_root=${FXOPT_CLUSTER_PYTHON:-/home/heswithme/arb/tools/python/cpython-3.12.12-linux-x86_64-gnu}
+loader=$(cat "$NIX_CC/nix-support/dynamic-linker")
+library_path=$(dirname "$loader")
+if test -n "${LD_LIBRARY_PATH:-}"; then
+    library_path="$library_path:$LD_LIBRARY_PATH"
+fi
+exec "$loader" --library-path "$library_path" "$python_root/bin/python3" "$@"

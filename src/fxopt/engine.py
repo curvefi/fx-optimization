@@ -1,4 +1,4 @@
-"""Persistent evaluator lifecycle for single-point, grid, and adaptive callers."""
+"""Persistent evaluator lifecycle for registered grids and arbitrary points."""
 
 from __future__ import annotations
 
@@ -17,6 +17,10 @@ class EvaluatorClient(Protocol):
     def start(self) -> Any: ...
 
     def open_session(self, session_id: str, **request: Any) -> Any: ...
+
+    def register_grid(
+        self, grid_id: str, grid: Mapping[str, Any], **request: Any
+    ) -> Any: ...
 
     def evaluate_batch(self, candidates: Sequence[Mapping[str, Any]], **request: Any) -> Any: ...
 
@@ -38,10 +42,14 @@ class ProjectedBatch:
 
 def _projected_row(
     value: Any,
-    candidate_id: str,
+    ordinal: int,
     metric_count: int,
 ) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping) or value.get("candidate_id") != candidate_id:
+    if (
+        not isinstance(value, Mapping)
+        or value.get("ordinal") != ordinal
+        or value.get("candidate_id") != candidate_id(ordinal)
+    ):
         raise ValueError("projected evaluator results must preserve input order")
     status = value.get("status", "ok")
     if status not in {"ok", "failed", "cancelled"}:
@@ -122,8 +130,12 @@ def _normalize_result(
     )
 
 
-class OptimizerEngine:
-    """Keep one evaluator process and one open session across repeated batches."""
+class EvaluatorSession:
+    """Keep one evaluator process and one immutable session across requests.
+
+    ``evaluate`` is the small point-batch seam for replay or a future adaptive
+    driver. Registered-grid range evaluation is the specialized bulk path.
+    """
 
     def __init__(
         self,
@@ -166,6 +178,7 @@ class OptimizerEngine:
         if observation is not None:
             self._batch_request["observation"] = dict(observation)
         self._grid = None if grid is None else dict(grid)
+        self._grid_id = "grid"
         self._client: EvaluatorClient | None = None
         self._started = False
         self._session_open = False
@@ -188,6 +201,17 @@ class OptimizerEngine:
         try:
             hello = self._client.start()
             self._client.open_session(self.session_id, **self._open_request)
+            if self._grid is not None:
+                ready = self._client.register_grid(
+                    self._grid_id,
+                    self._grid,
+                    session_id=self.session_id,
+                )
+                expected = 1
+                for length in self._grid.get("shape", ()):
+                    expected *= length
+                if _response_field(ready, "candidate_count") != expected:
+                    raise ValueError("registered grid size does not match its shape")
         except Exception:
             self._client.shutdown()
             self._client = None
@@ -274,18 +298,26 @@ class OptimizerEngine:
         self._next_ordinal += len(items)
         return results
 
-    def evaluate_projected_grid(self, ordinals: Sequence[int]) -> ProjectedBatch:
-        """Evaluate canonical Cartesian ordinals without Python candidates."""
+    def evaluate_projected_ranges(
+        self,
+        ranges: Sequence[tuple[int, int]],
+    ) -> ProjectedBatch:
+        """Evaluate ordered, disjoint canonical ordinal ranges."""
         if self._grid is None or self._metric_fields is None:
             raise ValueError("projected grid evaluation requires grid metadata")
+        ordinals = tuple(
+            ordinal
+            for start, count in ranges
+            for ordinal in range(start, start + count)
+        )
         if not ordinals:
             return ProjectedBatch(self._metric_fields, ())
         self.start()
         assert self._client is not None
         request = dict(self._batch_request)
         request["session_id"] = self.session_id
-        request["grid"] = self._grid
-        request["ordinals"] = list(ordinals)
+        request["grid_id"] = self._grid_id
+        request["ranges"] = [list(item) for item in ranges]
         response = self._client.evaluate_batch([], **request)
         if tuple(_response_field(response, "metric_fields") or ()) != self._metric_fields:
             raise ValueError("evaluator metric_fields do not match the request")
@@ -296,7 +328,7 @@ class OptimizerEngine:
         if len(rows) != len(ordinals):
             raise ValueError("evaluator returned the wrong number of grid results")
         validated = tuple(
-            _projected_row(row, candidate_id(ordinal), len(self._metric_fields))
+            _projected_row(row, ordinal, len(self._metric_fields))
             for ordinal, row in zip(ordinals, rows, strict=True)
         )
         return ProjectedBatch(self._metric_fields, validated)
@@ -317,7 +349,7 @@ class OptimizerEngine:
                 client.shutdown()
             self._started = False
 
-    def __enter__(self) -> "OptimizerEngine":
+    def __enter__(self) -> "EvaluatorSession":
         self.start()
         return self
 
@@ -325,4 +357,4 @@ class OptimizerEngine:
         self.close()
 
 
-__all__ = ["ClientFactory", "EvaluatorClient", "OptimizerEngine", "ProjectedBatch"]
+__all__ = ["ClientFactory", "EvaluatorClient", "EvaluatorSession", "ProjectedBatch"]
