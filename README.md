@@ -60,6 +60,13 @@ defaults, axes, robustness radii, execution inputs, and local replay inputs in
 result's meaning. The pool template remains under `configs/templates`, while
 compiled policies are harness build inputs.
 
+Pool templates keep contract encodings (for example, WAD integers). Candidate
+defaults and grid axes use human simulation units: `fee_gamma` and both
+`adjustment_step` controls are fractions such as `0.03`, not `3e16`. The
+evaluator rejects sub-WAD ratios instead of silently running a collapsed value.
+Every Shift-click replay records the resolved numeric controls under
+`result.artifacts.effective_inputs` for a quick initialization check.
+
 Non-empty `[placement].hosts` implies SSH; otherwise execution is local.
 Optional `[placement].numa_nodes` creates one persistent evaluator lane per NUMA
 node. Remote runs map config-relative sibling-workspace paths under the shared
