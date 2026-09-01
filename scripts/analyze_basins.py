@@ -195,6 +195,12 @@ def main() -> int:
         help="maximum absolute 7-day relative price difference in basis points",
     )
     parser.add_argument(
+        "--max-rel-price-diff-bps",
+        type=float,
+        default=float("inf"),
+        help="maximum absolute relative price difference in basis points",
+    )
+    parser.add_argument(
         "--max-fee-bps",
         type=float,
         default=float("inf"),
@@ -226,6 +232,8 @@ def main() -> int:
         or args.max_detach < 0
         or math.isnan(args.max_price_diff_bps)
         or args.max_price_diff_bps < 0
+        or math.isnan(args.max_rel_price_diff_bps)
+        or args.max_rel_price_diff_bps < 0
         or math.isnan(args.max_fee_bps)
         or args.max_fee_bps < 0
     ):
@@ -245,6 +253,8 @@ def main() -> int:
                 required.append("yb_apy_gm")
         if math.isfinite(args.max_price_diff_bps):
             required.append("max_7d_rel_price_diff")
+        if math.isfinite(args.max_rel_price_diff_bps):
+            required.append("max_rel_price_diff")
         columns = read_result_columns(root, metrics=required)
     except (OSError, KeyError, TypeError, ValueError) as exc:
         parser.error(f"could not read result artifact: {exc}")
@@ -274,6 +284,9 @@ def main() -> int:
         np.asarray(
             columns.metrics.get("max_7d_rel_price_diff", missing), dtype=float
         )
+    )
+    rel_price_diff = np.abs(
+        np.asarray(columns.metrics.get("max_rel_price_diff", missing), dtype=float)
     )
     base_valid = (
         columns.ok_mask
@@ -448,6 +461,22 @@ def main() -> int:
             parser.error(f"could not score price-difference robustness: {exc}")
         complete &= robust_price_diff.complete
         price_diff_ceiling = -robust_price_diff.robust_score
+    rel_price_diff_ceiling = rel_price_diff
+    if specs and math.isfinite(args.max_rel_price_diff_bps):
+        try:
+            robust_rel_price_diff = _robust(
+                rel_price_diff,
+                valid=columns.ok_mask & np.isfinite(rel_price_diff),
+                ordinals=ordinals,
+                axes=axes,
+                shape=shape,
+                specs=specs,
+                sign=-1.0,
+            )
+        except ValueError as exc:
+            parser.error(f"could not score relative price-difference robustness: {exc}")
+        complete &= robust_rel_price_diff.complete
+        rel_price_diff_ceiling = -robust_rel_price_diff.robust_score
 
     eligible = (
         complete
@@ -460,6 +489,8 @@ def main() -> int:
             eligible &= yb_floor >= args.min_yb_gm
     if math.isfinite(args.max_price_diff_bps):
         eligible &= price_diff_ceiling <= args.max_price_diff_bps / 10_000.0
+    if math.isfinite(args.max_rel_price_diff_bps):
+        eligible &= rel_price_diff_ceiling <= args.max_rel_price_diff_bps / 10_000.0
     if math.isfinite(args.max_fee_bps):
         try:
             eligible &= _max_fee_mask(metadata, shape, args.max_fee_bps)
@@ -496,6 +527,8 @@ def main() -> int:
         filters.append(f"detach <= {args.max_detach:g}")
     if math.isfinite(args.max_price_diff_bps):
         filters.append(f"7d price diff <= {args.max_price_diff_bps:g} bps")
+    if math.isfinite(args.max_rel_price_diff_bps):
+        filters.append(f"absolute price diff <= {args.max_rel_price_diff_bps:g} bps")
     if math.isfinite(args.max_fee_bps):
         filters.append(f"max fee <= {args.max_fee_bps:g} bps")
     if args.flat_fee:
@@ -530,6 +563,8 @@ def main() -> int:
         )
         if math.isfinite(args.max_price_diff_bps):
             metric_fields += f" max_7d_pdiff={price_diff_ceiling[row]:.8g}"
+        if math.isfinite(args.max_rel_price_diff_bps):
+            metric_fields += f" max_pdiff={rel_price_diff_ceiling[row]:.8g}"
         print(
             f"  ordinal={int(ordinals[row])} {args.rank}={rank_values[row]:.8g}"
             f"{robust_fields}{metric_fields} detach={detach[row]:.8g} {params}"
