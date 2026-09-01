@@ -10,17 +10,18 @@ import numpy as np
 
 from curve_fx_sim.plotting.explorer import HeatmapExplorer
 from curve_fx_sim.plotting.heatmap import HeatmapAxis, HeatmapDataset
-from curve_fx_sim.plotting.masked_metrics import (
-    SKEW_MASKED_METRICS,
-    SLIPPAGE_APY_MASK_SOURCES,
-    masked_metric_source,
-    masked_metric_uses_detach,
-)
+from curve_fx_sim.plotting.masked_metrics import masked_metric_source
 from .results import ResultColumns, read_result_columns
 from .shiftclick import shiftclick_figure, trace_stored_candidate
 
 
-def _metric_columns(requested: Sequence[str], available: Sequence[str]) -> tuple[str, ...]:
+def _metric_columns(
+    requested: Sequence[str],
+    available: Sequence[str],
+    *,
+    need_final_price_diff: bool = False,
+    need_slippage: bool = False,
+) -> tuple[str, ...]:
     available_set = set(available)
     needed: set[str] = set()
     for name in requested:
@@ -35,13 +36,12 @@ def _metric_columns(requested: Sequence[str], available: Sequence[str]) -> tuple
         )
         if price_diff is not None:
             needed.add(price_diff)
-        if masked_metric_uses_detach(name, available_set) and "detach_energy_ungated" in available_set:
+        if "detach_energy_ungated" in available_set:
             needed.add("detach_energy_ungated")
-        if name in SKEW_MASKED_METRICS:
-            needed.update(available_set.intersection({"max_7d_skew", "final_rel_price_diff"}))
-        slippage = SLIPPAGE_APY_MASK_SOURCES.get(name)
-        if slippage is not None:
-            needed.add(slippage)
+        if need_final_price_diff and "final_rel_price_diff" in available_set:
+            needed.add("final_rel_price_diff")
+        if need_slippage and "tw_real_slippage_1pct" in available_set:
+            needed.add("tw_real_slippage_1pct")
     return tuple(name for name in available if name in needed)
 
 
@@ -104,7 +104,6 @@ def open_fxopt_explorer(
     log_axes: Sequence[str] = (),
     max_price_diff_bps: float | None = 100.0,
     max_detach_energy: float | None = None,
-    max_skew_percent: float | None = None,
     slippage_bps: float | None = None,
     final_price_diff_bps: float | None = None,
 ) -> HeatmapExplorer:
@@ -116,7 +115,12 @@ def open_fxopt_explorer(
         )
     except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise ValueError("run has no readable metric manifest") from exc
-    selected_columns = _metric_columns(metrics, available_metrics)
+    selected_columns = _metric_columns(
+        metrics,
+        available_metrics,
+        need_final_price_diff=final_price_diff_bps is not None,
+        need_slippage=slippage_bps is not None,
+    )
     results = read_result_columns(root, metrics=selected_columns)
 
     def replay(selection: Any, mode: str) -> Path:
@@ -154,11 +158,9 @@ def open_fxopt_explorer(
         log_axes=tuple(aliases.get(name, name) for name in log_axes),
         max_pricethr=max_price_diff_bps,
         max_detach_energy=max_detach_energy,
-        skewthr=max_skew_percent,
         slipthr=slippage_bps,
         final_pdiffthr=final_price_diff_bps,
         run_id=results.run_id,
-        run_dir=root,
         on_replay=replay,
     )
 

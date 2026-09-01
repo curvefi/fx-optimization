@@ -1,9 +1,9 @@
-"""Precise shiftclick multi-panel view (port of the monorepo plot_price_scale.py).
+"""Multi-panel Shift-click view for raw evaluator traces.
 
-Renders the exact legacy look: stacked shared-x panels for prices, rolling
-90d annualized LP net APY with GM floor shading, YB releverage APY + balance
-sheet, pool skew with binned pool fee, and 1% TVL slippage, over a datetime
-axis. Input is the raw evaluator JSON trace produced by Shift-click.
+The view contains stacked shared-x panels for prices, rolling 90d annualized LP
+net APY with GM floor shading, YB releverage APY and balance sheet, pool skew
+with binned pool fee, and 1% TVL slippage over a datetime axis. Input is the
+raw evaluator JSON trace produced by Shift-click.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ def _series(records: Sequence[Mapping[str, Any]], name: str, default: Any = None
 
 
 def _trace_to_detailed(records: Sequence[Mapping[str, Any]]) -> dict[str, np.ndarray]:
-    """Map harness trace records onto the legacy detailed-output field set."""
+    """Map harness trace records onto the detailed plotting field set."""
     n = len(records)
     return {
         "timestamps": _series(records, "t"),
@@ -474,13 +474,11 @@ def render_shiftclick_figure(
     trace_path: Path,
     *,
     title: str | None = None,
-    fee_source: str = "sampled",
-    bin_hours: float = 6.0,
-    apy_ymax: float | None = None,
-    max_points: int = DEFAULT_MAX_POINTS,
     donation_frequency: float | None = None,
 ):
     """Build the multi-panel view from a raw evaluator trace."""
+    bin_hours = 6.0
+    max_points = DEFAULT_MAX_POINTS
     payload = json.loads(Path(trace_path).read_text(encoding="utf-8"))
     if not isinstance(payload, list) or any(not isinstance(row, Mapping) for row in payload):
         raise ValueError("raw evaluator trace must be an array of objects")
@@ -545,33 +543,30 @@ def render_shiftclick_figure(
 
     yb_path = _load_embedded_yb_path(detailed, max_points)
     yb_balance_path = _load_embedded_yb_balance_path(detailed, max_points)
-    if yb_path is not None and yb_balance_path is not None and have_slippage_panel:
-        fig, (ax1, ax_apy, ax2, ax_yb_balance, ax_skew, ax_slippage) = plt.subplots(
-            6, 1, figsize=(14, 18), sharex=True
-        )
-    elif yb_path is not None and yb_balance_path is not None:
-        fig, (ax1, ax_apy, ax2, ax_yb_balance, ax_skew) = plt.subplots(
-            5, 1, figsize=(14, 15), sharex=True
-        )
-        ax_slippage = None
-    elif yb_path is not None and have_slippage_panel:
-        fig, (ax1, ax_apy, ax2, ax_skew, ax_slippage) = plt.subplots(
-            5, 1, figsize=(14, 15), sharex=True
-        )
-        ax_yb_balance = None
-    elif yb_path is not None:
-        fig, (ax1, ax_apy, ax2, ax_skew) = plt.subplots(4, 1, figsize=(14, 12), sharex=True)
-        ax_yb_balance = None
-        ax_slippage = None
-    elif have_slippage_panel:
-        fig, (ax1, ax_apy, ax2, ax_slippage) = plt.subplots(4, 1, figsize=(14, 13), sharex=True)
-        ax_yb_balance = None
-        ax_skew = None
-    else:
-        fig, (ax1, ax_apy, ax2) = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
-        ax_yb_balance = None
-        ax_skew = None
-        ax_slippage = None
+    panel_count = 3 + int(yb_balance_path is not None) + int(yb_path is not None) + int(
+        have_slippage_panel
+    )
+    fig, panel_array = plt.subplots(
+        panel_count,
+        1,
+        figsize=(14, 3 * panel_count + 1),
+        sharex=True,
+        squeeze=False,
+    )
+    panels = list(panel_array[:, 0])
+    ax1, ax_apy, ax2 = panels[:3]
+    panel_index = 3
+    ax_yb_balance = None
+    if yb_balance_path is not None:
+        ax_yb_balance = panels[panel_index]
+        panel_index += 1
+    ax_skew = None
+    if yb_path is not None:
+        ax_skew = panels[panel_index]
+        panel_index += 1
+    ax_slippage = None
+    if have_slippage_panel:
+        ax_slippage = panels[panel_index]
 
     ax1.plot(dates, p_cex, label="CEX price", alpha=0.7, linewidth=1)
     ax1.plot(dates, price_scale, label="price_scale", alpha=0.7, linewidth=1)
@@ -605,8 +600,6 @@ def render_shiftclick_figure(
     ax_apy.set_title(f"LP net APY={_format_pct(lp_net_apy)} (GM={_format_pct(lp_gm_apy)})", fontsize=10)
     ax_apy.legend(loc="upper left")
     ax_apy.grid(True, alpha=0.3)
-    if apy_ymax is not None:
-        ax_apy.set_ylim(0.0, apy_ymax)
     ax_apy_growth = ax_apy.twinx()
     ax_apy_growth.plot(dates, net_lp_growth_pct, linewidth=1.0, color="tab:blue", alpha=0.65, label="LP net growth")
     ax_apy_growth.set_ylabel("LP net growth (%)", color="tab:blue")
@@ -618,23 +611,14 @@ def render_shiftclick_figure(
         if ax_yb_balance is not None:
             _plot_yb_balance_axis(ax_yb_balance, yb_balance_path)
         _plot_pool_skew_axis(ax_skew, dates, pool_skew)
-        if fee_source != "none":
-            fee_axis = ax_skew.twinx()
-            fee_plotted = False
-            if fee_source == "sampled":
-                fee_plotted = (
-                    _plot_binned_pool_fee_axis(
-                        fee_axis,
-                        sampled_fee_timestamps,
-                        sampled_pool_fee,
-                        bin_hours=bin_hours,
-                    )
-                    is not None
-                )
-            elif fee_source == "sampled-raw":
-                fee_plotted = _plot_pool_fee_axis(fee_axis, dates, pool_fee) is not None
-            if not fee_plotted:
-                fee_axis.remove()
+        fee_axis = ax_skew.twinx()
+        if _plot_binned_pool_fee_axis(
+            fee_axis,
+            sampled_fee_timestamps,
+            sampled_pool_fee,
+            bin_hours=bin_hours,
+        ) is None:
+            fee_axis.remove()
     else:
         ax2.plot(dates, rel_diff, linewidth=0.5, color="red", alpha=0.7, label="Price deviation")
         ax2.axhline(0, color="black", linewidth=0.5)
@@ -653,27 +637,15 @@ def render_shiftclick_figure(
         ax3.tick_params(axis="y", labelcolor="blue")
         ax3.set_ylim(50, 100)
         ax3.legend(loc="upper right")
-        if fee_source != "none":
-            fee_axis = ax2.twinx()
-            fee_plotted = False
-            if fee_source == "sampled":
-                fee_plotted = (
-                    _plot_binned_pool_fee_axis(
-                        fee_axis,
-                        sampled_fee_timestamps,
-                        sampled_pool_fee,
-                        bin_hours=bin_hours,
-                        spine_offset=1.08,
-                    )
-                    is not None
-                )
-            elif fee_source == "sampled-raw":
-                fee_plotted = (
-                    _plot_pool_fee_axis(fee_axis, dates, pool_fee, spine_offset=1.08)
-                    is not None
-                )
-            if not fee_plotted:
-                fee_axis.remove()
+        fee_axis = ax2.twinx()
+        if _plot_binned_pool_fee_axis(
+            fee_axis,
+            sampled_fee_timestamps,
+            sampled_pool_fee,
+            bin_hours=bin_hours,
+            spine_offset=1.08,
+        ) is None:
+            fee_axis.remove()
 
     if ax_slippage is not None:
         _plot_slippage_axis(

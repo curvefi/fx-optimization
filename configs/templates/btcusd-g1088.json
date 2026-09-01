@@ -1,0 +1,39 @@
+{
+  "pools": [
+    {
+      "tag": "btcusd_g1088",
+      "pool": {
+        "initial_liquidity": [
+          "499999999999999991611392",
+          "11820719404254654464"
+        ],
+        "A": "50000",
+        "gamma": "100000000000000",
+        "mid_fee": "128000000",
+        "out_fee": "328000000",
+        "fee_gamma": "30000000000000000",
+        "adjustment_step_min": "100000000",
+        "adjustment_step_max": "30000000000000000",
+        "ma_time": "866",
+        "reserved_profit_fraction": "3600000000",
+        "admin_fee": "0",
+        "policy": {
+          "kind": "none"
+        },
+        "initial_price": "42298609999999997575168",
+        "start_timestamp": "1704066924",
+        "donation_apy": "0.0132",
+        "donation_frequency": "86400",
+        "donation_duration": "604800",
+        "initial_donation_days": "28",
+        "donation_coins_ratio": "0"
+      },
+      "costs": {
+        "arb_fee_bps": 5,
+        "gas_coin0": 0.0,
+        "use_volume_cap": false,
+        "volume_cap_mult": 1
+      }
+    }
+  ]
+}

@@ -46,6 +46,8 @@ _PLACEMENT_KEYS = frozenset({"hosts", "numa_nodes"})
 _CANDIDATE_KEYS = frozenset({"defaults", "axes"})
 _SCENARIO_KEYS = frozenset({"id", "market", "chainlink", "yb_mode"})
 _COMPILED_POLICY_KEYS = frozenset({"header", "id"})
+EVALUATOR_POLICY_METADATA_KEY = "expected_evaluator_policy"
+_COMPILED_POLICY_ABI = "twocrypto_policy_v1"
 
 ProgressCallback = Callable[[int, int], None]
 WorkerProgressCallback = Callable[[int, int, float], None]
@@ -172,6 +174,10 @@ class RunConfig:
             raise ConfigError(
                 "[session] cannot set " + ", ".join(sorted(forbidden_session))
             )
+        resolved_session = dict(session)
+        resolved_session.setdefault("event_cursor", "scalar")
+        resolved_session.setdefault("metric_profile", "full_summary")
+        resolved_session.setdefault("enable_slippage_probes", False)
 
         candidate = raw.get("candidate")
         if not isinstance(candidate, Mapping):
@@ -201,11 +207,33 @@ class RunConfig:
             resolved_scenario["chainlink"] = str(
                 _resolve_path(chainlink, config_path.parent)
             )
-        scenario_yb_mode = scenario.get("yb_mode")
-        if scenario_yb_mode is not None and not isinstance(scenario_yb_mode, str):
+        scenario_yb_mode = scenario.get("yb_mode", "off")
+        if not isinstance(scenario_yb_mode, str):
             raise ConfigError("scenario.yb_mode must be a string")
-        if scenario_yb_mode is not None:
-            resolved_scenario["yb_mode"] = scenario_yb_mode
+        resolved_scenario["yb_mode"] = scenario_yb_mode
+        if (
+            resolved_session["event_cursor"] == "exact_skip"
+            and resolved_session["metric_profile"] != "grid_core"
+        ):
+            raise ConfigError("exact_skip requires metric_profile='grid_core'")
+        if (
+            resolved_session["metric_profile"] == "grid_core"
+            and (
+                scenario_yb_mode != "off"
+                or bool(resolved_session["enable_slippage_probes"])
+            )
+        ):
+            raise ConfigError(
+                "grid_core requires yb_mode='off' and slippage disabled"
+            )
+        if (
+            any(name.startswith("tw_real_slippage_") for name in raw_metric_fields)
+            and resolved_session["enable_slippage_probes"] is not True
+        ):
+            raise ConfigError(
+                "tw_real_slippage_* metrics require "
+                "session.enable_slippage_probes=true"
+            )
 
         compiled_policy = raw.get("compiled_policy")
         compiled_policy_header: Path | None = None
@@ -226,6 +254,14 @@ class RunConfig:
             compiled_policy_id = _required_string(
                 compiled_policy, "id", "compiled_policy"
             )
+        candidate_config = CandidateConfig.from_mapping(candidate)
+        if (
+            compiled_policy_header is None
+            and candidate_config.defaults["policy_params"]
+        ):
+            raise ConfigError(
+                "candidate.defaults.policy_params must be empty without [compiled_policy]"
+            )
         base = config_path.parent
         config = cls(
             path=config_path,
@@ -237,8 +273,8 @@ class RunConfig:
             metric_fields=tuple(raw_metric_fields),
             hosts=tuple(hosts),
             numa_nodes=tuple(numa_nodes),
-            candidate=CandidateConfig.from_mapping(candidate),
-            session=dict(session),
+            candidate=candidate_config,
+            session=resolved_session,
             scenario=resolved_scenario,
             robustness=parse_robustness_axes(
                 raw.get("robustness"), required=False
@@ -269,6 +305,22 @@ class RemoteRunStatus:
     remote_output: str | None
     detail: str = ""
     exit_code: int | None = None
+
+
+def _evaluator_policy_contract(config: RunConfig) -> dict[str, str | int]:
+    if config.compiled_policy_header is None:
+        return {
+            "policy_id": "none",
+            "policy_abi": "none",
+            "policy_parameter_count": 0,
+        }
+    policy_id = config.compiled_policy_id
+    assert policy_id is not None
+    return {
+        "policy_id": policy_id,
+        "policy_abi": _COMPILED_POLICY_ABI,
+        "policy_parameter_count": len(config.candidate.defaults["policy_params"]),
+    }
 
 
 def _display_value(value: object) -> str:
@@ -311,19 +363,19 @@ def _range_count(ranges: Iterable[tuple[int, int]]) -> int:
     return sum(stop - start for start, stop in ranges)
 
 
-def grid_summary(config_path: str | Path) -> str:
+def grid_summary(config_path: str | Path | RunConfig) -> str:
     """Describe the configured Cartesian axes in their operator-facing units."""
-    config = RunConfig.from_toml(config_path)
+    config = (
+        config_path
+        if isinstance(config_path, RunConfig)
+        else RunConfig.from_toml(config_path)
+    )
     total = len(config.candidate.grid())
-    with config.path.open("rb") as stream:
-        raw_axes = tomllib.load(stream)["candidate"].get("axes", {})
     parts = []
     for name, values in config.candidate.axes.items():
-        raw = raw_axes[name]
-        displayed = raw.get("values") if isinstance(raw, Mapping) and "values" in raw else raw
-        if isinstance(raw, Mapping) and "start" in raw:
-            displayed = (raw["start"], raw["stop"])
-        endpoints = displayed if isinstance(displayed, list) else list(displayed)
+        endpoints = [values[0], values[-1]]
+        if isinstance(endpoints[0], Mapping):
+            endpoints = [next(iter(value.values())) for value in endpoints]
         if name == "pool.donation_apy":
             endpoints = [float(value) * 100 for value in endpoints]
         span = _display_value(endpoints[0])
@@ -393,6 +445,10 @@ def _local_worker_lanes(
                 inputs["evaluator"],
                 work_dir=None if remote_paths else config.path.parent,
                 workers=workers + (index < extra),
+                client_options={
+                    f"expected_{name}": value
+                    for name, value in _evaluator_policy_contract(config).items()
+                },
                 launch_prefix=(
                     (("env", "-u", "LD_LIBRARY_PATH") if remote_paths else ())
                     + (() if node is None else (
@@ -483,15 +539,14 @@ def run_metadata(
             replay_session[key] = replay_path(replay_session[key])
     config_path = origin_config or config.path
     config_parent = config_path.parent
-    origin = (
-        "autoresearch"
-        if config_parent.name == "autoresearch"
-        and config_parent.parent.name == "configs"
-        else "human"
-        if config_parent.name == "experiments"
-        and config_parent.parent.name == "configs"
-        else "external"
-    )
+    origin = "external"
+    for parent in config_path.parents:
+        if (
+            parent.parent.name == "configs"
+            and parent.name in {"autoresearch", "experiments"}
+        ):
+            origin = parent.name
+            break
     metadata = {
         "config": str(config_path),
         "config_origin": origin,
@@ -508,6 +563,7 @@ def run_metadata(
         "axes": {name: list(grid.axes[name]) for name in sorted(grid.axes)},
         "shape": list(grid.shape),
         "candidate_defaults": config.candidate.defaults,
+        EVALUATOR_POLICY_METADATA_KEY: _evaluator_policy_contract(config),
         "open_session": open_session_request(config),
         "replay": {
             "evaluator": replay_path(local_inputs["evaluator"]),
@@ -595,6 +651,10 @@ def _run(
         config.evaluator,
         work_dir=config.path.parent,
         workers=config.workers,
+        client_options={
+            f"expected_{name}": value
+            for name, value in _evaluator_policy_contract(config).items()
+        },
     )
     if client_factory is not None:
         metadata["placement"] = "injected"
@@ -1558,14 +1618,18 @@ def follow_remote_run(
 
 
 def run_remote_config(
-    config_path: str | Path,
+    config_path: str | Path | RunConfig,
     output_dir: str | Path,
     *,
     transfer: bool = False,
     rebuild: bool = False,
 ) -> ArtifactPaths:
     """Launch, follow, and retrieve one disconnect-safe remote grid."""
-    config = RunConfig.from_toml(config_path)
+    config = (
+        config_path
+        if isinstance(config_path, RunConfig)
+        else RunConfig.from_toml(config_path)
+    )
     if not config.hosts:
         raise ConfigError("remote coordinator requires placement hosts")
     job = _start_remote_job(
@@ -1579,18 +1643,18 @@ def run_remote_config(
 
 
 def run_config(
-    config_path: str | Path,
+    config_path: str | Path | RunConfig,
     output_dir: str | Path,
     *,
     client_factory: ClientFactory | None = None,
     progress_callback: ProgressCallback | None = None,
-    transfer: bool = False,
-    rebuild: bool = False,
 ) -> ArtifactPaths:
     """Run one local grid and atomically publish its two artifacts."""
-    config = RunConfig.from_toml(config_path)
-    if transfer or rebuild:
-        raise ConfigError("--transfer and --rebuild require remote placement hosts")
+    config = (
+        config_path
+        if isinstance(config_path, RunConfig)
+        else RunConfig.from_toml(config_path)
+    )
     return _run(
         config,
         Path(output_dir).expanduser().resolve(),

@@ -30,8 +30,9 @@ For a new pair or policy, an agent should do exactly this:
 1. Read this file, the repository `README.md`, the current `fxopt ... --help`,
    and `../curve-fx-arb-harness/protocol/protocol_spec.md`.
 2. Inspect all three repository worktrees and preserve unrelated changes.
-3. Create `configs/autoresearch/<pair>-optimization/<policy>/report.md` and a
-   numbered `00-...toml` source grid.
+3. Start from a maintained manifest in `configs/experiments/` when one exists;
+   keep exploratory copies and their `report.md` under ignored
+   `configs/autoresearch/<pair>-optimization/<policy>/`.
 4. Freeze the objective, hard constraints, units, perturbation radii, dataset,
    template, policy, arb cost, and wall-time budget in the report **before** the
    first result.
@@ -65,16 +66,17 @@ There is currently no supported `fxopt optimize` or Nevergrad surface. Use the
 registered-grid runner for exhaustive work. Do not add optimizer state or an
 ask/tell loop merely to complete an ordinary grid campaign.
 
-Use a campaign layout like:
+Use a workbench layout like:
 
 ```text
-configs/autoresearch/btc-optimization/dual-ema/
-    00-source-highd-f64.toml
-    01-region-a-controller-f64.toml
-    02-region-b-economics-f64.toml
-    ...
+configs/experiments/
+    btcusd-native-discovery-f64.toml
+    btcusd-dual-ema-robust-f64.toml
+    btcusd-p3-finalist-comparison.toml
+configs/autoresearch/<pair>-optimization/<policy>/
     report.md
-    plots/
+    00-source.toml
+    ...
 ```
 
 Mirror the config purpose in the run name. Number configs in causal order and
@@ -146,8 +148,8 @@ YB mode, metric profile, event cursor, and fleet:
 candidate budget = measured pools/s * usable calculation seconds
 ```
 
-Allow for startup, market loading, and result merging. A no-YB native-policy
-rate says nothing about a compiled-policy or YB-enabled run.
+Allow for startup, market loading, and result merging. A native/no-policy rate
+says nothing about a compiled dual-EMA or YB-enabled run.
 
 Before launch, state:
 
@@ -209,13 +211,14 @@ a new evaluator/profile/protocol surface.
 | G | Numeric/cost/time validation | Required modes, costs, and folds preserve feasibility |
 | H | YB promotion | LP and YB metrics independently remain acceptable |
 
-### Stage A: broad blade-f64, YB-off discovery
+### Stage A: broad blade-f64, native/no-policy discovery
 
 Use:
 
 ```text
-arb_evaluator_f64
+arb_evaluator_f64 (native/no-policy build)
 yb_mode = "off"
+policy_params = []
 event_cursor = "exact_skip"
 metric_profile = "grid_core"
 slippage disabled
@@ -450,6 +453,19 @@ compute the known group floors and ceilings explicitly.
 This small-star form is also useful when one axis is an external scenario input,
 such as arb cost, rather than a parameter being optimized.
 
+The tracked BTC `btcusd-p3-finalist-comparison.toml` is the reusable form of
+this gate. It keeps one candidate star and the 2/3/4/5-bps arb-cost axis while
+the operator varies only two scalar settings between runs:
+
+```text
+numeric: evaluator_f64 -> evaluator_ld
+YB model: off -> active_2l -> reference_2l
+```
+
+Keep `full_summary`, `event_cursor = "scalar"`, and the metric list unchanged
+across the comparison. `reference_2l` is a small model-sensitivity check, not
+an onchain-parity claim.
+
 ## 8. Native promotion gates
 
 ### Numeric/platform gate
@@ -564,10 +580,10 @@ The replay is local. Its plot is a path diagnostic, not blade-LD ranking
 evidence. Put canonical blade metrics and local replay metrics side by side when
 they differ.
 
-If the local client rejects the evaluator hello or its compiled-policy identity
-is stale, rebuild the existing local Twocrypto install and the exact evaluator
-target named by `run.json`; do not edit the artifact or reconstruct the
-candidate manually.
+If the local client rejects the evaluator hello or its executable/build identity
+does not match the artifact, rebuild the existing local Twocrypto install and
+the exact evaluator target named by `run.json`; do not edit the artifact or
+reconstruct the candidate manually.
 
 ## 11. Cluster lifecycle
 

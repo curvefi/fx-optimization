@@ -1,0 +1,54 @@
+# Compiled yieldbasis_twocrypto_policy: six dual-EMA controls, native pool fee.
+[run]
+id = "btcusd-dual-ema-robust-f64"
+evaluator = "../../../curve-fx-arb-harness/build/grid-dual-current/arb_evaluator_f64"
+template = "../templates/btcusd-g1088.json"
+batch_size = 256
+workers = 1
+metric_fields = [
+  "apy_net", "apy_net_robust_90d", "avg_rel_price_diff",
+  "max_7d_rel_price_diff", "detach_energy_ungated", "trades",
+  "n_rebalances", "elapsed_ms",
+]
+
+[compiled_policy]
+id = "yieldbasis_twocrypto_policy"
+header = "../../../twocrypto-cpp/include/pools/twocrypto_fx/policies/yieldbasis.hpp"
+
+[session]
+n_candles = 0
+start_time = 1704066924
+end_time = 0
+candle_filter = 99.0
+min_swap = 0.000001
+max_swap = 1.0
+dustswap_freq_s = 3600
+user_swap_freq_s = 0
+user_swap_size_frac = 0.01
+user_swap_thresh = 0.05
+enable_slippage_probes = false
+event_cursor = "exact_skip"
+metric_profile = "grid_core"
+
+[scenario]
+id = "btcusd-dual-ema-robust"
+market = "../../data/market/btcusd/candles-2024-2026-08-29-filtered.json"
+yb_mode = "off"
+
+[candidate.defaults]
+policy_params = [7500, 54000, 1.27, 0.00028, 0.0012, 0.0048]
+pool = { A = 50000, donation_apy = 0.005, reserved_profit_fraction = 0.3 }
+
+[candidate.axes]
+flat_fee = { start = 0.013, stop = 0.015, step = 0.0001, targets = ["pool.mid_fee", "pool.out_fee"] }
+"policy_params.2" = [1.25, 1.27, 1.29]
+"policy_params.5" = [0.0052, 0.0054, 0.0056]
+"pool.donation_apy" = [0.004, 0.005, 0.006]
+"pool.reserved_profit_fraction" = [0.28, 0.3, 0.32]
+
+[robustness]
+flat_fee = { field = "pool.mid_fee", radius = 0.0001 }
+"policy_params.2" = 0.02
+"policy_params.5" = 0.0002
+"pool.donation_apy" = 0.001
+"pool.reserved_profit_fraction" = 0.02

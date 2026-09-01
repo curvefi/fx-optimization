@@ -1,0 +1,66 @@
+# One compact P3 star for model comparison. To compare variants, change only
+# evaluator (f64 -> ld) and scenario.yb_mode (off -> active_2l -> reference_2l).
+# Keep the candidate axis and metric schema identical; use a distinct output
+# directory for each comparison variant.
+[run]
+id = "btcusd-p3-finalist-comparison"
+evaluator = "../../../curve-fx-arb-harness/build/grid-dual-current/arb_evaluator_f64"
+template = "../templates/btcusd-g1088.json"
+batch_size = 4
+workers = 1
+metric_fields = [
+  "lp_xcp_profit", "apy", "apy_net", "apy_net_gm", "apy_net_robust_90d",
+  "avg_rel_price_diff", "max_rel_price_diff", "max_7d_rel_price_diff",
+  "final_rel_price_diff", "detach_energy_ungated", "trades", "n_rebalances",
+  "donations", "donation_coin0_total", "tvl_growth", "elapsed_ms",
+  "yb_apy", "yb_apy_gm", "yb_final_growth", "yb_fee",
+  "yb_releverage_trades", "yb_gm_windows", "yb_gm_floored_windows",
+  "yb_gm_floor_share",
+]
+
+[compiled_policy]
+id = "yieldbasis_twocrypto_policy"
+header = "../../../twocrypto-cpp/include/pools/twocrypto_fx/policies/yieldbasis.hpp"
+
+[session]
+n_candles = 0
+start_time = 1704066924
+end_time = 0
+candle_filter = 99.0
+min_swap = 0.000001
+max_swap = 1.0
+dustswap_freq_s = 3600
+user_swap_freq_s = 0
+user_swap_size_frac = 0.01
+user_swap_thresh = 0.05
+enable_slippage_probes = false
+event_cursor = "scalar"
+metric_profile = "full_summary"
+yb_releverage_fee = 0.012
+yb_cash_multiplier = 3.0
+
+[scenario]
+id = "btcusd-p3-finalist-comparison"
+market = "../../data/market/btcusd/candles-2024-2026-08-29-filtered.json"
+yb_mode = "off"
+
+[candidate.defaults]
+policy_params = [8100, 57600, 1.30, 0.0008, 0.0012, 0.0054]
+
+[candidate.defaults.pool]
+A = 50000
+mid_fee = 0.013
+out_fee = 0.013
+donation_apy = 0.009
+reserved_profit_fraction = 0.30
+
+[candidate.defaults.pool.costs]
+arb_fee_bps = 5
+
+[candidate.axes]
+arb_cost = [
+  { "pool.costs.arb_fee_bps" = 2 },
+  { "pool.costs.arb_fee_bps" = 3 },
+  { "pool.costs.arb_fee_bps" = 4 },
+  { "pool.costs.arb_fee_bps" = 5 },
+]

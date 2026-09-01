@@ -214,6 +214,8 @@ def run_command(
             raise ConfigError(
                 "--status, --follow, --retrieve, and --stop are mutually exclusive"
             )
+        if (transfer or rebuild) and not config_value.hosts:
+            raise ConfigError("--transfer and --rebuild require remote placement hosts")
         if overwrite and modes:
             raise ConfigError("--overwrite cannot be combined with remote job controls")
         if modes and not config_value.hosts:
@@ -247,10 +249,10 @@ def run_command(
         elif retrieve:
             paths = retrieve_remote_run(config, output_dir)
         else:
-            click.echo(grid_summary(config), err=True)
+            click.echo(grid_summary(config_value), err=True)
         if not modes and config_value.hosts:
             paths = run_remote_config(
-                config,
+                config_value,
                 output_dir,
                 transfer=transfer,
                 rebuild=rebuild,
@@ -258,11 +260,9 @@ def run_command(
         elif not modes:
             reporter = _ProgressReporter("run")
             paths = run_config(
-                config,
+                config_value,
                 output_dir,
                 progress_callback=reporter,
-                transfer=transfer,
-                rebuild=rebuild,
             )
     except (
         ConfigError,
@@ -373,7 +373,6 @@ def worker_command(
               show_default=True)
 @click.option("--max-price-diff-bps", type=float, default=100.0, show_default=True)
 @click.option("--max-detach-energy", type=click.FloatRange(min=0.0))
-@click.option("--max-skew-percent", type=float)
 @click.option("--slippage-bps", type=float)
 @click.option("--final-price-diff-bps", type=float)
 @click.option("--output", type=click.Path(dir_okay=False, path_type=Path))
@@ -382,7 +381,7 @@ def heatmap_command(
     run_dir: Path, x_axis: str | None, y_axis: str | None,
     log_axes: tuple[str, ...], columns: int, metrics: tuple[str, ...],
     max_price_diff_bps: float,
-    max_detach_energy: float | None, max_skew_percent: float | None,
+    max_detach_energy: float | None,
     slippage_bps: float | None,
     final_price_diff_bps: float | None, output: Path | None, show: bool,
 ) -> None:
@@ -395,7 +394,6 @@ def heatmap_command(
             log_axes=log_axes, columns=columns,
             max_price_diff_bps=max_price_diff_bps,
             max_detach_energy=max_detach_energy,
-            max_skew_percent=max_skew_percent,
             slippage_bps=slippage_bps,
             final_price_diff_bps=final_price_diff_bps,
         )

@@ -1,27 +1,27 @@
 """Deterministic headless and interactive orchestrator plots."""
 
 from .heatmap import (
+    auto_log,
+    edges,
     HeatmapAxis,
     HeatmapDataset,
     HeatmapSelection,
-    HeatmapState,
     HeatmapValidationError,
     MaskSpec,
-    MatplotlibHeatmapView,
-    render_heatmap,
+    SelectionRef,
 )
 from .explorer import HeatmapExplorer, format_axis_value, format_metric_value
 
 __all__ = [
+    "auto_log",
+    "edges",
     "HeatmapAxis",
     "HeatmapDataset",
     "HeatmapSelection",
-    "HeatmapState",
     "HeatmapValidationError",
     "MaskSpec",
-    "MatplotlibHeatmapView",
+    "SelectionRef",
     "HeatmapExplorer",
-    "render_heatmap",
     "format_axis_value",
     "format_metric_value",
 ]

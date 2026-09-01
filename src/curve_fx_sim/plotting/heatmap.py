@@ -1,4 +1,4 @@
-"""Interactive and headless heatmaps over exact common evaluation tables."""
+"""Exact evaluation-table data and the maintained tiled heatmap view."""
 
 from __future__ import annotations
 
@@ -6,27 +6,15 @@ import json
 import math
 import os
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal
 
-import matplotlib
-import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib import rcsetup
-from matplotlib.backend_bases import MouseButton, MouseEvent
-from matplotlib.widgets import RadioButtons, Slider
 
-from .masked_metrics import (
-    SKEW_MASKED_METRICS,
-    SLIPPAGE_APY_MASK_SOURCES,
-    is_masked_metric,
-    masked_metric_source,
-    masked_metric_uses_detach,
-)
-from .theme import DEFAULT_THEME, PlotTheme, apply_theme
+from .masked_metrics import is_masked_metric, masked_metric_source
 
 @dataclass(frozen=True)
 class SelectionRef:
@@ -59,41 +47,6 @@ def atomic_write_json(path: Path, value: object) -> Path:
 
 AxisScale = Literal["linear", "log", "categorical"]
 
-_MAIN_FIGURE_SIZE = (12.0, 7.4)
-_MAIN_AXES_RECT = (0.08, 0.19, 0.67, 0.73)
-_RADIO_RECT = (0.79, 0.58, 0.19, 0.34)
-_SLIDER_LEFT = 0.16
-_MAX_VISIBLE_METRIC_CONTROLS = 12
-_SLIDER_WIDTH = 0.56
-_SLIDER_HEIGHT = 0.025
-_SLIDER_BOTTOM = 0.045
-_SLIDER_GAP = 0.038
-
-
-def interactive_backend_active() -> bool:
-    """True when matplotlib selected a display-capable interactive backend.
-
-    The module no longer forces Agg: matplotlib auto-selects a GUI backend
-    when a display is available and falls back to Agg headlessly.  Callers
-    save first and then ``show()`` only when this reports True.
-    """
-    current = matplotlib.get_backend().lower()
-    return current in _interactive_backend_names()
-
-
-def _interactive_backend_names() -> set[str]:
-    try:
-        # matplotlib >= 3.9 registry API.
-        from matplotlib.backends.registry import BackendFilter, backend_registry
-
-        return {
-            name.lower()
-            for name in backend_registry.list_builtin(BackendFilter.INTERACTIVE)
-        }
-    except Exception:  # matplotlib 3.8: rcsetup.interactive_bk
-        return {name.lower() for name in rcsetup.interactive_bk}
-
-
 class HeatmapValidationError(ValueError):
     """Raised when table coordinates cannot form one exact dense heatmap."""
 
@@ -110,15 +63,6 @@ def _python_value(value: Any) -> Any:
     return value
 
 
-def _exact_equal(left: Any, right: Any) -> bool:
-    if isinstance(left, bool) or isinstance(right, bool):
-        return left is right
-    try:
-        return Decimal(str(left)) == Decimal(str(right))
-    except (InvalidOperation, ValueError):
-        return left == right
-
-
 def _labels(values: Sequence[Any]) -> tuple[str, ...]:
     return tuple(
         " / ".join(str(_python_value(item)) for item in value)
@@ -128,7 +72,7 @@ def _labels(values: Sequence[Any]) -> tuple[str, ...]:
     )
 
 
-def _auto_log(values: Sequence[Any]) -> bool:
+def auto_log(values: Sequence[Any]) -> bool:
     if len(values) < 3:
         return False
     try:
@@ -169,7 +113,7 @@ def _inferred_scale(values: Sequence[Any]) -> AxisScale:
         return "categorical"
     if np.any(~np.isfinite(numbers)):
         return "categorical"
-    if _auto_log(values):
+    if auto_log(values):
         return "log"
     return "linear"
 
@@ -295,10 +239,8 @@ class HeatmapAxis:
 class MaskSpec:
     max_price_diff_bps: float | None = None
     max_detach_energy: float | None = None
-    max_skew_percent: float | None = None
     max_final_price_diff_bps: float | None = None
     slippage_thr_bps: float | None = None
-    slippage_thr_max_bps: float | None = None
 
     def __post_init__(self) -> None:
         for name, value in self.__dict__.items():
@@ -316,13 +258,10 @@ class MaskSpec:
         payload: dict[str, float | None] = {
             "max_price_diff_bps": self.max_price_diff_bps,
             "max_detach_energy": self.max_detach_energy,
-            "max_skew_percent": self.max_skew_percent,
             "max_final_price_diff_bps": self.max_final_price_diff_bps,
         }
         if self.slippage_thr_bps is not None:
             payload["slippage_thr_bps"] = self.slippage_thr_bps
-        if self.slippage_thr_max_bps is not None:
-            payload["slippage_thr_max_bps"] = self.slippage_thr_max_bps
         return payload
 
 
@@ -335,7 +274,7 @@ class HeatmapSelection:
     grid_indices: tuple[int, ...]
 
     def to_selection_ref(self, run_id: str) -> SelectionRef:
-        """Adapt this exact table cell to Foundation's sole replay boundary."""
+        """Represent this exact table cell for replay."""
         return SelectionRef(
             run_id=run_id,
             kind="grid_point",
@@ -401,13 +340,7 @@ class HeatmapDataset:
         return self.axis_keys.index(self.axis(key).key)
 
     def _masked_metric_array(self, name: str, mask: MaskSpec) -> np.ndarray:
-        """Apply conditional legacy filters to a masked metric.
-
-        Raw tiles are observations, not pass/fail views: their values are only
-        invalidated by a failed evaluation row.  The threshold controls belong
-        to the derived ``*_masked`` family and are intentionally conditional
-        on that metric's semantics.
-        """
+        """Apply every enabled diagnostic threshold to ``X_masked``."""
         source = masked_metric_source(name, self.metrics)
         if source is None:
             raise HeatmapValidationError(f"unknown masked metric {name!r}")
@@ -428,36 +361,41 @@ class HeatmapDataset:
             )
             if pdiff is None:
                 raise HeatmapValidationError("price-difference mask metric is unavailable")
-            values[np.abs(pdiff) > mask.max_price_diff_bps / 10_000.0] = np.nan
-        if masked_metric_uses_detach(name, self.metrics) and mask.max_detach_energy is not None:
+            values[
+                ~np.isfinite(pdiff)
+                | (pdiff < 0.0)
+                | (np.abs(pdiff) > mask.max_price_diff_bps / 10_000.0)
+            ] = np.nan
+        if mask.max_detach_energy is not None:
             if "detach_energy_ungated" not in self.metrics:
                 raise HeatmapValidationError("detachment mask metric is unavailable")
             detach = np.asarray(self.metrics["detach_energy_ungated"], dtype=float)
             values[
-                ~np.isfinite(detach) | (detach > mask.max_detach_energy)
+                ~np.isfinite(detach)
+                | (detach < 0.0)
+                | (detach > mask.max_detach_energy)
             ] = np.nan
-        slippage_source = SLIPPAGE_APY_MASK_SOURCES.get(name)
-        if slippage_source is not None and mask.slippage_thr_bps is not None:
-            if slippage_source not in self.metrics:
+        if mask.max_final_price_diff_bps is not None:
+            if "final_rel_price_diff" not in self.metrics:
+                raise HeatmapValidationError("final price-difference mask metric is unavailable")
+            final_diff = np.asarray(self.metrics["final_rel_price_diff"], dtype=float)
+            values[
+                ~np.isfinite(final_diff)
+                | (final_diff < 0.0)
+                | (np.abs(final_diff) > mask.max_final_price_diff_bps / 10_000.0)
+            ] = np.nan
+        if mask.slippage_thr_bps is not None:
+            slippage_name = "tw_real_slippage_1pct"
+            if slippage_name not in self.metrics:
                 raise HeatmapValidationError(
-                    f"masked metric {name!r} requires {slippage_source!r} in the evaluation table"
+                    f"slippage mask metric {slippage_name!r} is unavailable"
                 )
-            slippage = np.asarray(self.metrics[slippage_source], dtype=float)
-            values[~np.isfinite(slippage) | (slippage > mask.slippage_thr_bps / 10_000.0)] = np.nan
-        if name in SKEW_MASKED_METRICS:
-            if mask.max_skew_percent is not None:
-                if "max_7d_skew" not in self.metrics:
-                    raise HeatmapValidationError("skew mask metric is unavailable")
-                skew = np.asarray(self.metrics["max_7d_skew"], dtype=float)
-                values[~np.isfinite(skew) | (np.abs(skew) > mask.max_skew_percent / 100.0)] = np.nan
-            if mask.max_final_price_diff_bps is not None:
-                if "final_rel_price_diff" not in self.metrics:
-                    raise HeatmapValidationError("final price-difference mask metric is unavailable")
-                final_diff = np.asarray(self.metrics["final_rel_price_diff"], dtype=float)
-                values[
-                    ~np.isfinite(final_diff)
-                    | (np.abs(final_diff) > mask.max_final_price_diff_bps / 10_000.0)
-                ] = np.nan
+            slippage = np.asarray(self.metrics[slippage_name], dtype=float)
+            values[
+                ~np.isfinite(slippage)
+                | (slippage == -1.0)
+                | (slippage > mask.slippage_thr_bps / 10_000.0)
+            ] = np.nan
         return values
 
     def metric_array(self, name: str, mask: MaskSpec = MaskSpec()) -> np.ndarray:
@@ -522,115 +460,6 @@ class HeatmapDataset:
             metrics=metrics,
             grid_indices=location,
         )
-
-
-
-@dataclass
-class HeatmapState:
-    axes: tuple[HeatmapAxis, ...]
-    metrics: tuple[str, ...]
-    metric: str
-    x_axis: str
-    y_axis: str
-    slider_indices: dict[str, int] = field(default_factory=dict)
-    mask: MaskSpec = field(default_factory=MaskSpec)
-    source: str | None = None
-
-    def __post_init__(self) -> None:
-        keys = tuple(axis.key for axis in self.axes)
-        if self.x_axis == self.y_axis or self.x_axis not in keys or self.y_axis not in keys:
-            raise HeatmapValidationError("heatmap state requires two distinct declared axes")
-        if self.metric not in self.metrics and not is_masked_metric(self.metric, self.metrics):
-            raise HeatmapValidationError("heatmap state metric is unavailable")
-        self.slider_indices = {
-            axis.key: int(self.slider_indices.get(axis.key, 0))
-            for axis in self.axes
-            if axis.key not in {self.x_axis, self.y_axis}
-        }
-        for axis in self.axes:
-            if axis.key in self.slider_indices:
-                index = self.slider_indices[axis.key]
-                if index < 0 or index >= len(axis.values):
-                    raise HeatmapValidationError(f"slider index is outside axis {axis.key!r}")
-
-    @property
-    def singleton_axes(self) -> tuple[str, ...]:
-        return tuple(axis.key for axis in self.axes if axis.is_singleton)
-
-    @property
-    def slider_axes(self) -> tuple[HeatmapAxis, ...]:
-        return tuple(
-            axis
-            for axis in self.axes
-            if axis.key not in {self.x_axis, self.y_axis} and not axis.is_singleton
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "schema_version": "fxopt_heatmap_state_v1",
-            "metric": self.metric,
-            "metrics": list(self.metrics),
-            "x_axis": self.x_axis,
-            "y_axis": self.y_axis,
-            "slider_indices": dict(self.slider_indices),
-            "slider_coordinates": {
-                axis.key: _python_value(axis.values[self.slider_indices[axis.key]])
-                for axis in self.axes
-                if axis.key in self.slider_indices
-            },
-            "singleton_axes": list(self.singleton_axes),
-            "mask": self.mask.to_dict(),
-            "axes": [
-                {
-                    "key": axis.key,
-                    "names": list(axis.names),
-                    "values": [_python_value(value) for value in axis.values],
-                    "scale": axis.scale,
-                }
-                for axis in self.axes
-            ],
-            "data": {
-                "source": self.source,
-                "shape": [len(axis.values) for axis in self.axes],
-                "axis_keys": [axis.key for axis in self.axes],
-            },
-        }
-
-    @classmethod
-    def default(
-        cls,
-        dataset: HeatmapDataset,
-        *,
-        metric: str | None = None,
-        x_axis: str | None = None,
-        y_axis: str | None = None,
-        mask: MaskSpec = MaskSpec(),
-    ) -> "HeatmapState":
-        active = [axis.key for axis in dataset.axes if not axis.is_singleton]
-        candidates = active + [axis.key for axis in dataset.axes if axis.key not in active]
-        if len(candidates) < 2:
-            raise HeatmapValidationError("heatmap needs two axes")
-        canonical = {"donation_apy", "reserved_profit_fraction"}
-        if x_axis is None and y_axis is None and canonical <= set(active):
-            selected_x, selected_y = "donation_apy", "reserved_profit_fraction"
-        else:
-            selected_x = x_axis or candidates[0]
-            selected_y = y_axis or next(key for key in candidates if key != selected_x)
-        metrics = tuple(dataset.metrics)
-        resolved_metric = metric
-        if resolved_metric is None:
-            if not metrics:
-                raise HeatmapValidationError("heatmap has no metrics")
-            resolved_metric = metrics[0]
-        return cls(
-            axes=dataset.axes,
-            metrics=metrics,
-            metric=resolved_metric,
-            x_axis=selected_x,
-            y_axis=selected_y,
-            mask=mask,
-        )
-
 
 @dataclass
 class HeatmapTilesState:
@@ -783,7 +612,7 @@ def _centers(axis: HeatmapAxis) -> np.ndarray:
     return np.asarray(axis.values, dtype=float)
 
 
-def _edges(centers: np.ndarray, *, logarithmic: bool) -> np.ndarray:
+def edges(centers: np.ndarray, *, logarithmic: bool) -> np.ndarray:
     if len(centers) == 1:
         center = float(centers[0])
         if logarithmic:
@@ -807,510 +636,13 @@ def _edges(centers: np.ndarray, *, logarithmic: bool) -> np.ndarray:
     return edges
 
 
-def _cell_index(axis: HeatmapAxis, coordinate: float) -> int | None:
-    """Return the containing declared cell, never a nearest coordinate."""
-    edges = _edges(
-        _centers(axis),
-        logarithmic=axis.scale == "log" and not _is_positional(axis),
-    )
-    if coordinate < edges[0] or coordinate > edges[-1]:
-        return None
-    index = int(np.searchsorted(edges, coordinate, side="right") - 1)
-    if index == len(axis.values) and coordinate == edges[-1]:
-        index -= 1
-    return index if 0 <= index < len(axis.values) else None
-
-
-def _atomic_save(figure: object, path: Path) -> None:
-    if path.exists():
-        raise FileExistsError(f"immutable heatmap artifact already exists: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=path.suffix, dir=path.parent
-    )
-    os.close(descriptor)
-    temporary = Path(temporary_name)
-    try:
-        figure.savefig(temporary, format=path.suffix.lstrip("."), bbox_inches="tight")
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-class MatplotlibHeatmapView:
-    """Live N-dimensional heatmap with exact cell inspection."""
-
-    def __init__(
-        self,
-        data: HeatmapDataset,
-        state: HeatmapState | None = None,
-        *,
-        on_select: Callable[[HeatmapSelection], None] | None = None,
-        theme: PlotTheme = DEFAULT_THEME,
-    ) -> None:
-        self.dataset = data
-        self.state = state or HeatmapState.default(self.dataset)
-        if self.state.axes != self.dataset.axes:
-            raise HeatmapValidationError("heatmap state axes differ from the dataset")
-        self.theme = theme
-        self.on_select = on_select
-        self.last_selection: HeatmapSelection | None = None
-        show_metric_controls = len(self.state.metrics) <= _MAX_VISIBLE_METRIC_CONTROLS
-        axes_rect = _MAIN_AXES_RECT if show_metric_controls else (0.08, 0.12, 0.82, 0.80)
-        self.figure = plt.figure(figsize=_MAIN_FIGURE_SIZE)
-        self.axis = self.figure.add_axes(axes_rect)
-        self._metric_axis = self.figure.add_axes(_RADIO_RECT, facecolor=theme.surface)
-        self._metric_axis.set_title("Metric", loc="left", fontfamily=theme.font_family)
-        self._metric_radio = RadioButtons(
-            self._metric_axis,
-            self.state.metrics,
-            active=self.state.metrics.index(self.state.metric),
-            activecolor=theme.accent,
-        )
-        self._metric_axis.set_visible(show_metric_controls)
-        self._metric_radio.on_clicked(self._on_metric)
-        self._sliders: dict[str, Slider] = {}
-        self._image: object | None = None
-        self._colorbar: object | None = None
-        self._rebuild_sliders()
-        self._draw()
-        self._click_connection = self.figure.canvas.mpl_connect(
-            "button_press_event", self._on_click
-        )
-
-    def _rebuild_sliders(self) -> None:
-        for slider in self._sliders.values():
-            slider.ax.remove()
-        self._sliders.clear()
-        for row, axis in enumerate(self.state.slider_axes):
-            slider_axis = self.figure.add_axes(
-                (
-                    _SLIDER_LEFT,
-                    _SLIDER_BOTTOM + row * _SLIDER_GAP,
-                    _SLIDER_WIDTH,
-                    _SLIDER_HEIGHT,
-                ),
-                facecolor=self.theme.surface,
-            )
-            slider = Slider(
-                slider_axis,
-                axis.key,
-                0,
-                len(axis.values) - 1,
-                valinit=self.state.slider_indices[axis.key],
-                valstep=1,
-                color=self.theme.accent,
-            )
-            slider.valtext.set_text(axis.display_labels[self.state.slider_indices[axis.key]])
-            slider.on_changed(lambda value, key=axis.key: self._on_slider(key, value))
-            self._sliders[axis.key] = slider
-
-    def _on_slider(self, key: str, value: float) -> None:
-        index = int(value)
-        self.state.slider_indices[key] = index
-        self._sliders[key].valtext.set_text(self.dataset.axis(key).display_labels[index])
-        self._draw()
-
-    def _on_metric(self, metric: str) -> None:
-        self.state.metric = metric
-        self._draw()
-
-    def _draw(self) -> None:
-        self.axis.clear()
-        x_axis = self.dataset.axis(self.state.x_axis)
-        y_axis = self.dataset.axis(self.state.y_axis)
-        values = self.dataset.slice_metric(
-            self.state.metric,
-            x_axis=x_axis.key,
-            y_axis=y_axis.key,
-            fixed_indices=self.state.slider_indices,
-            mask=self.state.mask,
-        )
-        x_centers = _centers(x_axis)
-        y_centers = _centers(y_axis)
-        self._image = self.axis.pcolormesh(
-            _edges(
-                x_centers,
-                logarithmic=x_axis.scale == "log" and not _is_positional(x_axis),
-            ),
-            _edges(
-                y_centers,
-                logarithmic=y_axis.scale == "log" and not _is_positional(y_axis),
-            ),
-            np.ma.masked_invalid(values),
-            shading="flat",
-            cmap=self.theme.sequential_cmap,
-        )
-        if self._colorbar is None:
-            self._colorbar = self.figure.colorbar(self._image, ax=self.axis, pad=0.02)
-        else:
-            self._colorbar.update_normal(self._image)
-        self._configure_axis(x_axis, orientation="x")
-        self._configure_axis(y_axis, orientation="y")
-        self.axis.set_title(
-            self.state.metric,
-            loc="left",
-            fontfamily=self.theme.font_family,
-            fontsize=self.theme.title_size,
-        )
-        apply_theme(self.figure, np.asarray([self.axis, self._metric_axis], dtype=object), self.theme)
-        self.figure.canvas.draw_idle()
-
-    def _configure_axis(self, axis: HeatmapAxis, *, orientation: Literal["x", "y"]) -> None:
-        label = self.axis.set_xlabel if orientation == "x" else self.axis.set_ylabel
-        scale = self.axis.set_xscale if orientation == "x" else self.axis.set_yscale
-        ticks = self.axis.set_xticks if orientation == "x" else self.axis.set_yticks
-        ticklabels = self.axis.set_xticklabels if orientation == "x" else self.axis.set_yticklabels
-        label(axis.key, fontfamily=self.theme.font_family, fontsize=self.theme.label_size)
-        positional = _is_positional(axis)
-        if axis.scale == "log" and not positional:
-            scale("log")
-        if positional:
-            ticks(_centers(axis))
-            ticklabels(
-                axis.display_labels,
-                rotation=35 if orientation == "x" else 0,
-                ha="right" if orientation == "x" else "center",
-            )
-
-    def selection_from_event(self, event: MouseEvent) -> HeatmapSelection | None:
-        if event.inaxes is not self.axis or event.xdata is None or event.ydata is None:
-            return None
-        x_axis = self.dataset.axis(self.state.x_axis)
-        y_axis = self.dataset.axis(self.state.y_axis)
-        x_index = _cell_index(x_axis, float(event.xdata))
-        y_index = _cell_index(y_axis, float(event.ydata))
-        if x_index is None or y_index is None:
-            return None
-        indices = [self.state.slider_indices.get(axis.key, 0) for axis in self.dataset.axes]
-        indices[self.dataset.axis_index(x_axis.key)] = x_index
-        indices[self.dataset.axis_index(y_axis.key)] = y_index
-        return self.dataset.point(indices)
-
-    def _on_click(self, event: MouseEvent) -> None:
-        if event.button not in {MouseButton.LEFT, 1}:
-            return
-        selection = self.selection_from_event(event)
-        if selection is None:
-            return
-        self.last_selection = selection
-        if self.on_select is not None:
-            self.on_select(selection)
-
-    def show(self, *, block: bool = True) -> None:
-        plt.show(block=block)
-
-    def save(
-        self,
-        output: Path | str,
-        *,
-        state_path: Path | str | None = None,
-    ) -> tuple[Path, Path]:
-        image_path = Path(output)
-        sidecar_path = Path(state_path) if state_path else image_path.with_suffix(".state.json")
-        if sidecar_path.exists():
-            raise FileExistsError(f"immutable heatmap state already exists: {sidecar_path}")
-        _atomic_save(self.figure, image_path)
-        atomic_write_json(sidecar_path, self.state.to_dict())
-        return image_path, sidecar_path
-
-    def close(self) -> None:
-        plt.close(self.figure)
-
-
-def render_heatmap(
-    data: HeatmapDataset,
-    output: Path | str,
-    *,
-    state: HeatmapState | None = None,
-    metric: str | None = None,
-    x_axis: str | None = None,
-    y_axis: str | None = None,
-    mask: MaskSpec = MaskSpec(),
-    theme: PlotTheme = DEFAULT_THEME,
-    source: str | None = None,
-) -> tuple[Path, Path]:
-    """Headlessly render a heatmap and deterministic complete state sidecar.
-
-    ``source`` is an opaque pointer to the N-D data (typically the run-relative
-    evaluation-table name) recorded in the state sidecar so frontends can
-    re-render any slice.  The figure is saved unconditionally; callers that
-    also want the interactive widget figure call ``show()`` themselves when
-    :func:`interactive_backend_active` reports a display-capable backend.
-    """
-    dataset = data
-    resolved_state = state or HeatmapState.default(
-        dataset,
-        metric=metric,
-        x_axis=x_axis,
-        y_axis=y_axis,
-        mask=mask,
-    )
-    if source is not None:
-        resolved_state.source = source
-    view = MatplotlibHeatmapView(dataset, resolved_state, theme=theme)
-    try:
-        return view.save(output)
-    finally:
-        view.close()
-
-
-_TILE_FIG_WIDTH = 6.0
-_TILE_FIG_HEIGHT = 5.0
-_TILE_SLIDER_LEFT = 0.12
-_TILE_SLIDER_WIDTH = 0.56
-_TILE_SLIDER_HEIGHT = 0.025
-_TILE_SLIDER_BOTTOM = 0.06
-_TILE_SLIDER_GAP = 0.04
-
-
-class MatplotlibHeatmapTilesView:
-    """Multi-metric tiled heatmap sharing one N-D slice and one validity mask."""
-
-    def __init__(
-        self,
-        data: HeatmapDataset,
-        *,
-        tiles: Sequence[str],
-        x_axis: str | None = None,
-        y_axis: str | None = None,
-        ncol: int = 2,
-        log_axes: Sequence[str] = (),
-        mask: MaskSpec = MaskSpec(),
-        theme: PlotTheme = DEFAULT_THEME,
-    ) -> None:
-        self.dataset = data
-        self.state = HeatmapTilesState.default(
-            self.dataset,
-            tiles=tiles,
-            x_axis=x_axis,
-            y_axis=y_axis,
-            mask=mask,
-            ncol=ncol,
-            log_axes=log_axes,
-        )
-        if self.state.axes != self.dataset.axes:
-            raise HeatmapValidationError("heatmap tiles state axes differ from the dataset")
-        self.theme = theme
-        n = len(self.state.tiles)
-        cols = min(self.state.ncol, n)
-        rows = max(1, math.ceil(n / cols)) if n else 1
-        grid_bottom = 0.12 if self.state.slider_axes else 0.06
-        self.figure = plt.figure(figsize=(_TILE_FIG_WIDTH * cols, _TILE_FIG_HEIGHT * rows))
-        self._axes = [self.figure.add_subplot(rows, cols, index + 1) for index in range(rows * cols)]
-        self._images: dict[int, object] = {}
-        self._colorbars: list[object] = []
-        self._sliders: dict[str, Slider] = {}
-        self._rebuild_sliders()
-        self._draw()
-        self.figure.subplots_adjust(bottom=grid_bottom, wspace=0.28, hspace=0.32)
-
-    def _rebuild_sliders(self) -> None:
-        for slider in self._sliders.values():
-            slider.ax.remove()
-        self._sliders.clear()
-        for row, axis in enumerate(self.state.slider_axes):
-            slider_axis = self.figure.add_axes(
-                (
-                    _TILE_SLIDER_LEFT,
-                    _TILE_SLIDER_BOTTOM + row * _TILE_SLIDER_GAP,
-                    _TILE_SLIDER_WIDTH,
-                    _TILE_SLIDER_HEIGHT,
-                ),
-                facecolor=self.theme.surface,
-            )
-            slider = Slider(
-                slider_axis,
-                axis.key,
-                0,
-                len(axis.values) - 1,
-                valinit=self.state.slider_indices[axis.key],
-                valstep=1,
-                color=self.theme.accent,
-            )
-            slider.valtext.set_text(axis.display_labels[self.state.slider_indices[axis.key]])
-            slider.on_changed(lambda value, key=axis.key: self._on_slider(key, value))
-            self._sliders[axis.key] = slider
-
-    def _on_slider(self, key: str, value: float) -> None:
-        index = int(value)
-        self.state.slider_indices[key] = index
-        if key in self._sliders:
-            self._sliders[key].valtext.set_text(self.dataset.axis(key).display_labels[index])
-        self._draw()
-
-    def _draw(self) -> None:
-        for colorbar in self._colorbars:
-            try:
-                colorbar.remove()
-            except Exception:
-                pass
-        self._colorbars = []
-        self._images = {}
-        x_axis = self.dataset.axis(self.state.x_axis)
-        y_axis = self.dataset.axis(self.state.y_axis)
-        log_x = x_axis.key in self.state.log_axes
-        log_y = y_axis.key in self.state.log_axes
-        x_positional = _is_positional(x_axis)
-        y_positional = _is_positional(y_axis)
-        x_centers = _centers(x_axis)
-        y_centers = _centers(y_axis)
-        x_edges = _edges(x_centers, logarithmic=log_x and not x_positional)
-        y_edges = _edges(y_centers, logarithmic=log_y and not y_positional)
-        n = len(self.state.tiles)
-        cols = min(self.state.ncol, n)
-        for index, axis in enumerate(self._axes):
-            axis.clear()
-            if index >= n:
-                axis.axis("off")
-                continue
-            metric = self.state.tiles[index]
-            # Legacy plot_heatmap_nd_opt.py builds metrics in two passes: raw
-            # metrics keep every cell (only success-masked); the *_masked
-            # family alone receives the pdiff/slippage caps. Scope the mask to
-            # masked tiles so raw panels keep full coverage.
-            tile_mask = (
-                self.state.mask
-                if is_masked_metric(metric, self.dataset.metrics)
-                else MaskSpec()
-            )
-            values = self.dataset.slice_metric(
-                metric,
-                x_axis=x_axis.key,
-                y_axis=y_axis.key,
-                fixed_indices=self.state.slider_indices,
-                mask=tile_mask,
-            )
-            image = axis.pcolormesh(
-                x_edges,
-                y_edges,
-                np.ma.masked_invalid(values),
-                shading="flat",
-                cmap=self.theme.sequential_cmap,
-            )
-            self._images[index] = image
-            if log_x and not x_positional:
-                axis.set_xscale("log")
-            if log_y and not y_positional:
-                axis.set_yscale("log")
-            self._configure_tile_ranges(image, values)
-            self._tile_axial(axis, x_axis, orientation="x", logarithmic=log_x)
-            self._tile_axial(axis, y_axis, orientation="y", logarithmic=log_y)
-            axis.set_title(metric, fontfamily=self.theme.font_family, fontsize=self.theme.title_size)
-            colorbar = self.figure.colorbar(image, ax=axis, fraction=0.046, pad=0.05)
-            self._colorbars.append(colorbar)
-        apply_theme(self.figure, np.asarray(self._axes[:max(1, n)], dtype=object) if n else np.asarray([], dtype=object), self.theme)
-        self.figure.canvas.draw_idle()
-
-    def _configure_tile_ranges(self, image: object, values: np.ndarray) -> None:
-        finite = values[np.isfinite(values)]
-        if finite.size == 0:
-            return
-        zmin = float(np.min(finite))
-        zmax = float(np.max(finite))
-        if zmin == zmax:
-            eps = 1e-12 if zmax == 0 else abs(zmax) * 1e-12
-            zmin, zmax = zmin - eps, zmax + eps
-        image.set_clim(zmin, zmax)
-
-    def _tile_axial(
-        self,
-        axis: object,
-        heat_axis: HeatmapAxis,
-        *,
-        orientation: Literal["x", "y"],
-        logarithmic: bool,
-    ) -> None:
-        label = axis.set_xlabel if orientation == "x" else axis.set_ylabel
-        scale = axis.set_xscale if orientation == "x" else axis.set_yscale
-        ticks = axis.set_xticks if orientation == "x" else axis.set_yticks
-        ticklabels = axis.set_xticklabels if orientation == "x" else axis.set_yticklabels
-        label(heat_axis.key, fontfamily=self.theme.font_family, fontsize=self.theme.label_size)
-        positional = _is_positional(heat_axis)
-        if logarithmic and not positional:
-            scale("log")
-        if positional:
-            centers = _centers(heat_axis)
-            ticks(centers)
-            ticklabels(
-                heat_axis.display_labels,
-                rotation=35 if orientation == "x" else 0,
-                ha="right" if orientation == "x" else "center",
-            )
-
-    def show(self, *, block: bool = True) -> None:
-        plt.show(block=block)
-
-    def save(
-        self,
-        output: Path | str,
-        *,
-        state_path: Path | str | None = None,
-    ) -> tuple[Path, Path]:
-        image_path = Path(output)
-        sidecar_path = Path(state_path) if state_path else image_path.with_suffix(".state.json")
-        if sidecar_path.exists():
-            raise FileExistsError(f"immutable heatmap state already exists: {sidecar_path}")
-        _atomic_save(self.figure, image_path)
-        atomic_write_json(sidecar_path, self.state.to_dict())
-        return image_path, sidecar_path
-
-    def close(self) -> None:
-        plt.close(self.figure)
-
-
-def render_heatmap_tiles(
-    data: HeatmapDataset,
-    output: Path | str,
-    *,
-    tiles: Sequence[str],
-    x_axis: str | None = None,
-    y_axis: str | None = None,
-    ncol: int = 2,
-    log_axes: Sequence[str] = (),
-    mask: MaskSpec = MaskSpec(),
-    theme: PlotTheme = DEFAULT_THEME,
-    source: str | None = None,
-) -> tuple[Path, Path]:
-    """Headlessly render the multi-metric tiled heatmap and its state sidecar.
-
-    Each tile shares the same x/y axes, the same fixed slice for extra
-    dimensions, and the same validity mask: a masked cell is NaN on every
-    tile.  ``source`` is recorded per tile so frontends can re-render any
-    slice.  The figure is saved unconditionally; callers that also want the
-    interactive widget figure call ``show()`` themselves when
-    :func:`interactive_backend_active` reports a display-capable backend.
-    """
-    dataset = data
-    view = MatplotlibHeatmapTilesView(
-        dataset,
-        tiles=tiles,
-        x_axis=x_axis,
-        y_axis=y_axis,
-        ncol=ncol,
-        log_axes=log_axes,
-        mask=mask,
-        theme=theme,
-    )
-    if source is not None:
-        view.state.source = source
-    try:
-        return view.save(output)
-    finally:
-        view.close()
-
-
 __all__ = [
+    "auto_log",
+    "edges",
     "HeatmapAxis",
     "HeatmapDataset",
     "HeatmapSelection",
-    "HeatmapState",
     "HeatmapTilesState",
     "HeatmapValidationError",
     "MaskSpec",
-    "MatplotlibHeatmapTilesView",
-    "MatplotlibHeatmapView",
-    "interactive_backend_active",
-    "render_heatmap",
-    "render_heatmap_tiles",
 ]

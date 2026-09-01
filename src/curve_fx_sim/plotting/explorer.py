@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import os
 import tempfile
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,16 +30,11 @@ from .heatmap import (
     MaskSpec,
     SelectionRef,
     atomic_write_json,
-    _auto_log,
-    _edges,
+    auto_log,
+    edges,
 )
 
-from .masked_metrics import (
-    SKEW_MASKED_METRICS,
-    SLIPPAGE_APY_MASK_SOURCES,
-    is_masked_metric,
-    masked_metric_uses_detach,
-)
+from .masked_metrics import is_masked_metric, masked_metric_uses_detach
 
 _LN2 = math.log(2.0)
 _MAX_TICKS = 12
@@ -120,22 +115,6 @@ def _format_slider_value(name: str, value: float) -> str:
     return f"{value:.4g}"
 
 
-def _target_name(target: Mapping[str, Any], fallback: str) -> str:
-    path = target.get("path")
-    return (
-        str(path[-1])
-        if isinstance(path, Sequence) and not isinstance(path, (str, bytes)) and path
-        else fallback
-    )
-
-
-def _target_value(value: Any, target: Mapping[str, Any]) -> float:
-    scale = float(target.get("scale", 1))
-    display_scale = float(target.get("display_scale", 1))
-    transformed = float(value) * scale / display_scale
-    return float(int(transformed)) if target.get("kind") in {"integer", "bps"} else transformed
-
-
 def _select_ticks(length: int, maximum: int = _MAX_TICKS) -> tuple[int, ...]:
     if length <= maximum:
         return tuple(range(length))
@@ -174,30 +153,10 @@ def _finite_clim(values: np.ndarray) -> tuple[float, float]:
     return lower, upper
 
 
-def _axis_metadata(dataset: HeatmapDataset, axis: HeatmapAxis) -> Mapping[str, Any]:
-    axes = dataset.metadata.get("axes")
-    index = dataset.axis_index(axis.key)
-    if isinstance(axes, Sequence) and index < len(axes) and isinstance(axes[index], Mapping):
-        return axes[index]
-    return {}
-
-
-def _targets(metadata: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
-    raw = metadata.get("targets") or metadata.get("target")
-    if isinstance(raw, Mapping):
-        return (raw,)
-    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
-        return tuple(target for target in raw if isinstance(target, Mapping))
-    return ()
-
-
 def _axis_view(
-    dataset: HeatmapDataset,
     axis: HeatmapAxis,
     explicit_logs: set[str],
 ) -> _AxisView:
-    metadata = _axis_metadata(dataset, axis)
-    targets = _targets(metadata)
     if axis.is_coupled:
         fee_axis = all(
             "fee" in name.lower().rsplit(".", 1)[-1]
@@ -207,11 +166,9 @@ def _axis_view(
         labels: list[str] = []
         for row in axis.values:
             parts = []
-            for index, (name, value) in enumerate(zip(axis.names, row, strict=True)):
-                target = targets[index] if index < len(targets) else {}
+            for name, value in zip(axis.names, row, strict=True):
                 try:
-                    raw = _target_value(value, target) if target else float(value)
-                    formatted = _format_slider_value(name, raw)
+                    formatted = _format_slider_value(name, float(value))
                     parts.append(formatted.removesuffix(" bps") if fee_axis else formatted)
                 except (TypeError, ValueError, ZeroDivisionError):
                     parts.append(str(value))
@@ -236,17 +193,11 @@ def _axis_view(
             logarithmic=False,
         )
     name = axis.names[0]
-    if targets:
-        name = _target_name(targets[0], name)
-        try:
-            numeric = np.asarray([_target_value(value, targets[0]) for value in axis.values])
-        except (TypeError, ValueError, ZeroDivisionError):
-            numeric = np.asarray(axis.values, dtype=float)
     positional = len(numeric) > 1 and not bool(np.all(np.diff(numeric) > 0))
     display_name, labels = _axis_name_and_labels(name, numeric.tolist())
     centers = np.arange(len(numeric), dtype=float) if positional else numeric
     logarithmic = not positional and (
-        axis.key in explicit_logs or axis.scale == "log" or _auto_log(numeric)
+        axis.key in explicit_logs or axis.scale == "log" or auto_log(numeric)
     )
     return _AxisView(axis.key, display_name, centers, labels, positional, logarithmic)
 
@@ -267,11 +218,11 @@ def _main_figure_size(nx: int, ny: int, rows: int, cols: int) -> tuple[float, fl
 
 
 def _cell_index_from_view(view: _AxisView, coordinate: float) -> int | None:
-    edges = _edges(view.centers, logarithmic=view.logarithmic and not view.positional)
-    if coordinate < edges[0] or coordinate > edges[-1]:
+    cell_edges = edges(view.centers, logarithmic=view.logarithmic and not view.positional)
+    if coordinate < cell_edges[0] or coordinate > cell_edges[-1]:
         return None
-    index = int(np.searchsorted(edges, coordinate, side="right") - 1)
-    if index == len(view.centers) and coordinate == edges[-1]:
+    index = int(np.searchsorted(cell_edges, coordinate, side="right") - 1)
+    if index == len(view.centers) and coordinate == cell_edges[-1]:
         index -= 1
     return index if 0 <= index < len(view.centers) else None
 
@@ -306,10 +257,6 @@ def _window_title(figure: Any, title: str) -> None:
     setter = getattr(manager, "set_window_title", None)
     if callable(setter):
         setter(title)
-
-
-def _metric_requires_mask(metric: str, available: Collection[str]) -> bool:
-    return is_masked_metric(metric, available)
 
 
 def _metric_scale_info(metric: str) -> tuple[float, str]:
@@ -360,12 +307,9 @@ class HeatmapExplorer:
         y_axis: str | None = None,
         max_pricethr: float | None = 100.0,
         max_detach_energy: float | None = None,
-        skewthr: float | None = None,
-        slipthr: float | None = 20.0,
-        slipthr_max: float | None = 100.0,
+        slipthr: float | None = None,
         final_pdiffthr: float | None = None,
         run_id: str | None = None,
-        run_dir: Path | None = None,
         on_replay: Callable[[SelectionRef, str], Any] | None = None,
     ) -> None:
         if not isinstance(data, HeatmapDataset):
@@ -391,10 +335,8 @@ class HeatmapExplorer:
         mask = MaskSpec(
             max_price_diff_bps=max_pricethr,
             max_detach_energy=max_detach_energy,
-            max_skew_percent=skewthr,
             max_final_price_diff_bps=final_pdiffthr,
             slippage_thr_bps=slipthr,
-            slippage_thr_max_bps=slipthr_max,
         )
         self.state = HeatmapTilesState.default(
             self.dataset,
@@ -407,7 +349,7 @@ class HeatmapExplorer:
         )
         explicit_logs = set(log_axes)
         self._axis_views = {
-            axis.key: _axis_view(self.dataset, axis, explicit_logs)
+            axis.key: _axis_view(axis, explicit_logs)
             for axis in self.dataset.axes
         }
         self.state.log_axes = tuple(
@@ -469,15 +411,10 @@ class HeatmapExplorer:
             for name in masked
         )
         price_source = self._mask_source("max_7d_rel_price_diff", "max_rel_price_diff")
-        threshold_count = sum(
-            (
-                bool(masked and price_source),
-                bool(detach_masked and "detach_energy_ungated" in self.dataset.metrics),
-                bool(selected & set(SKEW_MASKED_METRICS) and "max_7d_skew" in self.dataset.metrics),
-                bool(selected & set(SLIPPAGE_APY_MASK_SOURCES) and any(source in self.dataset.metrics for source in SLIPPAGE_APY_MASK_SOURCES.values())),
-                bool(selected & set(SKEW_MASKED_METRICS) and "final_rel_price_diff" in self.dataset.metrics),
-            )
-        )
+        threshold_count = sum((
+            bool(masked and price_source),
+            bool(detach_masked and "detach_energy_ungated" in self.dataset.metrics),
+        ))
         slider_count = len(self._get_slider_dims()) + threshold_count
         radio_height = len(keys) * 0.03 + 0.01
         content_height = (
@@ -562,12 +499,6 @@ class HeatmapExplorer:
                 max_pricethr=self.state.mask.max_detach_energy,
                 source="detach_energy_ungated",
             )
-        if selected & set(SKEW_MASKED_METRICS) and "max_7d_skew" in self.dataset.metrics:
-            y = self._add_threshold_slider("skewthr", "7d skew max (%)", y, max_pricethr=self.state.mask.max_skew_percent, source="max_7d_skew", scale=100.0)
-        if selected & set(SLIPPAGE_APY_MASK_SOURCES) and any(source in self.dataset.metrics for source in SLIPPAGE_APY_MASK_SOURCES.values()):
-            y = self._add_threshold_slider("slipthr", "slippage thr (bps)", y, max_pricethr=self.state.mask.slippage_thr_bps, source="tw_real_slippage_1pct", scale=10_000.0, range_max=self.state.mask.slippage_thr_max_bps)
-        if selected & set(SKEW_MASKED_METRICS) and "final_rel_price_diff" in self.dataset.metrics:
-            y = self._add_threshold_slider("final_pdiffthr", "final pdiff thr (bps)", y, max_pricethr=self.state.mask.max_final_price_diff_bps, source="final_rel_price_diff", scale=10_000.0)
         self.fig_controls.text(0.08, max(0.02, y - 0.02), "Shift+click / right-click: exact replay", fontsize=8)
         self.fig_controls.canvas.draw_idle()
 
@@ -583,12 +514,9 @@ class HeatmapExplorer:
         max_pricethr: float | None,
         source: str | None = None,
         scale: float = 1.0,
-        range_max: float | None = None,
     ) -> float:
         maximum = _finite_max(self.dataset, source, scale) if source else None
         maximum = max(1.0, float(maximum or 0.0), float(max_pricethr or 0.0))
-        if range_max is not None:
-            maximum = max(1.0, float(range_max))
         initial = maximum if max_pricethr is None else min(maximum, max(0.0, float(max_pricethr)))
         self.fig_controls.text(0.05, y, f"{label}:", ha="left", va="bottom", fontsize=8)
         control_ax = self.fig_controls.add_axes((0.20, y - 0.04, 0.62, 0.025))
@@ -599,14 +527,6 @@ class HeatmapExplorer:
         )
         slider.on_changed(lambda value, name=key: self._on_threshold_slider(name, value))
         self._threshold_sliders[key] = slider
-        if key == "max_pricethr":
-            self.max_price_thr_slider = slider
-        elif key == "skewthr":
-            self.skew_thr_slider = slider
-        elif key == "slipthr":
-            self.slippage_thr_slider = slider
-        elif key == "final_pdiffthr":
-            self.final_price_thr_slider = slider
         return y - _CONTROL_ROW_PITCH
 
     def _on_dimension_slider(self, key: str, value: float) -> None:
@@ -620,16 +540,13 @@ class HeatmapExplorer:
         values = {
             "max_price_diff_bps": mask.max_price_diff_bps,
             "max_detach_energy": mask.max_detach_energy,
-            "max_skew_percent": mask.max_skew_percent,
             "max_final_price_diff_bps": mask.max_final_price_diff_bps,
             "slippage_thr_bps": mask.slippage_thr_bps,
-            "slippage_thr_max_bps": mask.slippage_thr_max_bps,
         }
         values[
             {
                 "max_pricethr": "max_price_diff_bps",
                 "detachthr": "max_detach_energy",
-                "skewthr": "max_skew_percent",
                 "slipthr": "slippage_thr_bps",
                 "final_pdiffthr": "max_final_price_diff_bps",
             }[key]
@@ -696,8 +613,8 @@ class HeatmapExplorer:
         self.colorbars = []
         x_axis = self.dataset.axis(self.state.x_axis)
         y_axis = self.dataset.axis(self.state.y_axis)
-        x_edges = _edges(x_view.centers, logarithmic=x_view.logarithmic)
-        y_edges = _edges(y_view.centers, logarithmic=y_view.logarithmic)
+        x_edges = edges(x_view.centers, logarithmic=x_view.logarithmic)
+        y_edges = edges(y_view.centers, logarithmic=y_view.logarithmic)
         x_tick_indices = _select_ticks(len(x_view.centers))
         y_tick_indices = _select_ticks(len(y_view.centers))
         tick_font = _auto_font_size(len(x_view.centers), len(y_view.centers))
@@ -706,7 +623,7 @@ class HeatmapExplorer:
         for index, (axis, metric) in enumerate(zip(self._metric_axes, self.state.tiles, strict=True)):
             tile_mask = (
                 self.state.mask
-                if _metric_requires_mask(metric, self.dataset.metrics)
+                if is_masked_metric(metric, self.dataset.metrics)
                 else MaskSpec()
             )
             values = self.dataset.slice_metric(
@@ -779,7 +696,7 @@ class HeatmapExplorer:
                 return ""
             tile_mask = (
                 self.state.mask
-                if _metric_requires_mask(metric, self.dataset.metrics)
+                if is_masked_metric(metric, self.dataset.metrics)
                 else MaskSpec()
             )
             value = self.dataset.metric_array(metric, tile_mask)[tuple(indices)]
@@ -826,7 +743,7 @@ class HeatmapExplorer:
             for metric in self.state.tiles:
                 tile_mask = (
                     self.state.mask
-                    if _metric_requires_mask(metric, self.dataset.metrics)
+                    if is_masked_metric(metric, self.dataset.metrics)
                     else MaskSpec()
                 )
                 value = self.dataset.metric_array(metric, tile_mask)[selection.grid_indices]
