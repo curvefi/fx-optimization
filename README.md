@@ -217,6 +217,11 @@ controls—for example `apy_masked`, `apy_net_masked`, or
 `--final-price-diff-bps` and `--slippage-bps` filters apply when explicitly
 provided; unsuffixed diagnostic panels remain unmasked.
 
+The legacy-compatible `apy_1_masked` and `apy_5_masked` views use `apy_net`
+and mask it against the matching 1%- or 5%-of-TVL slippage probe. Selecting
+either view adds an interactive slippage-cap slider (0-100 bp, 20 bp default).
+The raw `tw_real_slippage_*_masked` panels remain price-difference-masked only.
+
 No-YB discovery ranks `apy_net_robust_90d` with detachment. The earnings
 metric gives equal weight to the mean and worst-5% mean of daily-sampled
 trailing-90-day net log returns, then converts that blended rate to APY.

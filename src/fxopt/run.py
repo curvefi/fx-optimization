@@ -44,7 +44,7 @@ from .robustness import (
 _RUN_KEYS = frozenset({"id", "evaluator", "template", "batch_size", "workers", "metric_fields"})
 _PLACEMENT_KEYS = frozenset({"hosts", "numa_nodes"})
 _CANDIDATE_KEYS = frozenset({"defaults", "axes"})
-_SCENARIO_KEYS = frozenset({"id", "market", "chainlink", "yb_mode"})
+_SCENARIO_KEYS = frozenset({"id", "market", "price_feed", "yb_mode"})
 _COMPILED_POLICY_KEYS = frozenset({"header", "id"})
 EVALUATOR_POLICY_METADATA_KEY = "expected_evaluator_policy"
 _COMPILED_POLICY_ABI = "twocrypto_policy_v1"
@@ -168,7 +168,7 @@ class RunConfig:
         if not isinstance(session, Mapping):
             raise ConfigError("[session] must be a mapping")
         forbidden_session = {
-            "session_id", "template_path", "scenario_id", "market_path", "chainlink_path"
+            "session_id", "template_path", "scenario_id", "market_path", "price_feed_path"
         } & set(session)
         if forbidden_session:
             raise ConfigError(
@@ -178,6 +178,7 @@ class RunConfig:
         resolved_session.setdefault("event_cursor", "scalar")
         resolved_session.setdefault("metric_profile", "full_summary")
         resolved_session.setdefault("enable_slippage_probes", False)
+        resolved_session.setdefault("arbitrage_enabled", True)
 
         candidate = raw.get("candidate")
         if not isinstance(candidate, Mapping):
@@ -200,12 +201,12 @@ class RunConfig:
             "id": scenario_id,
             "market": str(market),
         }
-        chainlink = scenario.get("chainlink")
-        if chainlink is not None:
-            if not isinstance(chainlink, str) or not chainlink.strip():
-                raise ConfigError("scenario.chainlink must be a non-empty string")
-            resolved_scenario["chainlink"] = str(
-                _resolve_path(chainlink, config_path.parent)
+        price_feed = scenario.get("price_feed")
+        if price_feed is not None:
+            if not isinstance(price_feed, str) or not price_feed.strip():
+                raise ConfigError("scenario.price_feed must be a non-empty string")
+            resolved_scenario["price_feed"] = str(
+                _resolve_path(price_feed, config_path.parent)
             )
         scenario_yb_mode = scenario.get("yb_mode", "off")
         if not isinstance(scenario_yb_mode, str):
@@ -214,8 +215,11 @@ class RunConfig:
         if (
             resolved_session["event_cursor"] == "exact_skip"
             and resolved_session["metric_profile"] != "grid_core"
+            and resolved_session["arbitrage_enabled"] is not False
         ):
-            raise ConfigError("exact_skip requires metric_profile='grid_core'")
+            raise ConfigError(
+                "exact_skip with arbitrage requires metric_profile='grid_core'"
+            )
         if (
             resolved_session["metric_profile"] == "grid_core"
             and (
@@ -407,7 +411,7 @@ def stage_remote_run(config: RunConfig) -> str:
     local_inputs = _execution_inputs(config, remote=False)
     remote_inputs = _execution_inputs(config, remote=True)
     first = config.hosts[0]
-    for name in ("template", "market", "chainlink"):
+    for name in ("template", "market", "price_feed"):
         if name in remote_inputs:
             ensure_remote_file(
                 first,
@@ -470,8 +474,8 @@ def _execution_inputs(config: RunConfig, *, remote: bool) -> dict[str, str]:
         "template": str(config.template),
         "market": config.scenario["market"],
     }
-    if (chainlink := config.scenario.get("chainlink")) is not None:
-        inputs["chainlink"] = chainlink
+    if (price_feed := config.scenario.get("price_feed")) is not None:
+        inputs["price_feed"] = price_feed
     if config.compiled_policy_header is not None:
         inputs["policy_header"] = str(config.compiled_policy_header)
     if remote:
@@ -505,8 +509,8 @@ def open_session_request(config: RunConfig, *, remote: bool | None = None) -> di
         "market_path": inputs["market"],
         **config.session,
     }
-    if (chainlink := inputs.get("chainlink")) is not None:
-        request["chainlink_path"] = chainlink
+    if (price_feed := inputs.get("price_feed")) is not None:
+        request["price_feed_path"] = price_feed
     if (yb_mode := config.scenario.get("yb_mode")) is not None:
         request.setdefault("yb_mode", yb_mode)
     return request
@@ -534,7 +538,7 @@ def run_metadata(
             raise ConfigError(f"coordinator replay path must be below {REMOTE_BASE}") from exc
         return str(origin_workspace.joinpath(*relative.parts))
 
-    for key in ("template_path", "market_path", "chainlink_path"):
+    for key in ("template_path", "market_path", "price_feed_path"):
         if key in replay_session:
             replay_session[key] = replay_path(replay_session[key])
     config_path = origin_config or config.path

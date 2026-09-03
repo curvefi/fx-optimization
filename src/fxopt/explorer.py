@@ -10,7 +10,11 @@ import numpy as np
 
 from curve_fx_sim.plotting.explorer import HeatmapExplorer
 from curve_fx_sim.plotting.heatmap import HeatmapAxis, HeatmapDataset
-from curve_fx_sim.plotting.masked_metrics import masked_metric_source
+from curve_fx_sim.plotting.masked_metrics import (
+    masked_metric_slippage_source,
+    masked_metric_source,
+    masked_metric_uses_slippage,
+)
 from .results import ResultColumns, read_result_columns
 from .shiftclick import shiftclick_figure, trace_stored_candidate
 
@@ -40,8 +44,13 @@ def _metric_columns(
             needed.add("detach_energy_ungated")
         if need_final_price_diff and "final_rel_price_diff" in available_set:
             needed.add("final_rel_price_diff")
-        if need_slippage and "tw_real_slippage_1pct" in available_set:
-            needed.add("tw_real_slippage_1pct")
+        slippage_source = masked_metric_slippage_source(name)
+        if slippage_source is not None or (
+            need_slippage and masked_metric_uses_slippage(name, available_set)
+        ):
+            slippage_source = slippage_source or "tw_real_slippage_1pct"
+            if slippage_source in available_set:
+                needed.add(slippage_source)
     return tuple(name for name in available if name in needed)
 
 

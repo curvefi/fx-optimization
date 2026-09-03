@@ -14,7 +14,13 @@ from typing import Any, Literal
 
 import numpy as np
 
-from .masked_metrics import is_masked_metric, masked_metric_source
+from .masked_metrics import (
+    is_masked_metric,
+    masked_metric_slippage_source,
+    masked_metric_source,
+    masked_metric_uses_detach,
+    masked_metric_uses_slippage,
+)
 
 @dataclass(frozen=True)
 class SelectionRef:
@@ -366,7 +372,8 @@ class HeatmapDataset:
                 | (pdiff < 0.0)
                 | (np.abs(pdiff) > mask.max_price_diff_bps / 10_000.0)
             ] = np.nan
-        if mask.max_detach_energy is not None:
+        uses_detach = masked_metric_uses_detach(name, self.metrics)
+        if mask.max_detach_energy is not None and uses_detach:
             if "detach_energy_ungated" not in self.metrics:
                 raise HeatmapValidationError("detachment mask metric is unavailable")
             detach = np.asarray(self.metrics["detach_energy_ungated"], dtype=float)
@@ -375,7 +382,7 @@ class HeatmapDataset:
                 | (detach < 0.0)
                 | (detach > mask.max_detach_energy)
             ] = np.nan
-        if mask.max_final_price_diff_bps is not None:
+        if mask.max_final_price_diff_bps is not None and uses_detach:
             if "final_rel_price_diff" not in self.metrics:
                 raise HeatmapValidationError("final price-difference mask metric is unavailable")
             final_diff = np.asarray(self.metrics["final_rel_price_diff"], dtype=float)
@@ -384,8 +391,12 @@ class HeatmapDataset:
                 | (final_diff < 0.0)
                 | (np.abs(final_diff) > mask.max_final_price_diff_bps / 10_000.0)
             ] = np.nan
-        if mask.slippage_thr_bps is not None:
-            slippage_name = "tw_real_slippage_1pct"
+        if mask.slippage_thr_bps is not None and masked_metric_uses_slippage(
+            name, self.metrics
+        ):
+            slippage_name = (
+                masked_metric_slippage_source(name) or "tw_real_slippage_1pct"
+            )
             if slippage_name not in self.metrics:
                 raise HeatmapValidationError(
                     f"slippage mask metric {slippage_name!r} is unavailable"

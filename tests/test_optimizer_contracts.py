@@ -16,6 +16,7 @@ from curve_fx_sim.plotting.heatmap import (
     HeatmapValidationError,
     MaskSpec,
 )
+from curve_fx_sim.plotting.masked_metrics import masked_metric_slippage_sources
 from fxopt.explorer import open_fxopt_explorer
 from fxopt import Candidate, EvaluatorSession
 from fxopt.cli import main
@@ -33,6 +34,7 @@ def _run_toml(
     compiled_policy: str = "",
     session: str = "",
     yb_mode: str = "off",
+    price_feed: str = "",
     metrics: str = '["score"]',
     axes: str = "",
 ) -> Path:
@@ -48,6 +50,7 @@ metric_fields = {metrics}
 [scenario]
 id = "scenario"
 market = "market.json"
+{price_feed}
 yb_mode = "{yb_mode}"
 {compiled_policy}
 [candidate.defaults]
@@ -76,9 +79,27 @@ def test_config_admission_table_covers_native_compiled_and_profiles(tmp_path: Pa
             None,
         ),
         (
+            "price-feed",
+            {"price_feed": 'price_feed = "nav.csv"'},
+            None,
+        ),
+        (
             "exact-skip-profile",
             {"session": '[session]\nevent_cursor = "exact_skip"\nmetric_profile = "full_summary"'},
-            "exact_skip requires metric_profile='grid_core'",
+            "exact_skip with arbitrage requires metric_profile='grid_core'",
+        ),
+        (
+            "exact-skip-no-arb-full-summary",
+            {
+                "session": (
+                    '[session]\nevent_cursor = "exact_skip"\n'
+                    'metric_profile = "full_summary"\n'
+                    "arbitrage_enabled = false\n"
+                    "enable_slippage_probes = true"
+                ),
+                "metrics": '["tw_real_slippage_1pct"]',
+            },
+            None,
         ),
         (
             "grid-core-admission",
@@ -118,6 +139,11 @@ def test_config_admission_table_covers_native_compiled_and_profiles(tmp_path: Pa
         if name == "full-summary-yb-slippage":
             assert config.scenario["yb_mode"] == "active_2l"
             assert config.session["enable_slippage_probes"] is True
+        if name == "price-feed":
+            metadata = run_metadata(config, effective_batch=2)
+            assert metadata["open_session"]["price_feed_path"].endswith("nav.csv")
+        if name == "exact-skip-no-arb-full-summary":
+            assert config.session["arbitrage_enabled"] is False
 
 
 class _GridClient:
@@ -441,6 +467,31 @@ def test_generic_mask_thresholds_fail_closed_and_require_source_metrics() -> Non
         if source is not None:
             with pytest.raises(HeatmapValidationError, match="mask metric.*unavailable"):
                 _mask_dataset(omit=source).metric_array("apy_net_masked", mask)
+
+
+def test_legacy_apy_mask_aliases_use_matching_slippage_sources() -> None:
+    dataset = _mask_dataset()
+    dataset.metrics["max_7d_rel_price_diff"] = np.full((2, 2), 0.001)
+    dataset.metrics["tw_real_slippage_5pct"] = np.array(
+        [[0.003, 0.001], [0.003, 0.001]]
+    )
+    mask = MaskSpec(slippage_thr_bps=20)
+
+    assert np.isfinite(dataset.metric_array("apy_masked", mask)).all()
+    assert np.isfinite(dataset.metric_array("apy_1_masked", mask)).tolist() == [
+        [True, False],
+        [False, True],
+    ]
+    assert np.isfinite(dataset.metric_array("apy_5_masked", mask)).tolist() == [
+        [False, True],
+        [False, True],
+    ]
+    assert np.isfinite(
+        dataset.metric_array("tw_real_slippage_5pct_masked", mask)
+    ).all()
+    assert masked_metric_slippage_sources(
+        ("apy_masked", "apy_1_masked", "apy_5_masked"), dataset.metrics
+    ) == ("tw_real_slippage_1pct", "tw_real_slippage_5pct")
 
 
 class _TraceClient:

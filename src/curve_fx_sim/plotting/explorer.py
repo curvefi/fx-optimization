@@ -34,7 +34,11 @@ from .heatmap import (
     edges,
 )
 
-from .masked_metrics import is_masked_metric, masked_metric_uses_detach
+from .masked_metrics import (
+    is_masked_metric,
+    masked_metric_slippage_sources,
+    masked_metric_uses_detach,
+)
 
 _LN2 = math.log(2.0)
 _MAX_TICKS = 12
@@ -328,6 +332,11 @@ class HeatmapExplorer:
             raise ValueError("explorer requires at least one metric")
         if ncol < 1:
             raise ValueError("ncol must be positive")
+        slippage_sources = masked_metric_slippage_sources(
+            self.metrics, self.dataset.metrics
+        )
+        if slipthr is None and slippage_sources:
+            slipthr = 20.0
         self.run_id = run_id or ""
         self.on_replay = on_replay
         self._updating_radios = False
@@ -410,10 +419,14 @@ class HeatmapExplorer:
             masked_metric_uses_detach(name, self.dataset.metrics)
             for name in masked
         )
+        slippage_sources = masked_metric_slippage_sources(
+            tuple(masked), self.dataset.metrics
+        )
         price_source = self._mask_source("max_7d_rel_price_diff", "max_rel_price_diff")
         threshold_count = sum((
             bool(masked and price_source),
             bool(detach_masked and "detach_energy_ungated" in self.dataset.metrics),
+            bool(slippage_sources),
         ))
         slider_count = len(self._get_slider_dims()) + threshold_count
         radio_height = len(keys) * 0.03 + 0.01
@@ -493,6 +506,12 @@ class HeatmapExplorer:
                 source=price_source,
                 scale=10_000.0,
             )
+        if slippage_sources:
+            y = self._add_threshold_slider(
+                "slipthr", "slippage cap (bps)", y,
+                max_pricethr=self.state.mask.slippage_thr_bps,
+                minimum_maximum=100.0,
+            )
         if detach_masked and "detach_energy_ungated" in self.dataset.metrics:
             y = self._add_threshold_slider(
                 "detachthr", "detach energy max", y,
@@ -514,9 +533,14 @@ class HeatmapExplorer:
         max_pricethr: float | None,
         source: str | None = None,
         scale: float = 1.0,
+        minimum_maximum: float = 1.0,
     ) -> float:
         maximum = _finite_max(self.dataset, source, scale) if source else None
-        maximum = max(1.0, float(maximum or 0.0), float(max_pricethr or 0.0))
+        maximum = max(
+            minimum_maximum,
+            float(maximum or 0.0),
+            float(max_pricethr or 0.0),
+        )
         initial = maximum if max_pricethr is None else min(maximum, max(0.0, float(max_pricethr)))
         self.fig_controls.text(0.05, y, f"{label}:", ha="left", va="bottom", fontsize=8)
         control_ax = self.fig_controls.add_axes((0.20, y - 0.04, 0.62, 0.025))
