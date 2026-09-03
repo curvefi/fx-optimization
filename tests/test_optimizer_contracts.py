@@ -24,7 +24,7 @@ from fxopt.config import ConfigError
 from fxopt.engine import ProjectedBatch
 from fxopt.results import GridResultWriter, merge_grid_partitions, read_result_columns
 from fxopt.run import RunConfig, run_config, run_metadata
-from fxopt.shiftclick import save_shiftclick_plot
+from fxopt.shiftclick import save_shiftclick_plot, trace_stored_candidate
 
 
 def _run_toml(
@@ -86,20 +86,14 @@ def test_config_admission_table_covers_native_compiled_and_profiles(tmp_path: Pa
         (
             "exact-skip-profile",
             {"session": '[session]\nevent_cursor = "exact_skip"\nmetric_profile = "full_summary"'},
-            "exact_skip with arbitrage requires metric_profile='grid_core'",
+            "exact_skip requires metric_profile='grid_core'",
         ),
         (
-            "exact-skip-no-arb-full-summary",
+            "removed-arbitrage-switch",
             {
-                "session": (
-                    '[session]\nevent_cursor = "exact_skip"\n'
-                    'metric_profile = "full_summary"\n'
-                    "arbitrage_enabled = false\n"
-                    "enable_slippage_probes = true"
-                ),
-                "metrics": '["tw_real_slippage_1pct"]',
+                "session": "[session]\narbitrage_enabled = false",
             },
-            None,
+            "session.arbitrage_enabled was removed",
         ),
         (
             "grid-core-admission",
@@ -142,8 +136,6 @@ def test_config_admission_table_covers_native_compiled_and_profiles(tmp_path: Pa
         if name == "price-feed":
             metadata = run_metadata(config, effective_batch=2)
             assert metadata["open_session"]["price_feed_path"].endswith("nav.csv")
-        if name == "exact-skip-no-arb-full-summary":
-            assert config.session["arbitrage_enabled"] is False
 
 
 class _GridClient:
@@ -548,6 +540,7 @@ def test_stored_ordinal_replay_passes_exact_candidate_for_yb_off_and_enabled(
                 "open_session": {
                     "scenario_id": "scenario",
                     "yb_mode": "active_2l",
+                    "arbitrage_enabled": True,
                 },
             },
         }
@@ -608,3 +601,23 @@ def test_stored_ordinal_replay_passes_exact_candidate_for_yb_off_and_enabled(
         "active_2l", "off"
     ]
     assert all(client.payloads[0]["candidate_id"] == "p00000003" for client in clients)
+    assert all(
+        "arbitrage_enabled" not in client.open_requests[0]
+        for client in clients
+    )
+
+    blocked_metadata = dict(manifest["metadata"])
+    blocked_replay = dict(blocked_metadata["replay"])
+    blocked_replay["open_session"] = {
+        **blocked_replay["open_session"],
+        "arbitrage_enabled": False,
+    }
+    blocked_metadata["replay"] = blocked_replay
+    with pytest.raises(ValueError, match="historical no-arbitrage run"):
+        trace_stored_candidate(
+            manifest["run_id"],
+            blocked_metadata,
+            candidate=Candidate("blocked"),
+            ordinal=0,
+            output_dir=tmp_path / "blocked",
+        )

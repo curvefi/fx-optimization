@@ -45,6 +45,13 @@ def _replay_from_metadata(
         raise ValueError("run replay metadata has no local work directory")
     if not isinstance(open_session, Mapping):
         raise ValueError("run replay metadata has no local session request")
+    normalized_open_session = dict(open_session)
+    legacy_arbitrage = normalized_open_session.pop("arbitrage_enabled", True)
+    if legacy_arbitrage is not True:
+        raise ValueError(
+            "cannot replay a historical no-arbitrage run after removal of "
+            "arbitrage_enabled"
+        )
     if (
         not isinstance(evaluator_policy, Mapping)
         or set(evaluator_policy)
@@ -63,7 +70,7 @@ def _replay_from_metadata(
         run_id=run_id,
         evaluator=Path(evaluator).expanduser(),
         work_dir=Path(work_dir).expanduser(),
-        open_session=dict(open_session),
+        open_session=normalized_open_session,
         evaluator_policy=dict(evaluator_policy),
     )
 

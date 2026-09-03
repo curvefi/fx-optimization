@@ -174,11 +174,15 @@ class RunConfig:
             raise ConfigError(
                 "[session] cannot set " + ", ".join(sorted(forbidden_session))
             )
+        if "arbitrage_enabled" in session:
+            raise ConfigError(
+                "session.arbitrage_enabled was removed; model arbitrage friction "
+                "with pool.costs.arb_fee_bps"
+            )
         resolved_session = dict(session)
         resolved_session.setdefault("event_cursor", "scalar")
         resolved_session.setdefault("metric_profile", "full_summary")
         resolved_session.setdefault("enable_slippage_probes", False)
-        resolved_session.setdefault("arbitrage_enabled", True)
 
         candidate = raw.get("candidate")
         if not isinstance(candidate, Mapping):
@@ -215,10 +219,9 @@ class RunConfig:
         if (
             resolved_session["event_cursor"] == "exact_skip"
             and resolved_session["metric_profile"] != "grid_core"
-            and resolved_session["arbitrage_enabled"] is not False
         ):
             raise ConfigError(
-                "exact_skip with arbitrage requires metric_profile='grid_core'"
+                "exact_skip requires metric_profile='grid_core'"
             )
         if (
             resolved_session["metric_profile"] == "grid_core"
