@@ -304,8 +304,6 @@ class HeatmapSelection:
 class HeatmapDataset:
     axes: tuple[HeatmapAxis, ...]
     metrics: Mapping[str, np.ndarray]
-    candidate_ids: np.ndarray
-    ordinals: np.ndarray
     valid: np.ndarray
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -321,10 +319,6 @@ class HeatmapDataset:
                 raise HeatmapValidationError(
                     f"metric {name!r} has shape {values.shape}, expected {shape}"
                 )
-        for name, raw in (("candidate_ids", self.candidate_ids),
-                          ("ordinals", self.ordinals)):
-            if np.asarray(raw).shape != shape:
-                raise HeatmapValidationError(f"{name} does not match heatmap shape {shape}")
         if np.asarray(self.valid).shape != shape:
             raise HeatmapValidationError(f"valid does not match heatmap shape {shape}")
 
@@ -345,7 +339,9 @@ class HeatmapDataset:
     def axis_index(self, key: str) -> int:
         return self.axis_keys.index(self.axis(key).key)
 
-    def _masked_metric_array(self, name: str, mask: MaskSpec) -> np.ndarray:
+    def _masked_metric_array(
+        self, name: str, mask: MaskSpec, selection: Any = Ellipsis,
+    ) -> np.ndarray:
         """Apply every enabled diagnostic threshold to ``X_masked``."""
         source = masked_metric_source(name, self.metrics)
         if source is None:
@@ -354,12 +350,12 @@ class HeatmapDataset:
             raise HeatmapValidationError(
                 f"masked metric {name!r} requires {source!r} in the evaluation table"
             )
-        values = np.asarray(self.metrics[source], dtype=float).copy()
-        values[~np.asarray(self.valid, dtype=bool)] = np.nan
+        values = np.array(self.metrics[source][selection], dtype=float, copy=True)
+        values[~np.asarray(self.valid[selection], dtype=bool)] = np.nan
         if mask.max_price_diff_bps is not None:
             pdiff = next(
                 (
-                    np.asarray(self.metrics[n], dtype=float)
+                    np.asarray(self.metrics[n][selection], dtype=float)
                     for n in ("max_7d_rel_price_diff", "max_rel_price_diff")
                     if n in self.metrics
                 ),
@@ -376,7 +372,7 @@ class HeatmapDataset:
         if mask.max_detach_energy is not None and uses_detach:
             if "detach_energy_ungated" not in self.metrics:
                 raise HeatmapValidationError("detachment mask metric is unavailable")
-            detach = np.asarray(self.metrics["detach_energy_ungated"], dtype=float)
+            detach = np.asarray(self.metrics["detach_energy_ungated"][selection], dtype=float)
             values[
                 ~np.isfinite(detach)
                 | (detach < 0.0)
@@ -385,7 +381,7 @@ class HeatmapDataset:
         if mask.max_final_price_diff_bps is not None and uses_detach:
             if "final_rel_price_diff" not in self.metrics:
                 raise HeatmapValidationError("final price-difference mask metric is unavailable")
-            final_diff = np.asarray(self.metrics["final_rel_price_diff"], dtype=float)
+            final_diff = np.asarray(self.metrics["final_rel_price_diff"][selection], dtype=float)
             values[
                 ~np.isfinite(final_diff)
                 | (final_diff < 0.0)
@@ -401,7 +397,7 @@ class HeatmapDataset:
                 raise HeatmapValidationError(
                     f"slippage mask metric {slippage_name!r} is unavailable"
                 )
-            slippage = np.asarray(self.metrics[slippage_name], dtype=float)
+            slippage = np.asarray(self.metrics[slippage_name][selection], dtype=float)
             values[
                 ~np.isfinite(slippage)
                 | (slippage == -1.0)
@@ -409,13 +405,15 @@ class HeatmapDataset:
             ] = np.nan
         return values
 
-    def metric_array(self, name: str, mask: MaskSpec = MaskSpec()) -> np.ndarray:
+    def metric_array(
+        self, name: str, mask: MaskSpec = MaskSpec(), *, selection: Any = Ellipsis,
+    ) -> np.ndarray:
         if is_masked_metric(name, self.metrics):
-            return self._masked_metric_array(name, mask)
+            return self._masked_metric_array(name, mask, selection)
         if name not in self.metrics:
             raise HeatmapValidationError(f"unknown heatmap metric {name!r}")
-        values = np.asarray(self.metrics[name], dtype=float).copy()
-        values[~np.asarray(self.valid, dtype=bool)] = np.nan
+        values = np.array(self.metrics[name][selection], dtype=float, copy=True)
+        values[~np.asarray(self.valid[selection], dtype=bool)] = np.nan
         return values
 
     def slice_metric(
@@ -440,7 +438,7 @@ class HeatmapDataset:
                 if fixed < 0 or fixed >= len(axis.values):
                     raise HeatmapValidationError(f"fixed index is outside axis {axis.key!r}")
                 selection.append(fixed)
-        result = self.metric_array(name, mask)[tuple(selection)]
+        result = self.metric_array(name, mask, selection=tuple(selection))
         if x_index < y_index:
             result = result.T
         return np.asarray(result, dtype=float)
@@ -454,15 +452,13 @@ class HeatmapDataset:
             if index < 0 or index >= len(axis.values):
                 raise HeatmapValidationError(f"point index is outside axis {axis.key!r}")
             coordinate.update(axis.coordinate(index))
-        candidate_id = str(self.candidate_ids[location])
-        ordinal = int(self.ordinals[location])
-        if not candidate_id:
-            raise HeatmapValidationError("selected heatmap cell has no exact candidate")
+        ordinal = int(np.ravel_multi_index(location, self.shape))
+        candidate_id = f"p{ordinal:08d}"
         if not bool(self.valid[location]):
             raise HeatmapValidationError("selected heatmap cell is invalid")
         metrics: dict[str, float | None] = {}
         for name in self.metrics:
-            value = float(self.metric_array(name)[location])
+            value = float(self.metrics[name][location])
             metrics[name] = value if math.isfinite(value) else None
         return HeatmapSelection(
             candidate_id=candidate_id,

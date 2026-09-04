@@ -7,7 +7,8 @@ from .results import (
     GridResultWriter,
     read_result_columns,
 )
-from .run import RunConfig, run_config
+from .config import RunConfig
+from .run import run_config
 
 __all__ = [
     "ArtifactPaths",

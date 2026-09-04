@@ -757,7 +757,7 @@ class HeatmapExplorer:
         right = event.button in {MouseButton.RIGHT, 3}
         shifted = event.button in {MouseButton.LEFT, 1} and "shift" in key
         if right or shifted:
-            self.replay(selection, "shift" if "shift" in key else "right")
+            self.replay(selection, "right" if right else "shift")
         elif event.button in {MouseButton.LEFT, 1}:
             coordinates = ", ".join(
                 f"{name}={format_axis_value(value)}"
@@ -770,7 +770,7 @@ class HeatmapExplorer:
                     if is_masked_metric(metric, self.dataset.metrics)
                     else MaskSpec()
                 )
-                value = self.dataset.metric_array(metric, tile_mask)[selection.grid_indices]
+                value = self.dataset.metric_array(metric, tile_mask, selection=selection.grid_indices)
                 metrics.append(f"{metric}={format_metric_value(metric, value)}")
             print(
                 f"selection candidate={selection.candidate_id} ordinal={selection.ordinal} "

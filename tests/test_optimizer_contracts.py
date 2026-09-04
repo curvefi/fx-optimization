@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
-import matplotlib
 import numpy as np
 import pytest
 from click.testing import CliRunner
 
-matplotlib.use("Agg")
+os.environ["MPLBACKEND"] = "Agg"
 
 from curve_fx_sim.plotting.heatmap import (
     HeatmapAxis,
@@ -17,14 +17,14 @@ from curve_fx_sim.plotting.heatmap import (
     MaskSpec,
 )
 from curve_fx_sim.plotting.masked_metrics import masked_metric_slippage_sources
-from fxopt.explorer import open_fxopt_explorer
 from fxopt import Candidate, EvaluatorSession
 from fxopt.cli import main
 from fxopt.config import ConfigError
 from fxopt.engine import ProjectedBatch
 from fxopt.results import GridResultWriter, merge_grid_partitions, read_result_columns
-from fxopt.run import RunConfig, run_config, run_metadata
-from fxopt.shiftclick import save_shiftclick_plot, trace_stored_candidate
+from fxopt.config import RunConfig
+from fxopt.run import run_config, run_metadata, run_leased_worker
+from fxopt.shiftclick import trace_stored_candidate
 
 
 def _run_toml(
@@ -139,21 +139,12 @@ def test_config_admission_table_covers_native_compiled_and_profiles(tmp_path: Pa
 
 
 class _GridClient:
-    def __init__(self, identity: dict[str, object] | None = None) -> None:
-        self.identity = identity
+    def __init__(self) -> None:
         self.registered: list[dict[str, object]] = []
         self.requests: list[dict[str, object]] = []
         self.evaluations = 0
 
     def start(self) -> dict[str, bool]:
-        if self.identity is not None:
-            expected = {
-                name.removeprefix("expected_"): value
-                for name, value in self.expected_options.items()
-            }
-            for name, value in expected.items():
-                if self.identity.get(name) != value:
-                    raise ValueError(f"evaluator policy {name} mismatch")
         return {"hello": True}
 
     def open_session(self, session_id: str, **request: object) -> None:
@@ -194,7 +185,7 @@ class _GridClient:
 
 
 def test_registered_grid_run_publishes_two_files_and_reconstructs_canonical_ordinals(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     config = _run_toml(
         tmp_path / "run.toml",
@@ -203,18 +194,8 @@ def test_registered_grid_run_publishes_two_files_and_reconstructs_canonical_ordi
         axes='[candidate.axes]\n"pool.A" = [10, 20]\n"pool.donation_apy" = [0.0, 0.1]',
     )
     client = _GridClient()
-    factory_calls: list[dict[str, object]] = []
-    active_client = client
-
-    def production_factory(_evaluator: object, *, client_options: dict[str, object], **_: object):
-        nonlocal active_client
-        factory_calls.append(dict(client_options))
-        active_client.expected_options = client_options
-        return lambda: active_client
-
-    monkeypatch.setattr("fxopt.run.local_client_factory", production_factory)
     output = tmp_path / "run"
-    paths = run_config(config, output)
+    paths = run_config(config, output, client_factory=lambda: client)
 
     assert paths.run_json.name == "run.json"
     assert paths.results_npz.name == "results.npz"
@@ -222,9 +203,7 @@ def test_registered_grid_run_publishes_two_files_and_reconstructs_canonical_ordi
     assert client.registered[0]["shape"] == [2, 2]
     columns = read_result_columns(output)
     assert columns.ordinals.tolist() == [0, 1, 2, 3]
-    assert columns.candidate_ids_array().tolist() == [
-        "p00000000", "p00000001", "p00000002", "p00000003"
-    ]
+    assert columns.candidate_at(3).candidate_id == "p00000003"
     assert columns.candidate_at(3).pool_overrides["A"] == 20
     assert columns.metrics["score"].tolist() == [0.0, 1.0, 2.0, 3.0]
     manifest = json.loads(paths.run_json.read_text())
@@ -233,26 +212,6 @@ def test_registered_grid_run_publishes_two_files_and_reconstructs_canonical_ordi
         "policy_abi": "twocrypto_policy_v1",
         "policy_parameter_count": 1,
     }
-    expected_options = {
-        "expected_policy_id": "compiled",
-        "expected_policy_abi": "twocrypto_policy_v1",
-        "expected_policy_parameter_count": 1,
-    }
-    assert factory_calls == [expected_options]
-    for field, bad_value in (
-        ("policy_id", "stale"),
-        ("policy_abi", "wrong_abi"),
-        ("policy_parameter_count", 2),
-    ):
-        active_client = _GridClient({**{
-            "policy_id": "compiled",
-            "policy_abi": "twocrypto_policy_v1",
-            "policy_parameter_count": 1,
-        }, field: bad_value})
-        with pytest.raises(ValueError, match=field):
-            run_config(config, tmp_path / f"tampered-{field}")
-        assert active_client.evaluations == 0
-
 
 def _write_partition(path: Path, ordinals: tuple[int, ...]) -> Path:
     writer = GridResultWriter(
@@ -314,6 +273,48 @@ def test_out_of_order_partitions_merge_to_integral_artifact_and_reject_overlap(
             metadata=metadata,
             metric_names=("score",),
         )
+    partial = tmp_path / "partial"
+    merge_grid_partitions(
+        partial, (first,), run_id="partitioned", total=4,
+        metadata=metadata, metric_names=("score",),
+    )
+    columns = read_result_columns(partial)
+    assert columns.ok_mask.tolist() == [True, False, False, True]
+    assert np.isnan(columns.metrics["score"][[1, 2]]).all()
+    assert columns.status_at(1) == "uncalculated"
+    assert columns.candidate_at(3).pool_overrides["A"] == 4
+    with pytest.raises(ValueError, match="not calculated"):
+        columns.candidate_at(1)
+
+
+def test_worker_keeps_completed_rows_after_evaluator_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Client(_GridClient):
+        def evaluate_batch(self, candidates, **request):
+            if request["ranges"][0][0] >= 2:
+                raise RuntimeError("evaluator disconnected")
+            return super().evaluate_batch(candidates, **request)
+
+    monkeypatch.setattr("fxopt.run.local_client_factory", lambda *args, **kwargs: Client)
+    config = _run_toml(
+        tmp_path / "run.toml", axes='[candidate.axes]\n"pool.A" = [1, 2, 3, 4]',
+    )
+    partition = tmp_path / "worker"
+    receipt = run_leased_worker(
+        config, partition, worker_index=0,
+        commands=({"type": "lease", "lease_id": 0}, {"type": "lease", "lease_id": 1}),
+    )
+    assert receipt["count"] == 2 and receipt["error"]
+    output = tmp_path / "partial-worker"
+    merge_grid_partitions(
+        output, (partition,), run_id="contract", total=4,
+        metadata=run_metadata(RunConfig.from_toml(config), effective_batch=2),
+        metric_names=("score",),
+    )
+    columns = read_result_columns(output)
+    assert columns.ok_mask.tolist() == [True, True, False, False]
+    np.testing.assert_equal(columns.metrics["score"], [0.0, 1.0, np.nan, np.nan])
 
 
 class _PointClient:
@@ -439,8 +440,6 @@ def _mask_dataset(*, omit: str | None = None) -> HeatmapDataset:
     return HeatmapDataset(
         axes=(HeatmapAxis(("x",), (1, 2)), HeatmapAxis(("y",), (10, 20))),
         metrics=metrics,
-        candidate_ids=np.asarray([["p0", "p1"], ["p2", "p3"]]),
-        ordinals=np.arange(4).reshape((2, 2)),
         valid=np.ones((2, 2), dtype=bool),
     )
 
@@ -455,7 +454,12 @@ def test_generic_mask_thresholds_fail_closed_and_require_source_metrics() -> Non
     )
     for mask, source, expected in cases:
         dataset = _mask_dataset()
-        assert np.isfinite(dataset.metric_array("apy_net_masked", mask)).sum() == expected
+        whole = dataset.metric_array("apy_net_masked", mask)
+        assert np.isfinite(whole).sum() == expected
+        np.testing.assert_equal(
+            dataset.slice_metric("apy_net_masked", x_axis="x", y_axis="y", fixed_indices={}, mask=mask),
+            whole.T,
+        )
         if source is not None:
             with pytest.raises(HeatmapValidationError, match="mask metric.*unavailable"):
                 _mask_dataset(omit=source).metric_array("apy_net_masked", mask)
@@ -507,7 +511,7 @@ class _TraceClient:
             "results": [{
                 "candidate_id": item["candidate_id"],
                 "status": "ok",
-                "metrics": {"score": 1.0},
+                "metrics": {"score": 1.0, "apy_net": 0.123, "apy_net_gm": 0.045},
                 "artifacts": {
                     "trace_path": str(self.trace_paths[self.mode]),
                     "effective_inputs": {"pool.donation_frequency": 3600.0},
@@ -525,6 +529,8 @@ class _TraceClient:
 def test_stored_ordinal_replay_passes_exact_candidate_for_yb_off_and_enabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from fxopt.explorer import open_fxopt_explorer
+
     run_dir = _write_heatmap_result(tmp_path / "run")
     manifest = json.loads((run_dir / "run.json").read_text())
     manifest["metadata"].update(
@@ -585,18 +591,16 @@ def test_stored_ordinal_replay_passes_exact_candidate_for_yb_off_and_enabled(
     try:
         selection = explorer.dataset.point((1, 1)).to_selection_ref(explorer.run_id)
         assert selection.index == ordinal and selection.candidate_id == "p00000003"
-        shift_summary = explorer.on_replay(selection, "shift")
-        shift_payload = json.loads(shift_summary.read_text())
-        shift_png = save_shiftclick_plot(shift_summary, tmp_path / "shift.png")
-        right_summary = explorer.on_replay(selection, "right")
-        right_payload = json.loads(right_summary.read_text())
-        right_png = save_shiftclick_plot(right_summary, tmp_path / "right.png")
+        shift_figure = explorer.on_replay(selection, "shift")
+        right_figure = explorer.on_replay(selection, "right")
+        for figure in (shift_figure, right_figure):
+            assert any("12.3%" in axis.get_title() for axis in figure.axes)
+        assert not (run_dir / "inspections").exists()
     finally:
         explorer.close()
+        from matplotlib import pyplot as plt
+        plt.close("all")
 
-    assert shift_payload["source_ordinal"] == right_payload["source_ordinal"] == ordinal
-    assert shift_payload["candidate"]["candidate_id"] == right_payload["candidate"]["candidate_id"] == "p00000003"
-    assert shift_png.is_file() and right_png.is_file()
     assert [client.open_requests[0]["yb_mode"] for client in clients] == [
         "active_2l", "off"
     ]

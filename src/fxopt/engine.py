@@ -143,7 +143,6 @@ class EvaluatorSession:
         *,
         session_id: str,
         open_session: Mapping[str, Any] | None = None,
-        metric_projection: str | None = None,
         metric_fields: Sequence[str] | None = None,
         observation: Mapping[str, Any] | None = None,
         grid: Mapping[str, Any] | None = None,
@@ -158,8 +157,6 @@ class EvaluatorSession:
         if "session_id" in self._open_request:
             raise ValueError("session_id belongs to the engine, not open_session")
         self._batch_request: dict[str, Any] = {}
-        if metric_projection is not None:
-            self._batch_request["metric_projection"] = metric_projection
         self._metric_fields: tuple[str, ...] | None = None
         if metric_fields is not None:
             fields = tuple(metric_fields)

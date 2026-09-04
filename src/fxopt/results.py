@@ -27,7 +27,7 @@ SCHEMA_VERSION = "fxopt.grid-results.v1"
 RUN_FILENAME = "run.json"
 RESULTS_FILENAME = "results.npz"
 
-_STATUS_TO_CODE = {"ok": 0, "failed": 1, "cancelled": 2}
+_STATUS_TO_CODE = {"ok": 0, "failed": 1, "cancelled": 2, "uncalculated": 3}
 _CODE_TO_STATUS = tuple(_STATUS_TO_CODE)
 
 
@@ -58,10 +58,9 @@ class ResultColumns:
     def row_for_ordinal(self, ordinal: int) -> int:
         if not isinstance(ordinal, int) or ordinal < 0:
             raise ValueError("ordinal must be a non-negative integer")
-        rows = np.flatnonzero(self.ordinals == ordinal)
-        if len(rows) != 1:
-            raise ValueError(f"result artifact has no unique row for ordinal {ordinal}")
-        return int(rows[0])
+        if ordinal >= self.row_count:
+            raise ValueError(f"result artifact has no row for ordinal {ordinal}")
+        return ordinal
 
     @property
     def ok_mask(self) -> np.ndarray:
@@ -76,17 +75,12 @@ class ResultColumns:
     def error_at(self, row: int) -> str | None:
         return self.failures.get(int(self.ordinals[row]))
 
-    def candidate_ids_array(self) -> np.ndarray:
-        width = len(candidate_id(max(0, self.row_count - 1)))
-        return np.fromiter(
-            (candidate_id(int(ordinal)) for ordinal in self.ordinals),
-            dtype=f"U{width}",
-            count=self.row_count,
-        )
-
     def candidate_at(self, ordinal: int) -> Candidate:
         """Construct only the candidate selected by its stored result ordinal."""
-        return self._candidate_at_row(self.row_for_ordinal(ordinal))
+        row = self.row_for_ordinal(ordinal)
+        if self.status_at(row) == "uncalculated":
+            raise ValueError(f"ordinal {ordinal} was not calculated")
+        return self._candidate_at_row(row)
 
     def _candidate_at_row(self, row: int) -> Candidate:
         assert self.grid is not None
@@ -196,7 +190,7 @@ def read_result_columns(
             or count < 1
             or isinstance(shard_count, bool)
             or not isinstance(shard_count, int)
-            or shard_count < 1
+            or shard_count < 0
             or not isinstance(run_id, str)
             or not run_id
         ):
@@ -214,9 +208,9 @@ def read_result_columns(
     columns = {name: index for index, name in enumerate(metric_names)}
 
     selected_metrics = {
-        name: np.empty(count, dtype=np.float64) for name in selected
+        name: np.full(count, np.nan, dtype=np.float64) for name in selected
     }
-    status_codes = np.empty(count, dtype=np.uint8)
+    status_codes = np.full(count, _STATUS_TO_CODE["uncalculated"], dtype=np.uint8)
     written = np.zeros(count, dtype=np.bool_)
     failures: dict[int, str] = {}
     try:
@@ -264,8 +258,8 @@ def read_result_columns(
                         failures.setdefault(ordinal, str(item["error"]))
     except (OSError, KeyError, ValueError, zipfile.BadZipFile) as exc:
         raise ValueError(f"invalid {RESULTS_FILENAME}") from exc
-    if not np.all(written) or np.any(status_codes >= len(_CODE_TO_STATUS)):
-        raise ValueError("grid shards do not cover the grid")
+    if np.any(status_codes >= len(_CODE_TO_STATUS)):
+        raise ValueError("grid result contains an invalid status")
     return ResultColumns(
         root=root,
         run_id=run_id,
@@ -600,7 +594,7 @@ def merge_grid_partitions(
                     or expected < 1
                     or isinstance(shard_count, bool)
                     or not isinstance(shard_count, int)
-                    or shard_count < 1
+                    or shard_count < 0
                 ):
                     raise ValueError("partition counts are invalid")
             except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -661,8 +655,7 @@ def merge_grid_partitions(
             if partition_count != expected:
                 raise ValueError("grid partition row count does not match its receipt")
 
-        if not np.all(written):
-            raise ValueError("grid partitions do not cover every candidate")
+        status_counts["uncalculated"] = int(total - np.count_nonzero(written))
         output.close()
         with temporary.open("rb") as stream:
             os.fsync(stream.fileno())

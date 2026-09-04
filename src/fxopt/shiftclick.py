@@ -14,7 +14,7 @@ from typing import Any
 from .contract import Candidate
 from .engine import ClientFactory, EvaluatorSession
 from .placement import local_client_factory
-from .run import EVALUATOR_POLICY_METADATA_KEY
+from .config import EVALUATOR_POLICY_METADATA_KEY
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +126,7 @@ def _run_trace(
         replay.evaluator,
         work_dir=replay.work_dir,
         workers=1,
+        timeout=600.0,
         client_options={
             f"expected_{name}": value
             for name, value in replay.evaluator_policy.items()
@@ -135,7 +136,6 @@ def _run_trace(
         factory,
         session_id=f"{replay.run_id}-trace-{ordinal}",
         open_session=open_session,
-        metric_projection="full",
         observation={
             "kind": "full_trace",
             "trace_interval": trace_interval,
@@ -237,6 +237,7 @@ def shiftclick_figure(summary_path: str | Path, *, title: str | None = None):
         trace,
         title=title,
         donation_frequency=donation_frequency,
+        metrics=payload["result"]["metrics"],
     )
 
 

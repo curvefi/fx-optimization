@@ -11,19 +11,16 @@ import time
 
 import click
 
-from .config import ConfigError
+from .config import ConfigError, RunConfig
+from .remote_jobs import (
+    REMOTE_JOB_FILENAME, follow_remote_run, remote_run_status,
+    retrieve_remote_run, run_remote_config, stop_remote_run,
+)
 from .run import (
-    REMOTE_JOB_FILENAME,
-    RunConfig,
-    follow_remote_run,
     grid_summary,
-    remote_run_status,
-    retrieve_remote_run,
     run_config,
     run_distributed_config,
-    run_remote_config,
     run_leased_worker,
-    stop_remote_run,
 )
 
 

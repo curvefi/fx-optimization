@@ -83,51 +83,6 @@ def _donation_growth(timestamps: np.ndarray, donation_apy: np.ndarray, donation_
     return np.power(1.0 + donation_apy, elapsed / SEC_PER_YEAR)
 
 
-def _annualized_growth_apy(timestamps: np.ndarray, growth: np.ndarray) -> float:
-    if len(timestamps) < 2 or not (growth[-1] > 0.0) or not (growth[0] > 0.0):
-        return np.nan
-    dt = timestamps[-1] - timestamps[0]
-    if not (dt > 0.0):
-        return np.nan
-    return np.expm1(np.log(growth[-1] / growth[0]) * SEC_PER_YEAR / dt)
-
-
-def _rolling_window_growth_gm(timestamps: np.ndarray, growth: np.ndarray) -> float:
-    if len(timestamps) == 0:
-        return np.nan
-    samples: list[tuple[float, float]] = []
-    last_sample_ts: float | None = None
-    sum_log_apy = 0.0
-    n_windows = 0
-    for ts, value in zip(timestamps, growth):
-        if not np.isfinite(value) or not (value > 0.0):
-            continue
-        if last_sample_ts is not None and ts < last_sample_ts + ROLLING_APY_SAMPLE_S:
-            continue
-        samples.append((float(ts), float(value)))
-        last_sample_ts = float(ts)
-        cutoff = ts - ROLLING_APY_WINDOW_S if ts > ROLLING_APY_WINDOW_S else 0.0
-        while len(samples) > 1 and samples[1][0] <= cutoff:
-            samples.pop(0)
-        first_ts, first_value = samples[0]
-        if ts < first_ts + ROLLING_APY_WINDOW_S:
-            continue
-        dt = ts - first_ts
-        if not (dt > 0.0) or not (first_value > 0.0):
-            continue
-        window_growth = value / first_value
-        annualized = ROLLING_APY_FLOOR
-        if np.isfinite(window_growth) and window_growth > 0.0:
-            annualized = np.power(window_growth, SEC_PER_YEAR / dt) - 1.0
-            if not np.isfinite(annualized) or annualized < ROLLING_APY_FLOOR:
-                annualized = ROLLING_APY_FLOOR
-        sum_log_apy += float(np.log(annualized))
-        n_windows += 1
-    if n_windows == 0:
-        return np.nan
-    return float(np.exp(sum_log_apy / n_windows))
-
-
 def _rolling_window_net_apy(
     timestamps: np.ndarray,
     profit_growth: np.ndarray,
@@ -192,7 +147,6 @@ def _make_yb_path(
     if len(t) == 0:
         return None
     rolling_apy, rolling_floored = _rolling_window_growth_apy(t, growth)
-    gm_apy = _rolling_window_growth_gm(t, growth)
     if max_points > 0 and len(t) > max_points:
         idx = np.linspace(0, len(t) - 1, max_points, dtype=int)
         t = t[idx]
@@ -209,13 +163,12 @@ def _make_yb_path(
         "apy": apy,
         "rolling_apy": rolling_apy,
         "rolling_floored": rolling_floored,
-        "gm_apy": gm_apy,
         "summary": summary,
         "source": source,
     }
 
 
-def _load_embedded_yb_path(detailed: Mapping[str, np.ndarray], max_points: int) -> dict[str, Any] | None:
+def _load_embedded_yb_path(detailed: Mapping[str, np.ndarray], max_points: int, metrics: Mapping[str, float]) -> dict[str, Any] | None:
     initialized = detailed.get("yb_initialized")
     growth = detailed.get("yb_growth")
     if initialized is None or growth is None:
@@ -230,8 +183,8 @@ def _load_embedded_yb_path(detailed: Mapping[str, np.ndarray], max_points: int) 
     finite_fees = fees[mask][np.isfinite(fees[mask])] if fees is not None else []
     summary = {
         "fee": float(finite_fees[-1]) if len(finite_fees) else None,
-        "apy": _annualized_growth_apy(t, growth),
-        "apy_gm": _rolling_window_growth_gm(t, growth),
+        "apy": metrics.get("yb_apy", np.nan),
+        "apy_gm": metrics.get("yb_apy_gm", np.nan),
         "n_releverage_trades": int(trades[mask][-1]) if trades is not None else None,
     }
     return _make_yb_path(t, growth, summary, "pool trace", max_points)
@@ -305,8 +258,7 @@ def _plot_yb_axis(ax, yb_path):
 
     fee = summary.get("fee")
     final_apy = summary.get("apy")
-    summary_gm_apy = summary.get("apy_gm")
-    gm_apy = summary_gm_apy if isinstance(summary_gm_apy, (int, float)) else yb_path.get("gm_apy", np.nan)
+    gm_apy = summary.get("apy_gm", np.nan)
     trades = summary.get("n_releverage_trades")
     source = yb_path.get("source", "unknown source")
     title_parts = []
@@ -475,6 +427,7 @@ def render_shiftclick_figure(
     *,
     title: str | None = None,
     donation_frequency: float | None = None,
+    metrics: Mapping[str, float],
 ):
     """Build the multi-panel view from a raw evaluator trace."""
     bin_hours = 6.0
@@ -509,8 +462,8 @@ def render_shiftclick_figure(
     donation_growth = _donation_growth(timestamps, donation_apy, donation_frequency)
     with np.errstate(invalid="ignore", divide="ignore"):
         net_lp_growth = lp_xcp_profit / donation_growth
-    lp_net_apy = _annualized_growth_apy(timestamps, net_lp_growth)
-    lp_gm_apy = _rolling_window_growth_gm(timestamps, net_lp_growth)
+    lp_net_apy = metrics.get("apy_net", np.nan)
+    lp_gm_apy = metrics.get("apy_net_gm", np.nan)
     rolling_apy, rolling_floored = _rolling_window_net_apy(
         timestamps, lp_xcp_profit, donation_apy, donation_frequency
     )
@@ -541,7 +494,7 @@ def render_shiftclick_figure(
     slippage_timestamps = timestamps
     dates = [datetime.fromtimestamp(t, timezone.utc) for t in timestamps]
 
-    yb_path = _load_embedded_yb_path(detailed, max_points)
+    yb_path = _load_embedded_yb_path(detailed, max_points, metrics)
     yb_balance_path = _load_embedded_yb_balance_path(detailed, max_points)
     panel_count = 3 + int(yb_balance_path is not None) + int(yb_path is not None) + int(
         have_slippage_panel

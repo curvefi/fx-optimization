@@ -1,4 +1,4 @@
-"""TOML-friendly Cartesian-grid configuration."""
+"""Cartesian candidates, resolved run settings, and input paths."""
 
 from __future__ import annotations
 
@@ -16,6 +16,8 @@ from .candidates import (
     path_parts,
 )
 from .grid import CartesianGrid
+from .placement import REMOTE_BASE
+from .robustness import RobustnessAxis, parse_robustness_axes
 
 
 class ConfigError(ValueError):
@@ -218,4 +220,277 @@ class CandidateConfig:
         return CartesianGrid(dict(self.defaults), self.axes)
 
 
-__all__ = ["CandidateConfig", "ConfigError"]
+_RUN_KEYS = frozenset({"id", "evaluator", "template", "batch_size", "workers", "metric_fields"})
+_PLACEMENT_KEYS = frozenset({"hosts", "numa_nodes"})
+_CANDIDATE_KEYS = frozenset({"defaults", "axes"})
+_SCENARIO_KEYS = frozenset({"id", "market", "price_feed", "yb_mode"})
+_COMPILED_POLICY_KEYS = frozenset({"header", "id"})
+EVALUATOR_POLICY_METADATA_KEY = "expected_evaluator_policy"
+_COMPILED_POLICY_ABI = "twocrypto_policy_v1"
+
+def _required_string(section: Mapping[str, Any], key: str, label: str) -> str:
+    value = section.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{label}.{key} must be a non-empty string")
+    return value
+
+
+def _resolve_path(value: str, base: Path) -> Path:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else base / path
+
+
+@dataclass(frozen=True, slots=True)
+class RunConfig:
+    """Resolved settings for the ordinary local-or-SSH ``fxopt run`` command."""
+
+    path: Path
+    run_id: str
+    evaluator: Path
+    template: Path
+    batch_size: int
+    workers: int
+    metric_fields: tuple[str, ...]
+    hosts: tuple[str, ...]
+    numa_nodes: tuple[int, ...]
+    candidate: CandidateConfig
+    session: Mapping[str, Any]
+    scenario: Mapping[str, Any]
+    robustness: tuple[RobustnessAxis, ...]
+    compiled_policy_header: Path | None
+    compiled_policy_id: str | None
+
+    @classmethod
+    def from_toml(cls, path: str | Path) -> "RunConfig":
+        config_path = Path(path).expanduser().resolve()
+        try:
+            with config_path.open("rb") as stream:
+                raw = tomllib.load(stream)
+        except OSError as exc:
+            raise ConfigError(f"cannot read config {config_path}: {exc}") from exc
+
+        run = raw.get("run")
+        if not isinstance(run, Mapping):
+            raise ConfigError("config requires a [run] table")
+        unknown_run = set(run) - _RUN_KEYS
+        if unknown_run:
+            raise ConfigError(f"unknown [run] keys: {sorted(unknown_run)}")
+        batch_size = run.get("batch_size")
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+            raise ConfigError("run.batch_size must be a positive integer")
+        workers = run.get("workers", 1)
+        if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+            raise ConfigError("run.workers must be a positive integer")
+        raw_metric_fields = run.get("metric_fields", [])
+        if (
+            isinstance(raw_metric_fields, (str, bytes))
+            or not isinstance(raw_metric_fields, list)
+            or not raw_metric_fields
+            or any(not isinstance(name, str) or not name for name in raw_metric_fields)
+            or len(set(raw_metric_fields)) != len(raw_metric_fields)
+        ):
+            raise ConfigError("run.metric_fields must contain unique non-empty strings")
+
+        placement = raw.get("placement", {})
+        if not isinstance(placement, Mapping):
+            raise ConfigError("[placement] must be a mapping")
+        unknown_placement = set(placement) - _PLACEMENT_KEYS
+        if unknown_placement:
+            raise ConfigError(f"unknown [placement] keys: {sorted(unknown_placement)}")
+        raw_hosts = placement.get("hosts", [])
+        if isinstance(raw_hosts, (str, bytes)) or not isinstance(raw_hosts, list):
+            raise ConfigError("placement.hosts must be an array")
+        hosts: list[str] = []
+        for host in raw_hosts:
+            if not isinstance(host, str) or not host.strip():
+                raise ConfigError("placement.hosts entries must be non-empty strings")
+            if host.startswith("-"):
+                raise ConfigError("placement.hosts entries must not start with '-'")
+            if any(character.isspace() or ord(character) < 32 for character in host):
+                raise ConfigError("placement.hosts entries must not contain whitespace")
+            if host in hosts:
+                raise ConfigError(f"duplicate placement host: {host!r}")
+            hosts.append(host)
+        raw_numa_nodes = placement.get("numa_nodes", [])
+        if (
+            isinstance(raw_numa_nodes, (str, bytes))
+            or not isinstance(raw_numa_nodes, list)
+        ):
+            raise ConfigError("placement.numa_nodes must be an array")
+        numa_nodes: list[int] = []
+        for node in raw_numa_nodes:
+            if isinstance(node, bool) or not isinstance(node, int) or node < 0:
+                raise ConfigError(
+                    "placement.numa_nodes entries must be non-negative integers"
+                )
+            if node in numa_nodes:
+                raise ConfigError(f"duplicate placement NUMA node: {node}")
+            numa_nodes.append(node)
+        if numa_nodes and not hosts:
+            raise ConfigError("placement.numa_nodes requires placement.hosts")
+
+        session = raw.get("session", {})
+        if not isinstance(session, Mapping):
+            raise ConfigError("[session] must be a mapping")
+        forbidden_session = {
+            "session_id", "template_path", "scenario_id", "market_path", "price_feed_path"
+        } & set(session)
+        if forbidden_session:
+            raise ConfigError(
+                "[session] cannot set " + ", ".join(sorted(forbidden_session))
+            )
+        if "arbitrage_enabled" in session:
+            raise ConfigError(
+                "session.arbitrage_enabled was removed; model arbitrage friction "
+                "with pool.costs.arb_fee_bps"
+            )
+        resolved_session = dict(session)
+        resolved_session.setdefault("event_cursor", "scalar")
+        resolved_session.setdefault("metric_profile", "full_summary")
+        resolved_session.setdefault("enable_slippage_probes", False)
+
+        candidate = raw.get("candidate")
+        if not isinstance(candidate, Mapping):
+            raise ConfigError("config requires a [candidate] table")
+        unknown_candidate = set(candidate) - _CANDIDATE_KEYS
+        if unknown_candidate:
+            raise ConfigError(f"unknown [candidate] keys: {sorted(unknown_candidate)}")
+
+        scenario = raw.get("scenario")
+        if not isinstance(scenario, Mapping):
+            raise ConfigError("config requires a [scenario] table")
+        unknown_scenario = set(scenario) - _SCENARIO_KEYS
+        if unknown_scenario:
+            raise ConfigError(f"unknown [scenario] keys: {sorted(unknown_scenario)}")
+        scenario_id = _required_string(scenario, "id", "scenario")
+        market = _resolve_path(
+            _required_string(scenario, "market", "scenario"), config_path.parent
+        )
+        resolved_scenario: dict[str, Any] = {
+            "id": scenario_id,
+            "market": str(market),
+        }
+        price_feed = scenario.get("price_feed")
+        if price_feed is not None:
+            if not isinstance(price_feed, str) or not price_feed.strip():
+                raise ConfigError("scenario.price_feed must be a non-empty string")
+            resolved_scenario["price_feed"] = str(
+                _resolve_path(price_feed, config_path.parent)
+            )
+        scenario_yb_mode = scenario.get("yb_mode", "off")
+        if not isinstance(scenario_yb_mode, str):
+            raise ConfigError("scenario.yb_mode must be a string")
+        resolved_scenario["yb_mode"] = scenario_yb_mode
+        if (
+            resolved_session["event_cursor"] == "exact_skip"
+            and resolved_session["metric_profile"] != "grid_core"
+        ):
+            raise ConfigError(
+                "exact_skip requires metric_profile='grid_core'"
+            )
+        if (
+            resolved_session["metric_profile"] == "grid_core"
+            and (
+                scenario_yb_mode != "off"
+                or bool(resolved_session["enable_slippage_probes"])
+            )
+        ):
+            raise ConfigError(
+                "grid_core requires yb_mode='off' and slippage disabled"
+            )
+        if (
+            any(name.startswith("tw_real_slippage_") for name in raw_metric_fields)
+            and resolved_session["enable_slippage_probes"] is not True
+        ):
+            raise ConfigError(
+                "tw_real_slippage_* metrics require "
+                "session.enable_slippage_probes=true"
+            )
+
+        compiled_policy = raw.get("compiled_policy")
+        compiled_policy_header: Path | None = None
+        compiled_policy_id: str | None = None
+        if compiled_policy is not None:
+            if not isinstance(compiled_policy, Mapping):
+                raise ConfigError("[compiled_policy] must be a mapping")
+            unknown_compiled_policy = set(compiled_policy) - _COMPILED_POLICY_KEYS
+            if unknown_compiled_policy:
+                raise ConfigError(
+                    "unknown [compiled_policy] keys: "
+                    f"{sorted(unknown_compiled_policy)}"
+                )
+            compiled_policy_header = _resolve_path(
+                _required_string(compiled_policy, "header", "compiled_policy"),
+                config_path.parent,
+            )
+            compiled_policy_id = _required_string(
+                compiled_policy, "id", "compiled_policy"
+            )
+        candidate_config = CandidateConfig.from_mapping(candidate)
+        if (
+            compiled_policy_header is None
+            and candidate_config.defaults["policy_params"]
+        ):
+            raise ConfigError(
+                "candidate.defaults.policy_params must be empty without [compiled_policy]"
+            )
+        base = config_path.parent
+        config = cls(
+            path=config_path,
+            run_id=_required_string(run, "id", "run"),
+            evaluator=_resolve_path(_required_string(run, "evaluator", "run"), base),
+            template=_resolve_path(_required_string(run, "template", "run"), base),
+            batch_size=batch_size,
+            workers=workers,
+            metric_fields=tuple(raw_metric_fields),
+            hosts=tuple(hosts),
+            numa_nodes=tuple(numa_nodes),
+            candidate=candidate_config,
+            session=resolved_session,
+            scenario=resolved_scenario,
+            robustness=parse_robustness_axes(
+                raw.get("robustness"), required=False
+            ),
+            compiled_policy_header=compiled_policy_header,
+            compiled_policy_id=compiled_policy_id,
+        )
+        if hosts:
+            _execution_inputs(config, remote=True)
+        return config
+
+
+def _execution_inputs(config: RunConfig, *, remote: bool) -> dict[str, str]:
+    inputs = {
+        "evaluator": str(config.evaluator),
+        "template": str(config.template),
+        "market": config.scenario["market"],
+    }
+    if (price_feed := config.scenario.get("price_feed")) is not None:
+        inputs["price_feed"] = price_feed
+    if config.compiled_policy_header is not None:
+        inputs["policy_header"] = str(config.compiled_policy_header)
+    if remote:
+        try:
+            optimizer_root = next(
+                parent
+                for parent in config.path.parents
+                if parent.name == "curve-fx-optimization"
+            )
+        except StopIteration as exc:
+            raise ConfigError(
+                "remote config must be inside a curve-fx-optimization repository"
+            ) from exc
+        workspace = optimizer_root.parent.resolve()
+        mapped = {}
+        for name, value in inputs.items():
+            try:
+                relative = Path(value).resolve().relative_to(workspace)
+            except ValueError as exc:
+                raise ConfigError(f"remote {name} path must be inside {workspace}") from exc
+            mapped[name] = str(REMOTE_BASE.joinpath(*relative.parts))
+        return mapped
+    return inputs
+
+
+
+__all__ = ["CandidateConfig", "ConfigError", "RunConfig"]

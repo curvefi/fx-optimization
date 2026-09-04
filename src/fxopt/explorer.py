@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -96,8 +97,6 @@ def _dataset(columns: ResultColumns) -> HeatmapDataset:
     return HeatmapDataset(
         axes=axes,
         metrics=metrics,
-        candidate_ids=columns.candidate_ids_array().reshape(shape),
-        ordinals=columns.ordinals.reshape(shape),
         valid=columns.ok_mask.reshape(shape),
         metadata=dict(columns.metadata),
     )
@@ -134,28 +133,26 @@ def open_fxopt_explorer(
     )
     results = read_result_columns(root, metrics=selected_columns)
 
-    def replay(selection: Any, mode: str) -> Path:
+    def replay(selection: Any, mode: str):
         ordinal = int(selection.index)
         candidate = results.candidate_at(ordinal)
         if candidate.candidate_id != selection.candidate_id:
             raise ValueError("selected candidate does not match the stored result row")
-        output = root / "inspections" / f"ordinal-{ordinal}"
-        summary = trace_stored_candidate(
-            results.run_id,
-            results.metadata,
-            candidate=candidate,
-            ordinal=ordinal,
-            output_dir=output,
-            trace_interval=200,
-            trace_actions=False,
-            yb_mode=shiftclick_yb_mode if mode == "shift" else "off",
-            yb_cash_multiplier=(
-                shiftclick_yb_cash_multiplier if mode == "shift" else None
-            ),
+        coordinates = ", ".join(
+            f"{name}={value}" for name, value in selection.coordinate.items()
         )
-        figure = shiftclick_figure(summary, title=f"{results.run_id}: {ordinal}")
+        print(f"replay ordinal={ordinal} ({coordinates})", flush=True)
+        with tempfile.TemporaryDirectory(prefix="fxopt-replay-") as output:
+            summary = trace_stored_candidate(
+                results.run_id, results.metadata,
+                candidate=candidate, ordinal=ordinal, output_dir=output,
+                trace_interval=200, trace_actions=False,
+                yb_mode=shiftclick_yb_mode if mode == "shift" else "off",
+                yb_cash_multiplier=shiftclick_yb_cash_multiplier if mode == "shift" else None,
+            )
+            figure = shiftclick_figure(summary, title=f"{results.run_id}: {ordinal}")
         figure.show()
-        return summary
+        return figure
 
     dataset = _dataset(results)
     raw_axes = results.metadata["axes"]

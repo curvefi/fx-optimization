@@ -91,8 +91,9 @@ is never copied.
 
 `run` writes a compact result bundle containing exactly `run.json` and
 `results.npz`; heatmap and Shift-click add their own image/state or trace
-artifacts. Grid results are buffered as typed NPZ shards and published only
-after complete ordinal coverage is verified. Interrupted grids are recomputed.
+artifacts. Grid results are buffered as typed NPZ shards. If a worker fails, completed
+results are retained and unevaluated cells remain blank. Missing cells are
+marked `uncalculated`; interrupted grids are not automatically resumed.
 The output directory is the durable hand-off between running, plotting, and
 replaying.
 
@@ -110,7 +111,7 @@ there are no fixed blade shards. Each worker owns its machine-local evaluator
 slots, and each lease contains one full evaluator batch per slot. Every
 evaluator registers the typed grid once and later receives only ordinal ranges.
 Workers write one local `/tmp` partition. The first placement host is the
-coordinator: it collects the partitions once, verifies complete disjoint
+coordinator: it collects the available partitions once, verifies disjoint
 coverage, merges their typed NPZ members, and sends only the final `run.json`
 and `results.npz` to the Mac. The launcher is SSH-specific; scheduling and
 worker execution are not.
@@ -163,15 +164,16 @@ prints one aggregate heartbeat every two seconds. Rate and ETA remain hidden
 until every worker has produced a batch; afterward ETA uses the remaining
 global queue and currently active worker rate. Deterministic candidate failures
 remain result rows; an evaluator transport failure is retried locally three
-times and then fails the run rather than publishing an incomplete grid. Final
+times; if the worker still fails, healthy workers continue and completed rows
+are published as a partial grid. Final
 `run.json` records the schedule, configured evaluator path, validated policy
 contract, per-worker timing, and aggregate status counts.
 Remote manifests must declare `run.metric_fields`, which fixes the typed result
 schema even when the first chunk fails. Subsequent runs can omit preparation
 flags when the requested evaluator target and sources are already present.
 
-The two maintained evaluator modes are native/no-policy and the compiled
-`yieldbasis_twocrypto_policy` dual-EMA controller. Native manifests omit
+Evaluator builds select either native/no-policy behavior or one compiled
+policy, such as the `yieldbasis_twocrypto_policy` dual-EMA controller. Native manifests omit
 `[compiled_policy]` and use `policy_params = []`. Compiled-policy grids declare
 the build input explicitly so `--rebuild` selects the dual-EMA header:
 
@@ -180,6 +182,13 @@ the build input explicitly so `--rebuild` selects the dual-EMA header:
 id = "yieldbasis_twocrypto_policy"
 header = "../../../twocrypto-cpp/include/pools/twocrypto_fx/policies/yieldbasis.hpp"
 ```
+
+The same build input supports `fair_price_fee` (base fee and capture),
+`implied_fair_fee` (plus assumed arb cost), `revealed_fair_fee` (plus revelation
+weight; floating-only), and `price_feed_passthrough` (no parameters). Select the
+matching header under `twocrypto-cpp/include/pools/twocrypto_fx/policies/` and
+use its descriptor's parameter order. Experimental headers are repository-local
+build inputs, not part of the installed pool library.
 
 The dual-EMA policy returns zero for its policy fee, so the pool's native fee
 surface remains active. Its six candidate parameters are fast and slow EMA
@@ -205,9 +214,10 @@ adaptive limits for price difference and detachment, fixed CLI filters for
 slippage and final price difference, axis selection,
 and multi-metric views. `--columns` controls the panel layout. Clicking a cell
 selects its exact candidate. Right-click replays that candidate with YieldBasis
-disabled. Shift-click replays it with the configured YB mode, preserving the
-run's session setting. These interactions are part of the heatmap workflow; no
-separate metrics window is required.
+disabled. Shift-left-click replays it with the configured YB mode. Plain left-click
+prints the selection without opening a plot. Replay prints the selected parameter coordinates to the console. Interactive
+replay traces are temporary and removed after plotting; titles and summaries
+use the local replay metrics.
 
 Raw panels never hide observations. Append `_masked` to any stored metric name
 to filter that panel by the interactive 7-day price-difference and detachment
