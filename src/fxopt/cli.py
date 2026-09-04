@@ -375,6 +375,19 @@ def worker_command(
 @click.option("--max-detach-energy", type=click.FloatRange(min=0.0))
 @click.option("--slippage-bps", type=float)
 @click.option("--final-price-diff-bps", type=float)
+@click.option(
+    "--shiftclick-yb-mode",
+    type=click.Choice(("off", "active_2l", "reference_2l")),
+    default="active_2l",
+    show_default=True,
+    help="YB mode for local Shift-click replay; right-click stays off.",
+)
+@click.option(
+    "--shiftclick-yb-cash-multiplier",
+    type=click.FloatRange(min=0.0, min_open=True),
+    default=3.0,
+    show_default=True,
+)
 @click.option("--output", type=click.Path(dir_okay=False, path_type=Path))
 @click.option("--show/--no-show", default=True, show_default=True)
 def heatmap_command(
@@ -383,7 +396,10 @@ def heatmap_command(
     max_price_diff_bps: float,
     max_detach_energy: float | None,
     slippage_bps: float | None,
-    final_price_diff_bps: float | None, output: Path | None, show: bool,
+    final_price_diff_bps: float | None,
+    shiftclick_yb_mode: str,
+    shiftclick_yb_cash_multiplier: float,
+    output: Path | None, show: bool,
 ) -> None:
     """Open the interactive filtered heatmap explorer."""
     explorer = None
@@ -396,6 +412,8 @@ def heatmap_command(
             max_detach_energy=max_detach_energy,
             slippage_bps=slippage_bps,
             final_price_diff_bps=final_price_diff_bps,
+            shiftclick_yb_mode=shiftclick_yb_mode,
+            shiftclick_yb_cash_multiplier=shiftclick_yb_cash_multiplier,
         )
         if output is not None:
             image, state = explorer.save(output)
@@ -418,9 +436,21 @@ def heatmap_command(
               type=click.Path(file_okay=False, path_type=Path))
 @click.option("--trace-interval", default=200, show_default=True, type=click.IntRange(min=1))
 @click.option("--actions/--no-actions", default=False, show_default=True)
+@click.option(
+    "--yb-mode",
+    type=click.Choice(("off", "active_2l", "reference_2l")),
+    default="active_2l",
+    show_default=True,
+)
+@click.option(
+    "--yb-cash-multiplier",
+    type=click.FloatRange(min=0.0, min_open=True),
+    default=3.0,
+    show_default=True,
+)
 def shiftclick_command(
     run_dir: Path, ordinal: int, output_dir: Path,
-    trace_interval: int, actions: bool,
+    trace_interval: int, actions: bool, yb_mode: str, yb_cash_multiplier: float,
 ) -> None:
     """Replay one exact stored RUN_DIR candidate with a full trace."""
     from .results import read_result_columns
@@ -437,6 +467,8 @@ def shiftclick_command(
             output_dir=output_dir,
             trace_interval=trace_interval,
             trace_actions=actions,
+            yb_mode=yb_mode,
+            yb_cash_multiplier=yb_cash_multiplier,
         )
         local_platform = " ".join(value for value in (platform.system(), platform.machine()) if value)
         plot = save_shiftclick_plot(

@@ -539,7 +539,7 @@ def test_stored_ordinal_replay_passes_exact_candidate_for_yb_off_and_enabled(
                 "work_dir": str(tmp_path),
                 "open_session": {
                     "scenario_id": "scenario",
-                    "yb_mode": "active_2l",
+                    "yb_mode": "off",
                     "arbitrage_enabled": True,
                 },
             },
@@ -600,6 +600,8 @@ def test_stored_ordinal_replay_passes_exact_candidate_for_yb_off_and_enabled(
     assert [client.open_requests[0]["yb_mode"] for client in clients] == [
         "active_2l", "off"
     ]
+    assert clients[0].open_requests[0]["yb_cash_multiplier"] == 3.0
+    assert "yb_cash_multiplier" not in clients[1].open_requests[0]
     assert all(client.payloads[0]["candidate_id"] == "p00000003" for client in clients)
     assert all(
         "arbitrage_enabled" not in client.open_requests[0]

@@ -98,6 +98,7 @@ def _run_trace(
     trace_actions: bool = False,
     client_factory: ClientFactory | None = None,
     yb_mode: str | None = None,
+    yb_cash_multiplier: float | None = None,
 ) -> Path:
     if not isinstance(candidate, Candidate):
         raise TypeError("candidate must be a Candidate")
@@ -117,6 +118,10 @@ def _run_trace(
                 "yb_mode must be off, active_2l, or reference_2l"
             )
         open_session["yb_mode"] = yb_mode
+    if yb_cash_multiplier is not None:
+        if not math.isfinite(yb_cash_multiplier) or yb_cash_multiplier <= 0.0:
+            raise ValueError("yb_cash_multiplier must be finite and positive")
+        open_session["yb_cash_multiplier"] = yb_cash_multiplier
     factory = client_factory or local_client_factory(
         replay.evaluator,
         work_dir=replay.work_dir,
@@ -161,6 +166,7 @@ def trace_stored_candidate(
     trace_actions: bool = False,
     client_factory: ClientFactory | None = None,
     yb_mode: str | None = None,
+    yb_cash_multiplier: float | None = None,
 ) -> Path:
     """Replay from self-contained run metadata."""
     return _run_trace(
@@ -172,6 +178,7 @@ def trace_stored_candidate(
         trace_actions=trace_actions,
         client_factory=client_factory,
         yb_mode=yb_mode,
+        yb_cash_multiplier=yb_cash_multiplier,
     )
 
 

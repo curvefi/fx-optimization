@@ -115,6 +115,8 @@ def open_fxopt_explorer(
     max_detach_energy: float | None = None,
     slippage_bps: float | None = None,
     final_price_diff_bps: float | None = None,
+    shiftclick_yb_mode: str = "active_2l",
+    shiftclick_yb_cash_multiplier: float = 3.0,
 ) -> HeatmapExplorer:
     """Open the interactive UI from columnar run results."""
     root = Path(run_dir).expanduser().resolve()
@@ -146,7 +148,10 @@ def open_fxopt_explorer(
             output_dir=output,
             trace_interval=200,
             trace_actions=False,
-            yb_mode=None if mode == "shift" else "off",
+            yb_mode=shiftclick_yb_mode if mode == "shift" else "off",
+            yb_cash_multiplier=(
+                shiftclick_yb_cash_multiplier if mode == "shift" else None
+            ),
         )
         figure = shiftclick_figure(summary, title=f"{results.run_id}: {ordinal}")
         figure.show()

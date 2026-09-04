@@ -244,6 +244,12 @@ and session inputs embedded in `run.json`; SSH placement is not reused. It write
 output directory. The plot title labels the local platform so
 double-versus-production-long-double stability checks stay explicit.
 
+Local Shift-click replay defaults to YB `active_2l` with a 3x cash multiplier,
+including when the source grid ran without YB. Right-click continues to force
+YB off. Override these defaults with `--shiftclick-yb-mode` and
+`--shiftclick-yb-cash-multiplier` on `fxopt heatmap`, or with `--yb-mode` and
+`--yb-cash-multiplier` on `fxopt shiftclick`.
+
 ## Results and configuration
 
 `run.json` contains the resolved run metadata, config origin, axes, robustness
