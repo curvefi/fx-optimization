@@ -1,0 +1,56 @@
+# Scalar x86 long-double reference; 161280 pools over the full market history.
+[run]
+id = "ethusd-fair-fee-perf-161k-ld-20260904"
+evaluator = "../../../curve-fx-arb-harness/build/fair-perf-baseline/arb_evaluator_ld"
+template = "ethusd-fair-fee-arb2bps.json"
+batch_size = 512
+workers = 128
+metric_fields = [
+  "vp", "lp_xcp_profit", "apy", "apy_net",
+  "apy_net_robust_90d", "avg_rel_price_diff", "max_rel_price_diff",
+  "max_7d_rel_price_diff", "final_rel_price_diff", "detach_energy_ungated",
+  "avg_imbalance", "trades", "n_rebalances", "arb_guarded_loss_coin0",
+  "donations", "donation_coin0_total", "tvl_growth", "elapsed_ms",
+]
+
+[placement]
+hosts = [
+  "blade-a5", "blade-a3", "blade-a4", "blade-a6", "blade-a7", "blade-a8", "blade-a10",
+  "blade-b1", "blade-b4", "blade-b5", "blade-b6", "blade-b7", "blade-b8", "blade-b9", "blade-b10",
+]
+numa_nodes = [0, 1]
+
+[compiled_policy]
+id = "fair_price_fee"
+header = "../../../twocrypto-cpp/include/pools/twocrypto_fx/policies/fair_price_fee.hpp"
+
+[session]
+n_candles = 0
+start_time = 1704067200
+end_time = 0
+candle_filter = 99.0
+min_swap = 0.000001
+max_swap = 1.0
+dustswap_freq_s = 3600
+user_swap_freq_s = 0
+enable_slippage_probes = false
+event_cursor = "scalar"
+metric_profile = "grid_core"
+
+[scenario]
+id = "ethusd-2024-2026-08-25-fair-price-fee-dense"
+market = "../../data/market/ethusd/candles-2023-2026-08-25-filtered.json"
+price_feed = "../../data/market/ethusd/fair-events-2023-2026-08-25.csv"
+yb_mode = "off"
+
+[candidate.defaults]
+policy_params = [0.01, 0.9]
+pool = {}
+
+[candidate.axes]
+"policy_params.0" = [0.001, 0.0014603174603174604, 0.0019206349206349206, 0.002380952380952381, 0.002841269841269841, 0.0033015873015873015, 0.003761904761904762, 0.004682539682539682, 0.005603174603174603, 0.006523809523809524, 0.0074444444444444445, 0.008365079365079365, 0.009285714285714286, 0.010206349206349207, 0.011126984126984128, 0.012047619047619048, 0.012968253968253969, 0.013888888888888888, 0.014809523809523809, 0.01573015873015873, 0.016650793650793652, 0.01757142857142857, 0.018492063492063494, 0.019412698412698413, 0.02033333333333333, 0.021253968253968254, 0.022174603174603173, 0.023095238095238096, 0.024936507936507937, 0.02677777777777778, 0.02861904761904762, 0.03]
+"policy_params.1" = [0, 0.031746031746031744, 0.06349206349206349, 0.09523809523809523, 0.12698412698412698, 0.15873015873015872, 0.19047619047619047, 0.2222222222222222, 0.25396825396825395, 0.2857142857142857, 0.31746031746031744, 0.3492063492063492, 0.38095238095238093, 0.4126984126984127, 0.4444444444444444, 0.47619047619047616, 0.5079365079365079, 0.5714285714285714, 0.6349206349206349, 0.6984126984126984, 0.7619047619047619, 0.8095238095238095, 0.8412698412698413, 0.873015873015873, 0.9047619047619048, 0.9365079365079365, 0.9682539682539683, 1.0]
+"pool.A" = [30000, 50000, 70000]
+"pool.donation_apy" = [0.01, 0.02, 0.03, 0.04, 0.05]
+"pool.ma_time" = [600, 3600, 14400]
+"pool.reserved_profit_fraction" = [0.1, 0.23333333333333334, 0.36666666666666664, 0.5]

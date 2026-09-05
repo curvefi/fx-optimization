@@ -1,0 +1,37 @@
+{
+  "pools": [
+    {
+      "tag": "ethusd_fair_price_fee_arb2bps",
+      "pool": {
+        "initial_liquidity": [
+          "500000000000000000000000",
+          "219086846025764613092"
+        ],
+        "A": "50000",
+        "gamma": "100000000000000",
+        "mid_fee": "128000000",
+        "out_fee": "328000000",
+        "fee_gamma": "30000000000000000",
+        "adjustment_step_min": "100000000",
+        "adjustment_step_max": "30000000000000000",
+        "ma_time": "3600",
+        "reserved_profit_fraction": "5000000000",
+        "admin_fee": "0",
+        "policy": {"kind": "none"},
+        "initial_price": "2282200000000000000000",
+        "start_timestamp": "1704067200",
+        "donation_apy": "0.01",
+        "donation_frequency": "86400",
+        "donation_duration": "604800",
+        "initial_donation_days": "28",
+        "donation_coins_ratio": "0"
+      },
+      "costs": {
+        "arb_fee_bps": 2,
+        "gas_coin0": 0,
+        "use_volume_cap": false,
+        "volume_cap_mult": 1
+      }
+    }
+  ]
+}

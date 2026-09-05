@@ -1,0 +1,56 @@
+# 2949120 pools; 15 blades, 128 threads each, two NUMA-bound evaluator processes.
+[run]
+id = "ethusd-fair-fee-dense-f64-20260905"
+evaluator = "../../../curve-fx-arb-harness/build/fair-perf-cache/arb_evaluator_f64"
+template = "ethusd-fair-fee-arb2bps.json"
+batch_size = 2048
+workers = 128
+metric_fields = [
+  "vp", "lp_xcp_profit", "apy", "apy_net",
+  "apy_net_robust_90d", "avg_rel_price_diff", "max_rel_price_diff",
+  "max_7d_rel_price_diff", "final_rel_price_diff", "detach_energy_ungated",
+  "avg_imbalance", "trades", "n_rebalances", "arb_guarded_loss_coin0",
+  "donations", "donation_coin0_total", "tvl_growth", "elapsed_ms",
+]
+
+[placement]
+hosts = [
+  "blade-a5", "blade-a3", "blade-a4", "blade-a6", "blade-a7", "blade-a8", "blade-a10",
+  "blade-b1", "blade-b4", "blade-b5", "blade-b6", "blade-b7", "blade-b8", "blade-b9", "blade-b10",
+]
+numa_nodes = [0, 1]
+
+[compiled_policy]
+id = "fair_price_fee"
+header = "../../../twocrypto-cpp/include/pools/twocrypto_fx/policies/fair_price_fee.hpp"
+
+[session]
+n_candles = 0
+start_time = 1704067200
+end_time = 0
+candle_filter = 99.0
+min_swap = 0.000001
+max_swap = 1.0
+dustswap_freq_s = 3600
+user_swap_freq_s = 0
+enable_slippage_probes = false
+event_cursor = "exact_skip"
+metric_profile = "grid_core"
+
+[scenario]
+id = "ethusd-2024-2026-08-25-fair-price-fee-dense"
+market = "../../data/market/ethusd/candles-2023-2026-08-25-filtered.json"
+price_feed = "../../data/market/ethusd/fair-events-2023-2026-08-25.csv"
+yb_mode = "off"
+
+[candidate.defaults]
+policy_params = [0.01, 0.9]
+pool = {}
+
+[candidate.axes]
+"pool.A" = [30000, 50000, 70000]
+"pool.reserved_profit_fraction" = { start = 0.1, stop = 0.5, count = 16 }
+"pool.ma_time" = [600, 3600, 14400]
+"pool.donation_apy" = [0.01, 0.02, 0.03, 0.04, 0.05]
+"policy_params.0" = { start = 0.001, stop = 0.03, count = 64 }
+"policy_params.1" = { start = 0.0, stop = 1.0, count = 64 }
