@@ -17,6 +17,7 @@ from curve_fx_sim.plotting.heatmap import (
     MaskSpec,
 )
 from curve_fx_sim.plotting.masked_metrics import masked_metric_slippage_sources
+from curve_fx_sim.plotting.shiftclick_view import ROLLING_APY_WINDOW_S, _rolling_window_growth_apy
 from fxopt import Candidate, EvaluatorSession
 from fxopt.cli import main
 from fxopt.config import ConfigError
@@ -24,7 +25,6 @@ from fxopt.engine import ProjectedBatch
 from fxopt.results import GridResultWriter, merge_grid_partitions, read_result_columns
 from fxopt.config import RunConfig
 from fxopt.run import run_config, run_metadata, run_leased_worker
-from fxopt.shiftclick import trace_stored_candidate
 
 
 def _run_toml(
@@ -89,11 +89,19 @@ def test_config_admission_table_covers_native_compiled_and_profiles(tmp_path: Pa
             "exact_skip requires metric_profile='grid_core'",
         ),
         (
-            "removed-arbitrage-switch",
-            {
-                "session": "[session]\narbitrage_enabled = false",
-            },
-            "session.arbitrage_enabled was removed",
+            "singleton-mismatch",
+            {"axes": '[candidate.axes]\n"pool.A" = {start = 1, stop = 2, count = 1}'},
+            "pool.A count=1 requires start and stop to match",
+        ),
+        (
+            "log-singleton-nonpositive",
+            {"axes": '[candidate.axes]\n"pool.A" = {start = 0, stop = 0, count = 1, scale = "log"}'},
+            "pool.A logarithmic endpoints must be positive",
+        ),
+        (
+            "singleton-equal",
+            {"axes": '[candidate.axes]\n"pool.A" = {start = 2, stop = 2, count = 1}'},
+            None,
         ),
         (
             "grid-core-admission",
@@ -490,6 +498,15 @@ def test_legacy_apy_mask_aliases_use_matching_slippage_sources() -> None:
     ) == ("tw_real_slippage_1pct", "tw_real_slippage_5pct")
 
 
+def test_rolling_growth_leaves_nonfinite_windows_unavailable() -> None:
+    timestamps = np.array([0.0, ROLLING_APY_WINDOW_S])
+    for growth in (np.array([1.0, np.nan]), np.array([1.0, np.inf]), np.array([np.inf, 1.0])):
+        rolling, floored = _rolling_window_growth_apy(timestamps, growth)
+        assert np.isnan(rolling[1]) and not floored[1]
+    rolling, floored = _rolling_window_growth_apy(timestamps, np.array([1.0, 0.0]))
+    assert rolling[1] == 0.0 and floored[1]
+
+
 class _TraceClient:
     def __init__(self, trace_paths: dict[str, Path]) -> None:
         self.trace_paths = trace_paths
@@ -546,7 +563,6 @@ def test_stored_ordinal_replay_passes_exact_candidate_for_yb_off_and_enabled(
                 "open_session": {
                     "scenario_id": "scenario",
                     "yb_mode": "off",
-                    "arbitrage_enabled": True,
                 },
             },
         }
@@ -589,8 +605,8 @@ def test_stored_ordinal_replay_passes_exact_candidate_for_yb_off_and_enabled(
         max_price_diff_bps=None,
     )
     try:
-        selection = explorer.dataset.point((1, 1)).to_selection_ref(explorer.run_id)
-        assert selection.index == ordinal and selection.candidate_id == "p00000003"
+        selection = explorer.dataset.point((1, 1))
+        assert selection.ordinal == ordinal and selection.candidate_id == "p00000003"
         shift_figure = explorer.on_replay(selection, "shift")
         right_figure = explorer.on_replay(selection, "right")
         for figure in (shift_figure, right_figure):
@@ -607,23 +623,3 @@ def test_stored_ordinal_replay_passes_exact_candidate_for_yb_off_and_enabled(
     assert clients[0].open_requests[0]["yb_cash_multiplier"] == 3.0
     assert "yb_cash_multiplier" not in clients[1].open_requests[0]
     assert all(client.payloads[0]["candidate_id"] == "p00000003" for client in clients)
-    assert all(
-        "arbitrage_enabled" not in client.open_requests[0]
-        for client in clients
-    )
-
-    blocked_metadata = dict(manifest["metadata"])
-    blocked_replay = dict(blocked_metadata["replay"])
-    blocked_replay["open_session"] = {
-        **blocked_replay["open_session"],
-        "arbitrage_enabled": False,
-    }
-    blocked_metadata["replay"] = blocked_replay
-    with pytest.raises(ValueError, match="historical no-arbitrage run"):
-        trace_stored_candidate(
-            manifest["run_id"],
-            blocked_metadata,
-            candidate=Candidate("blocked"),
-            ordinal=0,
-            output_dir=tmp_path / "blocked",
-        )

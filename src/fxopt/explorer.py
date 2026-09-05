@@ -5,12 +5,17 @@ from __future__ import annotations
 import json
 import tempfile
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Sequence
 
 import numpy as np
 
 from curve_fx_sim.plotting.explorer import HeatmapExplorer
-from curve_fx_sim.plotting.heatmap import HeatmapAxis, HeatmapDataset
+from curve_fx_sim.plotting.heatmap import (
+    HeatmapAxis,
+    HeatmapDataset,
+    HeatmapSelection,
+    infer_scale,
+)
 from curve_fx_sim.plotting.masked_metrics import (
     masked_metric_slippage_source,
     masked_metric_source,
@@ -63,18 +68,20 @@ def _heatmap_axis(name: str, raw_values: object) -> HeatmapAxis:
     if any(isinstance(value, dict) != grouped for value in values):
         raise ValueError(f"run axis {name!r} mixes scalar and grouped values")
     if not grouped:
-        return HeatmapAxis.from_metadata({"name": name, "values": values})
+        return HeatmapAxis(names=(name,), values=values, scale=infer_scale(values))
 
     member_names = tuple(sorted(values[0]))
     if not member_names or any(tuple(sorted(value)) != member_names for value in values):
         raise ValueError(f"run axis {name!r} grouped values have inconsistent members")
     rows = tuple(tuple(value[member] for member in member_names) for value in values)
     if len(member_names) == 1:
-        return HeatmapAxis.from_metadata({
-            "name": member_names[0],
-            "values": tuple(row[0] for row in rows),
-        })
-    return HeatmapAxis.from_metadata({"names": member_names, "rows": rows})
+        scalar_values = tuple(row[0] for row in rows)
+        return HeatmapAxis(
+            names=member_names,
+            values=scalar_values,
+            scale=infer_scale(scalar_values),
+        )
+    return HeatmapAxis(names=member_names, values=rows, scale="categorical")
 
 
 def _dataset(columns: ResultColumns) -> HeatmapDataset:
@@ -133,13 +140,13 @@ def open_fxopt_explorer(
     )
     results = read_result_columns(root, metrics=selected_columns)
 
-    def replay(selection: Any, mode: str):
-        ordinal = int(selection.index)
+    def replay(selection: HeatmapSelection, mode: str):
+        ordinal = int(selection.ordinal)
         candidate = results.candidate_at(ordinal)
         if candidate.candidate_id != selection.candidate_id:
             raise ValueError("selected candidate does not match the stored result row")
         coordinates = ", ".join(
-            f"{name}={value}" for name, value in selection.coordinate.items()
+            f"{name}={value}" for name, value in selection.coordinates.items()
         )
         print(f"replay ordinal={ordinal} ({coordinates})", flush=True)
         with tempfile.TemporaryDirectory(prefix="fxopt-replay-") as output:

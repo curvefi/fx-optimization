@@ -27,8 +27,11 @@ SCHEMA_VERSION = "fxopt.grid-results.v1"
 RUN_FILENAME = "run.json"
 RESULTS_FILENAME = "results.npz"
 
-_STATUS_TO_CODE = {"ok": 0, "failed": 1, "cancelled": 2, "uncalculated": 3}
-_CODE_TO_STATUS = tuple(_STATUS_TO_CODE)
+# Persisted status codes are append-only; keep this order stable.
+_CODE_TO_STATUS = ("ok", "failed", "cancelled", "uncalculated")
+_STATUS_TO_CODE = {
+    status: code for code, status in enumerate(_CODE_TO_STATUS)
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -347,10 +350,6 @@ class GridResultWriter:
         self._count = 0
         self._shard_count = 0
         self._closed = False
-
-    @property
-    def retained_rows(self) -> int:
-        return self._buffer_count
 
     @property
     def row_count(self) -> int:

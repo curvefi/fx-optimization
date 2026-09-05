@@ -42,6 +42,8 @@ def _range_values(spec: Mapping[str, Any], label: str) -> tuple[Any, ...]:
     scale = spec.get("scale", "linear")
     if scale not in {"linear", "log"}:
         raise ConfigError(f"{label}.scale must be 'linear' or 'log'")
+    if scale == "log" and (start <= 0 or stop <= 0):
+        raise ConfigError(f"{label} logarithmic endpoints must be positive")
     if "step" in spec:
         if scale != "linear":
             raise ConfigError(f"{label}.step is only supported for linear ranges")
@@ -62,10 +64,10 @@ def _range_values(spec: Mapping[str, Any], label: str) -> tuple[Any, ...]:
     if isinstance(count, bool) or not isinstance(count, int) or count < 1:
         raise ConfigError(f"{label} requires a positive integer count or non-zero step")
     if count == 1:
+        if start != stop:
+            raise ConfigError(f"{label} count=1 requires start and stop to match")
         return (_number_value(start),)
     if scale == "log":
-        if start <= 0 or stop <= 0:
-            raise ConfigError(f"{label} logarithmic endpoints must be positive")
         start_log = math.log(float(start))
         log_increment = (math.log(float(stop)) - start_log) / (count - 1)
         values = [math.exp(start_log + log_increment * index) for index in range(count)]
@@ -338,11 +340,6 @@ class RunConfig:
         if forbidden_session:
             raise ConfigError(
                 "[session] cannot set " + ", ".join(sorted(forbidden_session))
-            )
-        if "arbitrage_enabled" in session:
-            raise ConfigError(
-                "session.arbitrage_enabled was removed; model arbitrage friction "
-                "with pool.costs.arb_fee_bps"
             )
         resolved_session = dict(session)
         resolved_session.setdefault("event_cursor", "scalar")

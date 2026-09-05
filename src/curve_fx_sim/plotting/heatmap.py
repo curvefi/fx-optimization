@@ -22,23 +22,6 @@ from .masked_metrics import (
     masked_metric_uses_slippage,
 )
 
-@dataclass(frozen=True)
-class SelectionRef:
-    run_id: str
-    kind: str
-    index: int
-    coordinate: Mapping[str, Any]
-    candidate_id: str
-    tags: tuple[str, ...] = ()
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "run_id": self.run_id, "kind": self.kind, "index": self.index,
-            "coordinate": dict(self.coordinate), "candidate_id": self.candidate_id,
-            "tags": list(self.tags),
-        }
-
-
 def atomic_write_json(path: Path, value: object) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -107,7 +90,7 @@ def auto_log(values: Sequence[Any]) -> bool:
     return close_share >= 0.85 and log_cv < linear_cv
 
 
-def _inferred_scale(values: Sequence[Any]) -> AxisScale:
+def infer_scale(values: Sequence[Any]) -> AxisScale:
     """Linear/log/categorical detection for coordinates-inferred axes.
 
     Mirrors the metadata detection rules: non-numeric values are categorical,
@@ -188,59 +171,6 @@ class HeatmapAxis:
             }
         return {self.names[0]: _python_value(value)}
 
-    @classmethod
-    def from_metadata(cls, raw: Mapping[str, Any]) -> "HeatmapAxis":
-        if not isinstance(raw, Mapping):
-            raise HeatmapValidationError("heatmap axis metadata must be an object")
-        names_raw = raw.get("names") or ()
-        if not names_raw:
-            name = raw.get("name")
-            names_raw = (name,) if name else ()
-        if isinstance(names_raw, str):
-            names_raw = (names_raw,)
-        if not isinstance(names_raw, Sequence) or isinstance(names_raw, (bytes, bytearray)):
-            raise HeatmapValidationError("heatmap axis names metadata must be an array")
-        names = tuple(str(name) for name in names_raw)
-        rows = raw.get("rows")
-        values = raw.get("values")
-        # AxisSpec serialization retains the inactive representation as an
-        # empty array. Treat only populated representations as declarations.
-        rows = None if rows == [] else rows
-        values = None if values == [] else values
-        if rows is not None and values is not None:
-            raise HeatmapValidationError("heatmap axis metadata cannot declare both rows and values")
-        if rows is not None:
-            if len(names) <= 1:
-                raise HeatmapValidationError("heatmap axis rows require coupled axis names")
-            if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes, bytearray)):
-                raise HeatmapValidationError("heatmap axis rows metadata must be an array")
-            axis_values = tuple(
-                tuple(row)
-                if isinstance(row, Sequence) and not isinstance(row, (str, bytes, bytearray))
-                else row
-                for row in rows
-            )
-        else:
-            if not isinstance(values, Sequence) or isinstance(values, (str, bytes, bytearray)):
-                raise HeatmapValidationError("heatmap axis values metadata must be an array")
-            axis_values = tuple(values)
-        generation = raw.get("generation", {})
-        if not isinstance(generation, Mapping):
-            raise HeatmapValidationError("heatmap axis generation metadata must be an object")
-        declared_scale = generation.get("scale")
-        if declared_scale not in {None, "linear", "log", "logarithmic", "categorical"}:
-            raise HeatmapValidationError(f"unsupported axis scale metadata {declared_scale!r}")
-        if len(names) > 1 or rows is not None or declared_scale == "categorical":
-            scale: AxisScale = "categorical"
-        elif declared_scale in {"log", "logarithmic"}:
-            scale = "log"
-        elif declared_scale == "linear":
-            scale = "linear"
-        else:
-            scale = _inferred_scale(axis_values)
-        return cls(names=names, values=axis_values, scale=scale)
-
-
 @dataclass(frozen=True)
 class MaskSpec:
     max_price_diff_bps: float | None = None
@@ -278,17 +208,6 @@ class HeatmapSelection:
     coordinates: Mapping[str, Any]
     metrics: Mapping[str, float | None]
     grid_indices: tuple[int, ...]
-
-    def to_selection_ref(self, run_id: str) -> SelectionRef:
-        """Represent this exact table cell for replay."""
-        return SelectionRef(
-            run_id=run_id,
-            kind="grid_point",
-            index=self.ordinal,
-            coordinate=dict(self.coordinates),
-            candidate_id=self.candidate_id,
-            tags=("heatmap",),
-        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -588,12 +507,8 @@ class HeatmapTilesState:
         candidates = active + [axis.key for axis in dataset.axes if axis.key not in active]
         if len(candidates) < 2:
             raise HeatmapValidationError("heatmap needs two axes")
-        canonical = {"donation_apy", "reserved_profit_fraction"}
-        if x_axis is None and y_axis is None and canonical <= set(active):
-            selected_x, selected_y = "donation_apy", "reserved_profit_fraction"
-        else:
-            selected_x = x_axis or candidates[0]
-            selected_y = y_axis or next(key for key in candidates if key != selected_x)
+        selected_x = x_axis or candidates[0]
+        selected_y = y_axis or next(key for key in candidates if key != selected_x)
         return cls(
             axes=dataset.axes,
             metrics=tuple(dataset.metrics),
@@ -604,19 +519,6 @@ class HeatmapTilesState:
             ncol=ncol,
             log_axes=tuple(log_axes),
         )
-
-
-def _is_positional(axis: HeatmapAxis) -> bool:
-    if axis.scale == "categorical" or axis.is_coupled:
-        return True
-    values = np.asarray(axis.values, dtype=float)
-    return len(values) > 1 and not bool(np.all(np.diff(values) > 0))
-
-
-def _centers(axis: HeatmapAxis) -> np.ndarray:
-    if _is_positional(axis):
-        return np.arange(len(axis.values), dtype=float)
-    return np.asarray(axis.values, dtype=float)
 
 
 def edges(centers: np.ndarray, *, logarithmic: bool) -> np.ndarray:
@@ -645,6 +547,7 @@ def edges(centers: np.ndarray, *, logarithmic: bool) -> np.ndarray:
 
 __all__ = [
     "auto_log",
+    "infer_scale",
     "edges",
     "HeatmapAxis",
     "HeatmapDataset",

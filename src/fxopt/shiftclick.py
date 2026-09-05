@@ -46,12 +46,6 @@ def _replay_from_metadata(
     if not isinstance(open_session, Mapping):
         raise ValueError("run replay metadata has no local session request")
     normalized_open_session = dict(open_session)
-    legacy_arbitrage = normalized_open_session.pop("arbitrage_enabled", True)
-    if legacy_arbitrage is not True:
-        raise ValueError(
-            "cannot replay a historical no-arbitrage run after removal of "
-            "arbitrage_enabled"
-        )
     if (
         not isinstance(evaluator_policy, Mapping)
         or set(evaluator_policy)

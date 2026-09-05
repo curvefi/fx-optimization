@@ -59,6 +59,23 @@ pages, fetches them concurrently, preserves legitimate exchange gaps, rejects
 duplicates or disorder, and publishes the merged JSON atomically. The filter
 owns only the established centered-neighbor OHLC clipping step.
 
+Historical YB acquisition tools use the optional `research` dependency group.
+Run the cached configuration gate without RPC access, or acquire the bounded
+mainnet tapes with `DRPC_API_KEY` set:
+
+```sh
+uv run --group research python scripts/acquire_yb_configuration_window.py \
+  --offline-check runs/yb-cbbtc-historical-20260904/configuration/configuration_window.json
+uv run --group research python scripts/acquire_yb_configuration_window.py
+uv run --group research python scripts/acquire_yb_activity.py
+uv run --group research python scripts/acquire_yb_weth_window.py
+uv run --group research python scripts/acquire_yb_weth_activity.py
+```
+
+The acquisition commands are read-only RPC harvests and persist their response
+cache beside the study artifacts. The offline check only validates an existing
+configuration artifact.
+
 Configs live under `configs/`. Human-curated manifests live in
 `configs/experiments/`; LLM-generated iterative manifests belong in the ignored
 `configs/autoresearch/` workbench. The maintained BTC starters are

@@ -10,6 +10,7 @@ build/
 dist/
 *.egg-info/
 runs/
+reports/
 # Agent-generated search manifests are mutable workbench inputs. Completed runs
 # carry their resolved configuration and replay inputs in run.json.
 configs/autoresearch/*

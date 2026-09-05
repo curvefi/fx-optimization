@@ -28,7 +28,6 @@ from .heatmap import (
     HeatmapSelection,
     HeatmapTilesState,
     MaskSpec,
-    SelectionRef,
     atomic_write_json,
     auto_log,
     edges,
@@ -314,7 +313,7 @@ class HeatmapExplorer:
         slipthr: float | None = None,
         final_pdiffthr: float | None = None,
         run_id: str | None = None,
-        on_replay: Callable[[SelectionRef, str], Any] | None = None,
+        on_replay: Callable[[HeatmapSelection, str], Any] | None = None,
     ) -> None:
         if not isinstance(data, HeatmapDataset):
             raise TypeError("HeatmapExplorer requires a HeatmapDataset")
@@ -779,9 +778,8 @@ class HeatmapExplorer:
 
     def replay(self, selection: HeatmapSelection, mode: str = "shift") -> Any:
         """Forward an exact selection to the caller's local replay callback."""
-        selection_ref = selection.to_selection_ref(self.run_id)
         if self.on_replay is not None:
-            return self.on_replay(selection_ref, mode)
+            return self.on_replay(selection, mode)
         raise RuntimeError("replay requires an on_replay callback")
 
     def save(self, output: Path | str, *, state_path: Path | str | None = None) -> tuple[Path, Path]:
@@ -801,7 +799,7 @@ class HeatmapExplorer:
         payload["explorer"] = {
             "window_titles": ["Heatmaps", "Controls"],
             "run_id": self.run_id,
-            "selection": self.last_selection.to_selection_ref(self.run_id).to_dict() if self.last_selection else None,
+            "selection": self.last_selection.to_dict() if self.last_selection else None,
         }
         atomic_write_json(sidecar, payload)
         return image_path, sidecar

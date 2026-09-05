@@ -20,8 +20,6 @@ import numpy as np
 SEC_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
 ROLLING_APY_WINDOW_DAYS = 90
 ROLLING_APY_WINDOW_S = float(ROLLING_APY_WINDOW_DAYS) * 24.0 * 60.0 * 60.0
-ROLLING_APY_SAMPLE_S = 60.0 * 60.0
-ROLLING_APY_FLOOR = 1e-20
 DEFAULT_MAX_POINTS = 10_000
 
 
@@ -44,7 +42,6 @@ def _series(records: Sequence[Mapping[str, Any]], name: str, default: Any = None
 
 def _trace_to_detailed(records: Sequence[Mapping[str, Any]]) -> dict[str, np.ndarray]:
     """Map harness trace records onto the detailed plotting field set."""
-    n = len(records)
     return {
         "timestamps": _series(records, "t"),
         "price_scale": _series(records, "price_scale"),
@@ -83,17 +80,9 @@ def _donation_growth(timestamps: np.ndarray, donation_apy: np.ndarray, donation_
     return np.power(1.0 + donation_apy, elapsed / SEC_PER_YEAR)
 
 
-def _rolling_window_net_apy(
-    timestamps: np.ndarray,
-    profit_growth: np.ndarray,
-    donation_apy: np.ndarray,
-    donation_frequency: float,
+def _rolling_window_growth_apy(
+    timestamps: np.ndarray, growth: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    if len(timestamps) == 0:
-        return np.array([], dtype=float), np.array([], dtype=bool)
-    donation_growth = _donation_growth(timestamps, donation_apy, donation_frequency)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        net_profit_growth = profit_growth / donation_growth
     rolling = np.full(len(timestamps), np.nan, dtype=float)
     floored = np.zeros(len(timestamps), dtype=bool)
     start = 0
@@ -102,32 +91,16 @@ def _rolling_window_net_apy(
         while start + 1 < len(timestamps) and timestamps[start + 1] <= cutoff:
             start += 1
         dt = ts - timestamps[start]
-        if dt < ROLLING_APY_WINDOW_S or not (net_profit_growth[start] > 0.0):
-            continue
-        growth = net_profit_growth[i] / net_profit_growth[start]
-        if not np.isfinite(growth) or growth <= 0.0:
-            rolling[i] = 0.0
-            floored[i] = True
-            continue
-        apy = np.power(growth, SEC_PER_YEAR / dt) - 1.0
-        rolling[i] = apy
-        floored[i] = bool(np.isfinite(apy) and apy < 0.0)
-    return rolling, floored
-
-
-def _rolling_window_growth_apy(timestamps: np.ndarray, growth: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    rolling = np.full(len(timestamps), np.nan, dtype=float)
-    floored = np.zeros(len(timestamps), dtype=bool)
-    start = 0
-    for i, ts in enumerate(timestamps):
-        cutoff = ts - ROLLING_APY_WINDOW_S
-        while start + 1 < len(timestamps) and timestamps[start + 1] <= cutoff:
-            start += 1
-        dt = ts - timestamps[start]
-        if dt < ROLLING_APY_WINDOW_S or not (growth[start] > 0.0):
+        if (
+            dt < ROLLING_APY_WINDOW_S
+            or not np.isfinite(growth[start])
+            or not (growth[start] > 0.0)
+        ):
             continue
         window_growth = growth[i] / growth[start]
-        if not np.isfinite(window_growth) or window_growth <= 0.0:
+        if not np.isfinite(window_growth):
+            continue
+        if window_growth <= 0.0:
             rolling[i] = 0.0
             floored[i] = True
             continue
@@ -464,9 +437,7 @@ def render_shiftclick_figure(
         net_lp_growth = lp_xcp_profit / donation_growth
     lp_net_apy = metrics.get("apy_net", np.nan)
     lp_gm_apy = metrics.get("apy_net_gm", np.nan)
-    rolling_apy, rolling_floored = _rolling_window_net_apy(
-        timestamps, lp_xcp_profit, donation_apy, donation_frequency
-    )
+    rolling_apy, rolling_floored = _rolling_window_growth_apy(timestamps, net_lp_growth)
     val0 = token0
     val1 = token1 * p_cex
     denom = val0 + val1
