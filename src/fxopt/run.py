@@ -25,6 +25,7 @@ from .config import (
     _COMPILED_POLICY_ABI, _execution_inputs,
 )
 from .engine import ClientFactory
+from .datasets import dataset_metadata
 from .placement import (
     EvaluatorFleet,
     PlacementLane,
@@ -162,8 +163,9 @@ def stage_remote_run(config: RunConfig) -> str:
         raise ConfigError("remote staging requires placement hosts")
     local_inputs = _execution_inputs(config, remote=False)
     remote_inputs = _execution_inputs(config, remote=True)
+    datasets = dataset_metadata(local_inputs)
     first = config.hosts[0]
-    for name in ("template", "market", "price_feed"):
+    for name in ("template", "market", "price_feed", "cex_depth", "observed_state"):
         if name in remote_inputs:
             ensure_remote_file(
                 first,
@@ -171,6 +173,13 @@ def stage_remote_run(config: RunConfig) -> str:
                 remote_inputs[name],
                 replace=name == "template",
             )
+    manifests = {
+        (Path(local_inputs[name]).with_name("dataset.json"),
+         str(PurePosixPath(remote_inputs[name]).with_name("dataset.json")))
+        for name in datasets
+    }
+    for source, destination in sorted(manifests):
+        ensure_remote_file(first, source, destination, replace=True)
     workspace = next(
         parent.parent
         for parent in config.path.parents
@@ -225,11 +234,15 @@ def open_session_request(config: RunConfig, *, remote: bool | None = None) -> di
     request = {
         "template_path": inputs["template"],
         "scenario_id": config.scenario["id"],
-        "market_path": inputs["market"],
+        **({"market_path": inputs["market"]} if "market" in inputs else {}),
         **config.session,
     }
     if (price_feed := inputs.get("price_feed")) is not None:
         request["price_feed_path"] = price_feed
+    if (cex_depth := inputs.get("cex_depth")) is not None:
+        request["cex_depth_path"] = cex_depth
+    if (observed_state := inputs.get("observed_state")) is not None:
+        request["observed_state_path"] = observed_state
     if (yb_mode := config.scenario.get("yb_mode")) is not None:
         request.setdefault("yb_mode", yb_mode)
     return request
@@ -257,7 +270,7 @@ def run_metadata(
             raise ConfigError(f"coordinator replay path must be below {REMOTE_BASE}") from exc
         return str(origin_workspace.joinpath(*relative.parts))
 
-    for key in ("template_path", "market_path", "price_feed_path"):
+    for key in ("template_path", "market_path", "price_feed_path", "cex_depth_path", "observed_state_path"):
         if key in replay_session:
             replay_session[key] = replay_path(replay_session[key])
     config_path = origin_config or config.path
@@ -275,7 +288,7 @@ def run_metadata(
         "config_origin": origin,
         "evaluator": inputs["evaluator"],
         "template": inputs["template"],
-        "market": inputs["market"],
+        **({"market": inputs["market"]} if "market" in inputs else {}),
         "placement": "ssh" if config.hosts else "local",
         "hosts": list(config.hosts),
         "numa_nodes": list(config.numa_nodes),
@@ -296,6 +309,8 @@ def run_metadata(
     }
     if config.robustness:
         metadata["robustness"] = robustness_metadata(config.robustness)
+    if datasets := dataset_metadata(local_inputs):
+        metadata["datasets"] = datasets
     if config.compiled_policy_header is not None:
         metadata["compiled_policy"] = {
             "id": config.compiled_policy_id,
@@ -653,6 +668,16 @@ def run_distributed_config(
         raise ConfigError("distributed grids require hosts and metric fields")
     total = len(config.candidate.grid())
     batch_size = _evaluator_batch_size(config, total)
+    metadata = run_metadata(
+        config,
+        effective_batch=batch_size,
+        origin_workspace=(
+            None if origin_workspace is None else Path(origin_workspace).resolve()
+        ),
+        origin_config=(
+            None if origin_config is None else Path(origin_config).resolve()
+        ),
+    )
     block_size = _schedule_block_size(config, total)
     leases = _shuffled_block_leases(
         total,
@@ -875,16 +900,6 @@ def run_distributed_config(
         progress.close()
         progress_closed = True
 
-        metadata = run_metadata(
-            config,
-            effective_batch=batch_size,
-            origin_workspace=(
-                None if origin_workspace is None else Path(origin_workspace).resolve()
-            ),
-            origin_config=(
-                None if origin_config is None else Path(origin_config).resolve()
-            ),
-        )
         metadata["placement"] = "machine_workers"
         metadata["execution_order"] = {
             "kind": "dynamic_shuffled_leases_v1",

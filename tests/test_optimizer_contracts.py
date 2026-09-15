@@ -30,14 +30,17 @@ from fxopt.run import run_config, run_metadata, run_leased_worker
 def _run_toml(
     path: Path,
     *,
+    market: str | None = "market.json",
     policy_params: str = "[]",
     compiled_policy: str = "",
     session: str = "",
     yb_mode: str = "off",
     price_feed: str = "",
+    cex_depth: str = "",
     metrics: str = '["score"]',
     axes: str = "",
 ) -> Path:
+    market_line = f'market = "{market}"' if market is not None else ""
     path.write_text(
         f'''[run]
 id = "contract"
@@ -49,8 +52,9 @@ metric_fields = {metrics}
 {session}
 [scenario]
 id = "scenario"
-market = "market.json"
+{market_line}
 {price_feed}
+{cex_depth}
 yb_mode = "{yb_mode}"
 {compiled_policy}
 [candidate.defaults]
@@ -60,6 +64,54 @@ pool = {{}}
 '''
     )
     return path
+
+
+def test_depth_config_omits_market_and_preserves_runtime_interval(tmp_path):
+    from fxopt.run import open_session_request
+    from curve_fx_harness_client.models import OpenSessionFrame
+    for mode in ("reference_2l", "active_2l"):
+        path = _run_toml(tmp_path/"depth.toml", market=None, yb_mode=mode,
+                         cex_depth='cex_depth = "book.npz"',
+                         session='[session]\nactor_timing_mode = "minute_sequential"\nobservation_interval_s = 37')
+        config = RunConfig.from_toml(path)
+        request = open_session_request(config)
+        frame = OpenSessionFrame.model_validate(dict(request, request_id="r", session_id="s"))
+        assert frame.event_mode == "depth" and frame.observation_interval_s == 37
+        assert "market_path" not in request and "market" not in run_metadata(config, effective_batch=1)
+    with pytest.raises(ConfigError, match="requires NPZ"):
+        RunConfig.from_toml(_run_toml(tmp_path/"old.toml", cex_depth='cex_depth = "book.jsonl"'))
+
+
+def test_vp_margin_config_and_public_frame(tmp_path: Path) -> None:
+    from curve_fx_harness_client.models import OpenSessionFrame
+    from fxopt.run import open_session_request
+    from pydantic import ValidationError
+    base = dict(request_id="r", session_id="s", template_path="t", scenario_id="x", market_path="m")
+    for value in (None, 0, 1):
+        session = "" if value is None else f"[session]\nyb_min_net_profit_coin0 = {value}"
+        request = open_session_request(RunConfig.from_toml(_run_toml(tmp_path / "margin.toml", session=session)))
+        frame = OpenSessionFrame.model_validate(dict(request, request_id="r", session_id="s"))
+        assert ("yb_min_net_profit_coin0" in request) == (value is not None)
+        assert frame.model_dump(exclude_none=True).get("yb_min_net_profit_coin0") == value
+    assert not {"yb_min_net_profit_coin0", "state_reconciliation_mode", "equalization_interval_s", "equalization_delay_s"} & OpenSessionFrame(**base).model_dump(exclude_none=True).keys()
+    explicit = OpenSessionFrame(**base, state_reconciliation_mode="off", equalization_delay_s=0).model_dump(exclude_none=True)
+    assert explicit["state_reconciliation_mode"] == "off" and explicit["equalization_delay_s"] == 0
+    reconciled = open_session_request(RunConfig.from_toml(_run_toml(
+        tmp_path / "reconciled.toml", market=None, yb_mode="reference_2l",
+        cex_depth='cex_depth = "depth.npz"\nobserved_state = "observed.jsonl"',
+        session='[session]\nstate_reconciliation_mode = "on_price_scale_detach"\nactor_timing_mode = "minute_sequential"\nequalization_delay_s = 20')))
+    assert OpenSessionFrame.model_validate(dict(reconciled, request_id="r", session_id="s")).equalization_delay_s == 20
+    minute = open_session_request(RunConfig.from_toml(_run_toml(
+        tmp_path / "minute.toml", market=None, yb_mode="reference_2l", cex_depth='cex_depth = "deep.npz"',
+        session='[session]\nactor_timing_mode = "minute_sequential"')))
+    minute_frame = OpenSessionFrame.model_validate(dict(minute, request_id="r", session_id="s"))
+    assert minute_frame.actor_timing_mode == "minute_sequential"
+    assert minute_frame.event_mode == "depth" and minute_frame.dustswap_freq_s == minute_frame.user_swap_freq_s == 0
+    for bad in (-1., float("nan"), float("inf")):
+        with pytest.raises(ConfigError):
+            RunConfig.from_toml(_run_toml(tmp_path / "bad.toml", session=f"[session]\nyb_min_net_profit_coin0 = {bad}"))
+        with pytest.raises(ValidationError):
+            OpenSessionFrame.model_validate(dict(base, yb_min_net_profit_coin0=bad))
 
 
 def test_config_admission_table_covers_native_compiled_and_profiles(tmp_path: Path) -> None:
@@ -83,6 +135,9 @@ def test_config_admission_table_covers_native_compiled_and_profiles(tmp_path: Pa
             {"price_feed": 'price_feed = "nav.csv"'},
             None,
         ),
+        ("depth-exact-skip", {"market": None, "cex_depth": 'cex_depth = "book.npz"', "session": '[session]\nevent_mode = "depth"\nevent_cursor = "exact_skip"\nmetric_profile = "grid_core"'}, None),
+        ("depth-yb", {"cex_depth": 'cex_depth = "book.npz"', "yb_mode": "active_2l"}, None),
+        ("depth-reference-yb", {"cex_depth": 'cex_depth = "book.npz"', "yb_mode": "reference_2l"}, None),
         (
             "exact-skip-profile",
             {"session": '[session]\nevent_cursor = "exact_skip"\nmetric_profile = "full_summary"'},
@@ -144,6 +199,9 @@ def test_config_admission_table_covers_native_compiled_and_profiles(tmp_path: Pa
         if name == "price-feed":
             metadata = run_metadata(config, effective_batch=2)
             assert metadata["open_session"]["price_feed_path"].endswith("nav.csv")
+        if name == "depth-exact-skip":
+            opened = run_metadata(config, effective_batch=2)["open_session"]
+            assert opened["cex_depth_path"].endswith("book.npz") and opened["cex_depth_max_age_s"] == 30 and opened["event_mode"] == "depth"
 
 
 class _GridClient:

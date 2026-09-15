@@ -36,8 +36,3 @@ cluster = [
 dev = [
     "pytest>=8.0.0",
 ]
-research = [
-    "eth-abi",
-    "eth-hash[pycryptodome]",
-    "eth-utils",
-]

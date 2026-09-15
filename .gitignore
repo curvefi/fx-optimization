@@ -11,11 +11,12 @@ dist/
 *.egg-info/
 runs/
 reports/
+.env
+.lake_cache/
 # Agent-generated search manifests are mutable workbench inputs. Completed runs
 # carry their resolved configuration and replay inputs in run.json.
 configs/autoresearch/*
 !configs/autoresearch/README.md
-# Market candles ship compressed (data/market/*/candles.xz via LFS); the
-# uncompressed JSON is a local working artifact and is not tracked.
-data/market/**/*.json
-data/market/**/*.csv
+.DS_Store
+# Keep local datasets and provenance untracked. Existing tracked files are unaffected.
+/data/
