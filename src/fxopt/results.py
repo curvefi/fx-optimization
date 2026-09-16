@@ -188,11 +188,9 @@ def read_result_columns(
         shard_count = payload["shard_count"]
         run_id = payload["run_id"]
         if (
-            isinstance(count, bool)
-            or not isinstance(count, int)
+            type(count) is not int
             or count < 1
-            or isinstance(shard_count, bool)
-            or not isinstance(shard_count, int)
+            or type(shard_count) is not int
             or shard_count < 0
             or not isinstance(run_id, str)
             or not run_id
@@ -292,7 +290,7 @@ class GridResultWriter:
     ) -> None:
         if not isinstance(run_id, str) or not run_id.strip():
             raise ValueError("run_id must be a non-empty string")
-        if isinstance(total, bool) or not isinstance(total, int) or total < 1:
+        if type(total) is not int or total < 1:
             raise ValueError("grid result total must be a positive integer")
         names = tuple(sorted(metric_names))
         if (
@@ -301,15 +299,10 @@ class GridResultWriter:
             or any(not isinstance(name, str) or not name for name in names)
         ):
             raise ValueError("metric names must be unique non-empty strings")
-        if (
-            isinstance(shard_rows, bool)
-            or not isinstance(shard_rows, int)
-            or shard_rows < 1
-        ):
+        if type(shard_rows) is not int or shard_rows < 1:
             raise ValueError("shard_rows must be a positive integer")
         if expected_count is not None and (
-            isinstance(expected_count, bool)
-            or not isinstance(expected_count, int)
+            type(expected_count) is not int
             or expected_count < 1
             or expected_count > total
         ):
@@ -588,11 +581,9 @@ def merge_grid_partitions(
                 expected = payload["partition_count"]
                 shard_count = payload["shard_count"]
                 if (
-                    isinstance(expected, bool)
-                    or not isinstance(expected, int)
+                    type(expected) is not int
                     or expected < 1
-                    or isinstance(shard_count, bool)
-                    or not isinstance(shard_count, int)
+                    or type(shard_count) is not int
                     or shard_count < 0
                 ):
                     raise ValueError("partition counts are invalid")

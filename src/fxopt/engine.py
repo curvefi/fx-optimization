@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-import math
 from typing import Any, Protocol
 
 from .candidates import candidate_id
@@ -12,7 +11,7 @@ from .contract import Candidate, CandidateResult
 
 
 class EvaluatorClient(Protocol):
-    """Minimal lifecycle implemented by the local or remote harness client."""
+    """Harness-client lifecycle; responses have already passed wire validation."""
 
     def start(self) -> Any: ...
 
@@ -40,42 +39,6 @@ class ProjectedBatch:
     rows: tuple[Mapping[str, Any], ...]
 
 
-def _projected_row(
-    value: Any,
-    ordinal: int,
-    metric_count: int,
-) -> Mapping[str, Any]:
-    if (
-        not isinstance(value, Mapping)
-        or value.get("ordinal") != ordinal
-        or value.get("candidate_id") != candidate_id(ordinal)
-    ):
-        raise ValueError("projected evaluator results must preserve input order")
-    status = value.get("status", "ok")
-    if status not in {"ok", "failed", "cancelled"}:
-        raise ValueError("projected evaluator result has an invalid status")
-    metrics = value.get("metrics")
-    if (
-        isinstance(metrics, (str, bytes))
-        or not isinstance(metrics, Sequence)
-        or len(metrics) != metric_count
-        or any(
-            isinstance(metric, bool)
-            or not isinstance(metric, (int, float))
-            or not math.isfinite(metric)
-            for metric in metrics
-        )
-    ):
-        raise ValueError("projected evaluator result has invalid metrics")
-    error = value.get("error")
-    if error is not None and not isinstance(error, str):
-        raise ValueError("projected evaluator result has an invalid error")
-    artifacts = value.get("artifacts")
-    if artifacts is not None and not isinstance(artifacts, Mapping):
-        raise ValueError("projected evaluator result has invalid artifacts")
-    return value
-
-
 def _response_field(value: Any, name: str, default: Any = None) -> Any:
     if isinstance(value, Mapping):
         return value.get(name, default)
@@ -88,17 +51,6 @@ def _normalize_result(
     ordinal: int,
     metric_fields: Sequence[str] | None = None,
 ) -> CandidateResult:
-    if isinstance(value, CandidateResult):
-        if value.candidate_id != candidate.candidate_id:
-            raise ValueError("evaluator returned a result for the wrong candidate")
-        return CandidateResult(
-            candidate_id=candidate.candidate_id,
-            status=value.status,
-            metrics=value.metrics,
-            error=value.error,
-            artifacts=value.artifacts,
-            ordinal=ordinal,
-        )
     candidate_id = _response_field(value, "candidate_id")
     if candidate_id != candidate.candidate_id:
         raise ValueError(
@@ -108,24 +60,17 @@ def _normalize_result(
     if metrics is None:
         metrics = {}
     if metric_fields is not None and not isinstance(metrics, Mapping):
-        values = tuple(metrics)
-        if len(values) != len(metric_fields):
-            raise ValueError("evaluator metric array has the wrong length")
-        return CandidateResult(
-            candidate_id=candidate.candidate_id,
-            status=_response_field(value, "status", "ok"),
-            metrics=dict(zip(metric_fields, values, strict=True)),
-            error=_response_field(value, "error"),
-            artifacts=_response_field(value, "artifacts"),
-            ordinal=ordinal,
-        )
+        metrics = dict(zip(metric_fields, metrics, strict=True))
+    artifacts = _response_field(value, "artifacts")
+    if artifacts is not None and not isinstance(artifacts, Mapping):
+        artifacts = artifacts.model_dump(exclude_none=True)
     status = _response_field(value, "status", "ok")
     return CandidateResult(
         candidate_id=candidate.candidate_id,
         status=status,
         metrics=metrics,
         error=_response_field(value, "error"),
-        artifacts=_response_field(value, "artifacts"),
+        artifacts=artifacts,
         ordinal=ordinal,
     )
 
@@ -324,11 +269,12 @@ class EvaluatorSession:
         rows = tuple(values)
         if len(rows) != len(ordinals):
             raise ValueError("evaluator returned the wrong number of grid results")
-        validated = tuple(
-            _projected_row(row, ordinal, len(self._metric_fields))
+        if any(
+            row["ordinal"] != ordinal or row["candidate_id"] != candidate_id(ordinal)
             for ordinal, row in zip(ordinals, rows, strict=True)
-        )
-        return ProjectedBatch(self._metric_fields, validated)
+        ):
+            raise ValueError("projected evaluator results must preserve input order")
+        return ProjectedBatch(self._metric_fields, rows)
 
     def close(self) -> None:
         if self._closed:

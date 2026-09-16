@@ -41,3 +41,27 @@ def test_session_admission_matches_retained_harness_modes(tmp_path):
         frame = OpenSessionFrame.model_validate(dict(open_session_request(config), request_id='r', session_id='s'))
         assert frame.event_mode == 'depth' and frame.observation_interval_s == 37
         assert frame.yb_mode == scenario['yb_mode'] and frame.market_path is None
+
+
+def test_mixed_depth_requires_both_sources_and_continuous_actor_timing(tmp_path):
+    for market, depth, timing, accepted in (
+        (True, True, 'legacy_event', True), (False, True, 'legacy_event', False),
+        (True, False, 'legacy_event', False), (True, True, 'minute_sequential', False),
+    ):
+        path = tmp_path/'mixed.toml'
+        text = '[run]\nid = "mixed"\nevaluator = "evaluator"\ntemplate = "template.json"\nbatch_size = 1\nworkers = 1\nmetric_fields = ["score"]\n'
+        text += '[scenario]\nid = "mixed"\nyb_mode = "active_2l"\n'
+        if market: text += 'market = "candles.json"\n'
+        if depth: text += 'cex_depth = "book.npz"\n'
+        text += f'[session]\nevent_mode = "mixed_depth"\nactor_timing_mode = "{timing}"\n'
+        text += 'observation_interval_s = 10\ncex_depth_max_age_s = 60\n'
+        path.write_text(text + '[candidate.defaults]\npolicy_params = []\npool = {}\n')
+        if not accepted:
+            with pytest.raises(ConfigError):
+                RunConfig.from_toml(path)
+            continue
+        frame = OpenSessionFrame.model_validate(dict(
+            open_session_request(RunConfig.from_toml(path)), request_id='r', session_id='s'))
+        assert frame.event_mode == 'mixed_depth' and frame.actor_timing_mode == 'legacy_event'
+        assert frame.market_path.endswith('candles.json') and frame.cex_depth_path.endswith('book.npz')
+        assert frame.observation_interval_s == 10 and frame.cex_depth_max_age_s == 60

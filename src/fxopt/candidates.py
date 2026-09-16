@@ -5,7 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
+import math
 from typing import Any
 
 
@@ -57,18 +58,17 @@ def merge_payload(defaults: Mapping[str, Any], updates: Mapping[str, Any]) -> di
 
 
 def _validate_number(value: int | float | Decimal) -> None:
-    try:
-        number = Decimal(str(value))
-    except (InvalidOperation, ValueError) as exc:
-        raise CandidateError(f"non-finite numeric value: {value!r}") from exc
-    if not number.is_finite():
+    finite = value.is_finite() if isinstance(value, Decimal) else (
+        isinstance(value, int) or math.isfinite(value)
+    )
+    if not finite:
         raise CandidateError(f"non-finite numeric value: {value!r}")
 
 
 def _validate_json_value(value: object) -> None:
     if value is None or isinstance(value, (bool, str)):
         return
-    if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
+    if isinstance(value, (int, float, Decimal)):
         _validate_number(value)
         return
     if isinstance(value, Mapping):
@@ -95,7 +95,7 @@ def canonical_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 def candidate_id(ordinal: int) -> str:
     """Return one readable run-local ordinal ID."""
-    if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0:
+    if type(ordinal) is not int or ordinal < 0:
         raise CandidateError("candidate ordinal must be a non-negative integer")
     return f"p{ordinal:08d}"
 

@@ -1,1 +1,5 @@
-data/market/** filter=lfs diff=lfs merge=lfs -text
+data/market/**/*.xz filter=lfs diff=lfs merge=lfs -text
+data/market/**/candles*.json filter=lfs diff=lfs merge=lfs -text
+data/market/**/aruusd-*.json filter=lfs diff=lfs merge=lfs -text
+data/market/**/*.csv filter=lfs diff=lfs merge=lfs -text
+data/depth/**/*.npz filter=lfs diff=lfs merge=lfs -text

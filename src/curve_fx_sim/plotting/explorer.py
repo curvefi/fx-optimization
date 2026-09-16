@@ -36,7 +36,6 @@ from .heatmap import (
 from .masked_metrics import (
     is_masked_metric,
     masked_metric_slippage_sources,
-    masked_metric_uses_detach,
 )
 
 _LN2 = math.log(2.0)
@@ -414,17 +413,12 @@ class HeatmapExplorer:
             name for name in selected
             if is_masked_metric(name, self.dataset.metrics)
         }
-        detach_masked = any(
-            masked_metric_uses_detach(name, self.dataset.metrics)
-            for name in masked
-        )
         slippage_sources = masked_metric_slippage_sources(
             tuple(masked), self.dataset.metrics
         )
         price_source = self._mask_source("max_7d_rel_price_diff", "max_rel_price_diff")
         threshold_count = sum((
             bool(masked and price_source),
-            bool(detach_masked and "detach_energy_ungated" in self.dataset.metrics),
             bool(slippage_sources),
         ))
         slider_count = len(self._get_slider_dims()) + threshold_count
@@ -511,12 +505,6 @@ class HeatmapExplorer:
                 max_pricethr=self.state.mask.slippage_thr_bps,
                 minimum_maximum=100.0,
             )
-        if detach_masked and "detach_energy_ungated" in self.dataset.metrics:
-            y = self._add_threshold_slider(
-                "detachthr", "detach energy max", y,
-                max_pricethr=self.state.mask.max_detach_energy,
-                source="detach_energy_ungated",
-            )
         self.fig_controls.text(0.08, max(0.02, y - 0.02), "Shift+click / right-click: exact replay", fontsize=8)
         self.fig_controls.canvas.draw_idle()
 
@@ -569,7 +557,6 @@ class HeatmapExplorer:
         values[
             {
                 "max_pricethr": "max_price_diff_bps",
-                "detachthr": "max_detach_energy",
                 "slipthr": "slippage_thr_bps",
                 "final_pdiffthr": "max_final_price_diff_bps",
             }[key]

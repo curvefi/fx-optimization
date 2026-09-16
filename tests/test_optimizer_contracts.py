@@ -414,6 +414,13 @@ class _PointClient:
         pass
 
 
+def test_candidate_keeps_exact_integer_overrides_and_owns_input_copy() -> None:
+    overrides = {"precisions": [1, 10**18 - 1]}
+    candidate = Candidate("exact", pool_overrides=overrides)
+    overrides["precisions"][1] = 2
+    assert candidate.to_dict(ordinal=0)["pool_overrides"] == {"precisions": [1, 10**18 - 1]}
+
+
 def test_point_batch_preserves_candidate_identity_and_metric_schema() -> None:
     client = _PointClient()
     with EvaluatorSession(

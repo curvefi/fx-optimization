@@ -29,11 +29,10 @@ RSYNC_SSH = (
     "-o ServerAliveInterval=30 -o ServerAliveCountMax=6"
 )
 REMOTE_BASE = PurePosixPath("/home/heswithme/arb")
-_MAX_CONSECUTIVE_GRID_FAILURES = 3
 
 
 def _token(value: str | PathLike[str], label: str) -> str:
-    """Validate one argv token; subprocess argv supplies the shell boundary."""
+    """Restrict tokens interpolated into SSH or rsync remote shell commands."""
     token = fspath(value)
     if not isinstance(token, str):
         raise TypeError(f"{label} must be a string or path")
@@ -48,37 +47,6 @@ def _token(value: str | PathLike[str], label: str) -> str:
     return token
 
 
-def _argv_token(value: str | PathLike[str], label: str) -> str:
-    """Validate a non-shell argv token while allowing ordinary option prefixes."""
-    token = fspath(value)
-    if not isinstance(token, str):
-        raise TypeError(f"{label} must be a string or path")
-    if not token or any(
-        character.isspace()
-        or ord(character) < 32
-        or ord(character) == 127
-        or character in ";&|$`<>\\\"'(){}"
-        for character in token
-    ):
-        raise ValueError(f"{label} must not contain whitespace or control characters")
-    return token
-
-
-def _client_options(
-    options: Mapping[str, Any] | None,
-    updates: Mapping[str, Any],
-    *,
-    fixed: Mapping[str, Any],
-) -> dict[str, Any]:
-    merged = dict(options or {})
-    merged.update(updates)
-    for name in fixed:
-        if name in merged:
-            raise TypeError(f"{name} is fixed by the placement factory")
-    merged.update(fixed)
-    return merged
-
-
 def local_client_factory(
     executable_path: str | PathLike[str] = "arb_evaluator_ld",
     *,
@@ -89,25 +57,23 @@ def local_client_factory(
     **options: Any,
 ) -> ClientFactory:
     """Return a factory for a local evaluator in persistent ``serve`` mode."""
-    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+    if type(workers) is not int or workers < 1:
         raise ValueError("workers must be a positive integer")
-    executable = _token(executable_path, "executable_path")
-    directory = None if work_dir is None else _token(work_dir, "work_dir")
-    prefix = [
-        _argv_token(value, f"launch_prefix[{index}]")
-        for index, value in enumerate(launch_prefix)
-    ]
-    fixed = {
+    executable = fspath(executable_path)
+    directory = None if work_dir is None else fspath(work_dir)
+    launch_options = {
+        **(client_options or {}),
+        **options,
         "executable_path": executable,
         "work_dir": directory,
-        "launch_argv": [*prefix, executable, "serve", "--workers", str(workers)],
-        "verify_local_inputs": True,
+        "launch_argv": [
+            *(fspath(value) for value in launch_prefix),
+            executable, "serve", "--workers", str(workers),
+        ],
     }
 
     def create() -> EvaluatorClient:
-        return EvaluatorClient(
-            **_client_options(client_options, options, fixed=fixed),
-        )
+        return EvaluatorClient(**launch_options)
 
     return create
 
@@ -244,7 +210,7 @@ def rebuild_shared_evaluator(
         f'cmake --build {quoted_build} --parallel --target {quoted_target}',
     ))
     command = (
-        "nix-shell -p gcc cmake boost gnumake --run "
+        "nix-shell -p gcc cmake boost gnumake minizip zlib --run "
         + shlex.quote(build_script)
     )
     result = subprocess.run(
@@ -341,17 +307,6 @@ class EvaluatorFleet:
             **self._engine_options,
         )
 
-    def _recycle_engine(self, lane_index: int) -> None:
-        engine = self._engines[lane_index]
-        try:
-            if engine.client is None:
-                engine.close()
-            else:
-                engine.client.shutdown()
-        except Exception:
-            pass
-        self._engines[lane_index] = self._new_engine(lane_index)
-
     def start(self) -> None:
         if self._closed:
             raise RuntimeError("fleet is closed")
@@ -376,11 +331,7 @@ class EvaluatorFleet:
         blocks_per_batch: int = 1,
     ) -> Iterator[LaneBatchResult]:
         """Let every projected evaluator lane pull from one shared block queue."""
-        if (
-            isinstance(blocks_per_batch, bool)
-            or not isinstance(blocks_per_batch, int)
-            or blocks_per_batch < 1
-        ):
+        if type(blocks_per_batch) is not int or blocks_per_batch < 1:
             raise ValueError("blocks_per_batch must be a positive integer")
         with self._evaluation_lock:
             iterator = iter(blocks)
@@ -390,10 +341,8 @@ class EvaluatorFleet:
                 if not selected:
                     return ()
                 if any(
-                    isinstance(start, bool)
-                    or isinstance(stop, bool)
-                    or not isinstance(start, int)
-                    or not isinstance(stop, int)
+                    type(start) is not int
+                    or type(stop) is not int
                     or start < 0
                     or stop <= start
                     for start, stop in selected
@@ -420,28 +369,8 @@ class EvaluatorFleet:
                     for start, count in ranges
                     for ordinal in range(start, start + count)
                 )
-                last_error: Exception | None = None
-                for attempt in range(_MAX_CONSECUTIVE_GRID_FAILURES):
-                    try:
-                        engine = self._engines[lane_index]
-                        engine.start()
-                        projected = engine.evaluate_projected_ranges(ranges)
-                        if len(projected.rows) != len(ordinals):
-                            raise ValueError("lane returned the wrong number of results")
-                        return LaneBatchResult(
-                            ordinals=ordinals,
-                            projected=projected,
-                        )
-                    except Exception as exc:
-                        last_error = exc
-                        self._recycle_engine(lane_index)
-                        if attempt + 1 == _MAX_CONSECUTIVE_GRID_FAILURES:
-                            break
-                assert last_error is not None
-                raise RuntimeError(
-                    f"lane {self.lanes[lane_index].name} failed grid ranges "
-                    f"after {_MAX_CONSECUTIVE_GRID_FAILURES} attempts"
-                ) from last_error
+                projected = self._engines[lane_index].evaluate_projected_ranges(ranges)
+                return LaneBatchResult(ordinals=ordinals, projected=projected)
 
             executor = ThreadPoolExecutor(max_workers=len(self.lanes))
             futures: dict[Any, int] = {}

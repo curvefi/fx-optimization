@@ -61,7 +61,7 @@ def _range_values(spec: Mapping[str, Any], label: str) -> tuple[Any, ...]:
             raise ConfigError(f"{label} range does not land on stop")
         return tuple(_number_value(value) for value in values)
     count = spec.get("count")
-    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+    if type(count) is not int or count < 1:
         raise ConfigError(f"{label} requires a positive integer count or non-zero step")
     if count == 1:
         if start != stop:
@@ -278,10 +278,10 @@ class RunConfig:
         if unknown_run:
             raise ConfigError(f"unknown [run] keys: {sorted(unknown_run)}")
         batch_size = run.get("batch_size")
-        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+        if type(batch_size) is not int or batch_size < 1:
             raise ConfigError("run.batch_size must be a positive integer")
         workers = run.get("workers", 1)
-        if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+        if type(workers) is not int or workers < 1:
             raise ConfigError("run.workers must be a positive integer")
         raw_metric_fields = run.get("metric_fields", [])
         if (
@@ -321,7 +321,7 @@ class RunConfig:
             raise ConfigError("placement.numa_nodes must be an array")
         numa_nodes: list[int] = []
         for node in raw_numa_nodes:
-            if isinstance(node, bool) or not isinstance(node, int) or node < 0:
+            if type(node) is not int or node < 0:
                 raise ConfigError(
                     "placement.numa_nodes entries must be non-negative integers"
                 )
@@ -359,7 +359,7 @@ class RunConfig:
         resolved_session.setdefault("cex_depth_max_age_s", 30)
         depth_max_age = resolved_session["cex_depth_max_age_s"]
         if (
-            isinstance(depth_max_age, bool) or not isinstance(depth_max_age, int)
+            type(depth_max_age) is not int
             or not 0 <= depth_max_age <= 2**64 - 1
         ):
             raise ConfigError("session.cex_depth_max_age_s must be a non-negative uint64")
@@ -367,13 +367,13 @@ class RunConfig:
         if actor_timing_mode not in {"legacy_event", "minute_sequential"}:
             raise ConfigError("session.actor_timing_mode must be legacy_event or minute_sequential")
         observation_interval = resolved_session.get("observation_interval_s", 60)
-        if isinstance(observation_interval, bool) or not isinstance(observation_interval, int) or not 0 < observation_interval <= 2**64-1:
+        if type(observation_interval) is not int or not 0 < observation_interval <= 2**64-1:
             raise ConfigError("session.observation_interval_s must be a positive uint64")
         reconciliation_mode = resolved_session.get("state_reconciliation_mode", "off")
         if reconciliation_mode not in {"off", "on_price_scale_detach"}:
             raise ConfigError("session.state_reconciliation_mode must be off or on_price_scale_detach")
         delay = resolved_session.get("equalization_delay_s", 60)
-        if isinstance(delay, bool) or not isinstance(delay, int) or not 0 <= delay <= (2**64-1)//1_000_000_000:
+        if type(delay) is not int or not 0 <= delay <= (2**64-1)//1_000_000_000:
             raise ConfigError("session.equalization_delay_s must be nonnegative seconds representable in uint64 nanoseconds")
         threshold = resolved_session.get("reset_threshold_bps", 100)
         if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not math.isfinite(threshold) or threshold <= 0:
@@ -433,13 +433,16 @@ class RunConfig:
                     resolved_session["event_cursor"] != "scalar" or resolved_session["metric_profile"] != "full_summary"):
                 raise ConfigError("minute_sequential requires depth, active_2l or reference_2l, depth events, scalar full_summary, and no synthetic swaps")
         event_mode = resolved_session.setdefault("event_mode", "candle_path")
-        if event_mode not in {"candle_path", "depth"}:
-            raise ConfigError("session.event_mode must be candle_path or depth; observations has been replaced by depth")
+        if event_mode not in {"candle_path", "depth", "mixed_depth"}:
+            raise ConfigError("session.event_mode must be candle_path, depth, or mixed_depth")
         if cex_depth is not None and Path(cex_depth).suffix != ".npz":
             raise ConfigError("scenario.cex_depth requires NPZ; convert JSONL with cryptolake.depth_archive in data/cryptolake")
         if event_mode == "depth":
             if cex_depth is None or "market" in resolved_scenario or resolved_session.get("candle_filter", 0) != 0:
                 raise ConfigError("depth event_mode requires scenario.cex_depth and no scenario.market or candle_filter")
+        elif event_mode == "mixed_depth":
+            if cex_depth is None or "market" not in resolved_scenario:
+                raise ConfigError("mixed_depth requires scenario.cex_depth and scenario.market")
         elif "market" not in resolved_scenario:
             raise ConfigError("candle_path event_mode requires scenario.market")
         if (

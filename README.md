@@ -38,43 +38,47 @@ cd /path/to/curve-fx-optimization
 uv sync --frozen --group dev
 ```
 
-## Market data
+## Prepared inputs and data workbench
 
-Download raw candles and filter them as separate steps. Use dated filenames;
-both commands refuse to replace an existing output.
+Selected candles, depth NPZs, and oracle feeds live in [`data/`](data/README.md)
+under Git LFS, with small provenance manifests in ordinary Git. Experiment
+TOMLs use relative paths into this collection or the sibling data workbench.
+Each selected input is checked against its adjacent `dataset.json`, and the
+dataset revision and checksums are recorded in `run.json`.
 
-```sh
-uv run python scripts/fetch_binance_candles.py \
-  --start 2023-01-01T00:00:00Z --end 2026-08-26T00:00:00Z \
-  --workers 16 \
-  --output data/market/ethusd/candles-2023-2026-08-25-raw.json
+Acquisition, reconstruction, raw archives, and historical onchain fitting and
+plotting stay in the sibling [`../data/`](../data/README.md) workbench, with their
+own dependencies and tests. The optimizer consumes prepared files without
+importing or running those generators. External input paths remain supported.
 
-uv run python scripts/filter_candles.py \
-  data/market/ethusd/candles-2023-2026-08-25-raw.json \
-  data/market/ethusd/candles-2023-2026-08-25-filtered.json
-```
+For depth with candle fallback, provide both `scenario.cex_depth` (NPZ) and
+`scenario.market` (OHLC JSON), then set `session.event_mode = "mixed_depth"`.
+Use `actor_timing_mode = "legacy_event"` throughout. Fresh books execute on
+`observation_interval_s`; absent or stale books use the existing candle path
+under `cex_depth_max_age_s`. Pool and YB state continue across switches.
+A 10-second observation interval with a 60-second maximum age can hold actual
+1-minute snapshots without replenishing consumed depth between publications.
+The [harness protocol](../curve-fx-arb-harness/protocol/protocol_spec.md)
+defines the clock, freshness boundary, and trace behavior.
 
-The downloader partitions the requested minute range into independent Binance
-pages, fetches them concurrently, preserves legitimate exchange gaps, rejects
-duplicates or disorder, and publishes the merged JSON atomically. The filter
-owns only the established centered-neighbor OHLC clipping step.
+The main ETH/USD baseline is now **mixed depth at 10s, 30s, and 1m**:
 
-Historical YB acquisition tools use the optional `research` dependency group.
-Run the cached configuration gate without RPC access, or acquire the bounded
-mainnet tapes with `DRPC_API_KEY` set:
+| Observation cadence | Baseline configuration |
+| --- | --- |
+| 10 seconds | [mixed-depth 10s](configs/experiments/ethusd-mixeddepth10s-depthwindow-active2l-cash3-gm-speedtest-40960-f64.toml) |
+| 30 seconds | [mixed-depth 30s](configs/experiments/ethusd-mixeddepth30s-depthwindow-active2l-cash3-gm-speedtest-40960-f64.toml) |
+| 1 minute | [mixed-depth 1m](configs/experiments/ethusd-mixeddepth1m-depthwindow-active2l-cash3-gm-speedtest-40960-f64.toml) |
 
-```sh
-uv run --group research python scripts/acquire_yb_configuration_window.py \
-  --offline-check runs/yb-cbbtc-historical-20260904/configuration/configuration_window.json
-uv run --group research python scripts/acquire_yb_configuration_window.py
-uv run --group research python scripts/acquire_yb_activity.py
-uv run --group research python scripts/acquire_yb_weth_window.py
-uv run --group research python scripts/acquire_yb_weth_activity.py
-```
+All three use the same 1-minute depth tape, a 60-second freshness limit,
+candle fallback through gaps, `active_2l` with cash multiplier 3, and the
+2024-02-15 through 2026-08-20 window. The shorter cadences reuse published
+books; they do not imply new snapshots. Candle-only and depth-only configs
+remain comparison runs. The dated `speedtest` filenames retain run provenance.
 
-The acquisition commands are read-only RPC harvests and persist their response
-cache beside the study artifacts. The offline check only validates an existing
-configuration artifact.
+Older research configs and completed run manifests retain their original paths
+and may need explicit path updates before replay. The historical fitting tools
+also contain retired evaluator inputs; a fresh simulation requires review
+against the current harness protocol.
 
 Configs live under `configs/`. Human-curated manifests live in
 `configs/experiments/`; LLM-generated iterative manifests belong in the ignored
@@ -207,6 +211,23 @@ matching header under `twocrypto-cpp/include/pools/twocrypto_fx/policies/` and
 use its descriptor's parameter order. Experimental headers are repository-local
 build inputs, not part of the installed pool library.
 
+`reporting_fair_fee.hpp` selects `reporting_fair_fee`, with parameters
+`[base_fee, capture, fallback_fee]` in fractions. It charges
+`min(max(base_fee, capture * edge), fallback_fee)` with a fresh arb report, otherwise `fallback_fee`,
+and keeps the native MA price-scale driver. Fees retain the pool's 0.1 bp floor.
+Grid report probabilities independently of the policy parameters:
+
+```toml
+[candidate.axes]
+"pool.run.arb_report_rate" = { start = 0.1, stop = 1.0, count = 10, scale = "linear" }
+```
+
+The default rate is 1. One reproducible event-index draw is shared across
+candidates and held fixed through sizing and execution; it measures reporting
+opportunities, not the realized share of swaps. Reports use the current market
+price unless an explicit price-feed tape is supplied; stale tape samples invoke
+the fallback fee. The report is cleared before subsequent actors run.
+
 The dual-EMA policy returns zero for its policy fee, so the pool's native fee
 surface remains active. Its six candidate parameters are fast and slow EMA
 half-lives, kappa, deadband, and minimum/maximum caps.
@@ -301,12 +322,13 @@ Do not copy evaluator or pool code into this repository. Run outputs are
 ordinary local artifacts and can be inspected or plotted again without
 rebuilding the grid.
 
-For a production run, fetch authorized Git-LFS market data first:
+For a production run, fetch the published Git-LFS inputs required by the config:
 
 ```sh
-git lfs pull
+git lfs pull --include="data/market/btcusd/**"
 ```
 
 Use `fxopt` for runs, heatmaps, replay, and remote lifecycle. The small
-`scripts/` surface is limited to data preparation and post-run basin analysis;
+`scripts/` surface contains event fair-price feed generation, basin analysis,
+and the cluster Python launcher;
 pool and evaluator implementation details stay in their sibling repositories.
