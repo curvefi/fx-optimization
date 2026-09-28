@@ -1,3 +1,19 @@
+# Standard YB heatmaps
+
+- Use `bash scripts/heatmap-yb.sh CONFIG RUN_DIR [heatmap options...]` for YB
+  grids. It follows/retrieves unfinished remote runs and opens completed local
+  artifacts directly. Paths are relative to this repository unless absolute.
+- Preserve the established three-column layout and metric order:
+  1. `apy_net`, `yb_apy`, `yb_apy_gm`
+  2. `apy_net_masked`, `yb_apy_masked`, `yb_apy_gm_masked`
+  3. `max_7d_rel_price_diff`, `apy_net_robust_90d`, `avg_imbalance`
+- Default axes are donation x RPF, price-divergence mask is 1500 bp (15%), and
+  Shift-click uses `active_2l` with cash multiplier 3. The mask does not impose
+  positive yields. Preserve this layout unless the user requests a change;
+  adapt axes only when the grid lacks donation/RPF.
+- When providing a run-local `heatmap-yb.sh`, make it a thin wrapper around the
+  shared launcher with the exact config/run paths; do not invent another layout.
+
 # Test policy
 
 - For a bug fix, add one regression test. For a feature, add at most 3 test

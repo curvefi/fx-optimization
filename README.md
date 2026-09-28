@@ -40,59 +40,47 @@ uv sync --frozen --group dev
 
 ## Prepared inputs and data workbench
 
-Selected candles, depth NPZs, and oracle feeds live in [`data/`](data/README.md)
+Selected candles, trade-flow tapes, and oracle feeds live in [`data/`](data/README.md)
 under Git LFS, with small provenance manifests in ordinary Git. Experiment
 TOMLs use relative paths into this collection or the sibling data workbench.
 Each selected input is checked against its adjacent `dataset.json`, and the
 dataset revision and checksums are recorded in `run.json`.
 
-Acquisition, reconstruction, raw archives, and historical onchain fitting and
-plotting stay in the sibling [`../data/`](../data/README.md) workbench, with their
-own dependencies and tests. The optimizer consumes prepared files without
-importing or running those generators. External input paths remain supported.
+Acquisition, packing and historical onchain fitting and plotting stay in the
+sibling [`../data/`](../data/README.md) workbench, with their own dependencies.
+The optimizer consumes prepared files without importing or running those
+generators. External input paths remain supported.
 
-For depth with candle fallback, provide both `scenario.cex_depth` (NPZ) and
-`scenario.market` (OHLC JSON), then set `session.event_mode = "mixed_depth"`.
-Use `actor_timing_mode = "legacy_event"` throughout. Fresh books execute on
-`observation_interval_s`; absent or stale books use the existing candle path
-under `cex_depth_max_age_s`. Pool and YB state continue across switches.
-A 10-second observation interval with a 60-second maximum age can hold actual
-1-minute snapshots without replenishing consumed depth between publications.
-The [harness protocol](../curve-fx-arb-harness/protocol/protocol_spec.md)
-defines the clock, freshness boundary, and trace behavior.
+The harness arbitrageur is a maker that hedges each bin's trade-through fills.
+Pick one market mode per config:
 
-The main ETH/USD baseline is now **mixed depth at 10s, 30s, and 1m**:
+- **Candles:** `scenario.market` (OHLC JSON) with the default
+  `session.event_mode = "candles"`. `session.candle_volume` (default true)
+  spreads candle volume along the OHLC path; false leaves the wicks unlimited.
+  Use this to ballpark assets without trade data.
+- **Measured trades:** `scenario.trade_flow` (NPZ from
+  `data/market/pack_trade_flow.py`) with `session.event_mode = "trade_flow"`.
+  For example, Binance ETHUSDT 12s bins for 2025-03-24 through 2026-08-20.
 
-| Observation cadence | Baseline configuration |
-| --- | --- |
-| 10 seconds | [mixed-depth 10s](configs/experiments/ethusd-mixeddepth10s-depthwindow-active2l-cash3-gm-speedtest-40960-f64.toml) |
-| 30 seconds | [mixed-depth 30s](configs/experiments/ethusd-mixeddepth30s-depthwindow-active2l-cash3-gm-speedtest-40960-f64.toml) |
-| 1 minute | [mixed-depth 1m](configs/experiments/ethusd-mixeddepth1m-depthwindow-active2l-cash3-gm-speedtest-40960-f64.toml) |
+`session.excluded_time_ranges = [[start, end)]` removes UTC intervals (for
+example 10 October 2025, `[[1760054400, 1760140800]]`). Their events and
+price-feed samples are omitted, calendar time advances across the gap, and
+pool/YB state resumes at the next retained event. The
+[harness protocol](../curve-fx-arb-harness/protocol/protocol_spec.md) defines
+both modes, the clock and trace behavior. Build a new evaluator remotely with
+`fxopt run ... --rebuild` before its first cluster run.
 
-All three use the same 1-minute depth tape, a 60-second freshness limit,
-candle fallback through gaps, `active_2l` with cash multiplier 3, and the
-2024-02-15 through 2026-08-20 window. The shorter cadences reuse published
-books; they do not imply new snapshots. Candle-only and depth-only configs
-remain comparison runs. The dated `speedtest` filenames retain run provenance.
+`pool_nav_vs_hold` is final total pool assets divided by the final marked value
+of the starting token basket, minus one, with both portfolios at the final
+external price. It includes donations and net liquidity changes, is not
+annualized, and does not normalize LP supply.
 
-Older research configs and completed run manifests retain their original paths
-and may need explicit path updates before replay. The historical fitting tools
-also contain retired evaluator inputs; a fresh simulation requires review
-against the current harness protocol.
-
-Configs live under `configs/`. Human-curated manifests live in
-`configs/experiments/`; LLM-generated iterative manifests belong in the ignored
-`configs/autoresearch/` workbench. The maintained BTC starters are
-`btcusd-native-discovery-f64.toml`, `btcusd-dual-ema-robust-f64.toml`, and
-`btcusd-p3-finalist-comparison.toml`. The last is one compact finalist star:
-change only its evaluator target and `scenario.yb_mode` when repeating it for
-f64/LD or off/active_2l/reference_2l comparisons. Give each variant a distinct
-output directory (for example, `runs/btcusd-p3-off-f64`) because the manifest
-ID is intentionally neutral. A completed run embeds resolved candidate
-defaults, axes, robustness radii, execution inputs, and local replay inputs in
-`run.json`, so autoresearch TOMLs can be reused or discarded without losing the
-result's meaning. Pool templates remain under `configs/templates`; compiled
-policy headers remain harness build inputs.
+Configs live under `configs/`. Pool templates are in `configs/templates`;
+LLM-generated iterative manifests belong in the ignored `configs/autoresearch/`
+workbench. A completed run embeds resolved candidate defaults, axes, robustness
+radii, execution inputs, and local replay inputs in `run.json`, so manifests can
+be reused or discarded without losing the result's meaning. Compiled policy
+headers remain harness build inputs.
 
 Pool templates keep contract encodings (for example, WAD integers). Candidate
 defaults and grid axes use human simulation units: `fee_gamma` and both
@@ -121,8 +109,7 @@ replaying.
 Run a Cartesian candidate grid in bounded batches:
 
 ```sh
-uv run fxopt run configs/experiments/eurusd-a-donation-rpf-8x8x8.toml \
-  --output runs/eurusd-a-donation-rpf-8x8x8
+uv run fxopt run configs/autoresearch/GRID.toml --output runs/GRID
 ```
 
 Remote grids deterministically shuffle small contiguous ordinal tiles into
@@ -149,9 +136,7 @@ and `shell.nix`; it does not synchronize an environment for each run. Source
 transfer and compilation happen once through shared home:
 
 ```sh
-uv run fxopt run configs/experiments/eurusd-a-donation-rpf-16x16x16-two-blades.toml \
-  --output runs/eurusd-a-donation-rpf-16x16x16-two-blades \
-  --transfer --rebuild
+uv run fxopt run configs/autoresearch/GRID.toml --output runs/GRID --transfer --rebuild
 ```
 
 The coordinator is detached before the command follows its log, so a Mac or
@@ -211,39 +196,45 @@ matching header under `twocrypto-cpp/include/pools/twocrypto_fx/policies/` and
 use its descriptor's parameter order. Experimental headers are repository-local
 build inputs, not part of the installed pool library.
 
-`reporting_fair_fee.hpp` selects `reporting_fair_fee`, with parameters
-`[base_fee, capture, fallback_fee]` in fractions. It charges
-`min(max(base_fee, capture * edge), fallback_fee)` with a fresh arb report, otherwise `fallback_fee`,
-and keeps the native MA price-scale driver. Fees retain the pool's 0.1 bp floor.
-Grid report probabilities independently of the policy parameters:
-
-```toml
-[candidate.axes]
-"pool.run.arb_report_rate" = { start = 0.1, stop = 1.0, count = 10, scale = "linear" }
-```
-
-The default rate is 1. One reproducible event-index draw is shared across
-candidates and held fixed through sizing and execution; it measures reporting
-opportunities, not the realized share of swaps. Reports use the current market
-price unless an explicit price-feed tape is supplied; stale tape samples invoke
-the fallback fee. The report is cleared before subsequent actors run.
-
-The dual-EMA policy returns zero for its policy fee, so the pool's native fee
-surface remains active. Its six candidate parameters are fast and slow EMA
-half-lives, kappa, deadband, and minimum/maximum caps.
+The current research policy is
+`autoresearch/ar-superset-v5.hpp` (id `ar_superset_v5_report_driver_dual_ema`), which carries
+the rs1#6567 design: an oraclized report fee with a hybrid dual-EMA
+price-scale driver. `autoresearch/ar-superset-v11.hpp` is its latest superset,
+with launch warm-up parameters. Report probabilities grid independently of the
+policy parameters, for example
+`"pool.run.arb_report_rate" = { start = 0.1, stop = 1.0, count = 10 }`.
 
 Use blade f64 for broad discovery and x86-64 blade long double for production
 finalist ranking. Apple ARM `long double` has binary64 width, so local Mac replay
 checks workflow and behavioral stability rather than x86 extended precision.
 
-Open the mature interactive heatmap explorer (or save a PNG and its state):
+For YB grids, use the standard launcher (paths relative to this repository):
 
 ```sh
-uv run fxopt heatmap runs/eurusd-a-donation-rpf-8x8x8
-uv run fxopt heatmap runs/eurusd-a-donation-rpf-8x8x8 \
+bash scripts/heatmap-yb.sh configs/autoresearch/GRID.toml runs/GRID
+```
+
+It follows and retrieves unfinished remote runs, or opens completed local
+artifacts directly. The default view is donation × RPF, with three columns:
+
+| Pool APY | YB APY | YB GM APY |
+| --- | --- | --- |
+| `apy_net` | `yb_apy` | `yb_apy_gm` |
+| `apy_net_masked` | `yb_apy_masked` | `yb_apy_gm_masked` |
+| `max_7d_rel_price_diff` | `apy_net_robust_90d` | `avg_imbalance` |
+
+Masked panels exclude price divergence above 1500 bp (15%); they do not require
+positive yields. Shift-click defaults to `active_2l` and cash multiplier 3.
+Append heatmap options to override axes or thresholds while retaining the layout.
+
+Open the mature interactive heatmap explorer directly (or save a PNG and its state):
+
+```sh
+uv run fxopt heatmap runs/GRID
+uv run fxopt heatmap runs/GRID \
   --metric apy_net_robust_90d_masked --metric detach_energy_ungated --columns 2 \
   --max-price-diff-bps 1000 \
-  --output runs/eurusd-a-donation-rpf-8x8x8/heatmap.png \
+  --output runs/GRID/heatmap.png \
   --no-show
 ```
 
@@ -281,8 +272,8 @@ remains available in full reference and YB runs.
 Replay one ordinal with a full trace:
 
 ```sh
-uv run fxopt shiftclick runs/eurusd-a-donation-rpf-8x8x8 \
-  --ordinal 12 --output runs/eurusd-a-donation-rpf-8x8x8/inspections/ordinal-12
+uv run fxopt shiftclick runs/GRID \
+  --ordinal 12 --output runs/GRID/inspections/ordinal-12
 ```
 
 `--trace-interval` and `--actions` enable denser traces and action recording.
@@ -332,3 +323,43 @@ Use `fxopt` for runs, heatmaps, replay, and remote lifecycle. The small
 `scripts/` surface contains event fair-price feed generation, basin analysis,
 and the cluster Python launcher;
 pool and evaluator implementation details stay in their sibling repositories.
+
+Compiled policies can provide optional heatmap labels in parameter order:
+
+```toml
+[compiled_policy]
+id = "example"
+header = "example.hpp"
+parameter_names = ["fast_ema (s)", "slow_ema (s)", "kappa"]
+```
+
+When supplied, names must be unique and match the number of default policy
+parameters. They are stored in `run.json` and used as display labels; axis keys,
+Cartesian ordering, and replay payloads remain `policy_params.<index>`.
+
+Find connected regions above a metric floor, optionally below the 7-day
+price-difference limit, with `scripts/find_blobs.py`:
+
+```sh
+uv run python scripts/find_blobs.py runs/RUN \
+  --metric yb_gm --min-value 0.001 --max-pdif 0.15 \
+  --axes fast_ema kappa pool.reserved_profit_fraction pool.donation_apy \
+  --top 10 --output runs/RUN/inspections/blobs.json
+```
+
+Thresholds are exclusive and use raw metric units: `0.001` means 0.1% APY;
+`0.15` means 15% for `max_7d_rel_price_diff`. Omit `--max-pdif` to remove that
+constraint. `yb_gm` aliases `yb_apy_gm`; other stored metric names work directly.
+Axes accept canonical keys (such as `policy_params.3`) or stored policy labels
+(with an optional trailing unit omitted, such as `fast_ema`). Other axes stay
+fixed. Only adjacent sampled indices along one selected axis connect: there
+are no diagonal links, interpolation, or links across failed/nonfinite points.
+No other yield filters are applied.
+
+Blobs rank by point count. Reports include exact member ordinals, fixed axes,
+parameter extents, metric minimum/median/maximum, bounding-box fill, and the
+number of centers whose two immediate neighbors on every selected axis pass.
+Missing neighbors at grid boundaries do not pass. Extents are not guaranteed
+passing rectangles. The representative has the most passing immediate
+neighbors, with ties resolved by smallest ordinal; it is not an optimized
+parameter recommendation.

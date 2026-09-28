@@ -165,7 +165,7 @@ def stage_remote_run(config: RunConfig) -> str:
     remote_inputs = _execution_inputs(config, remote=True)
     datasets = dataset_metadata(local_inputs)
     first = config.hosts[0]
-    for name in ("template", "market", "price_feed", "cex_depth", "observed_state"):
+    for name in ("template", "market", "price_feed", "trade_flow"):
         if name in remote_inputs:
             ensure_remote_file(
                 first,
@@ -239,10 +239,8 @@ def open_session_request(config: RunConfig, *, remote: bool | None = None) -> di
     }
     if (price_feed := inputs.get("price_feed")) is not None:
         request["price_feed_path"] = price_feed
-    if (cex_depth := inputs.get("cex_depth")) is not None:
-        request["cex_depth_path"] = cex_depth
-    if (observed_state := inputs.get("observed_state")) is not None:
-        request["observed_state_path"] = observed_state
+    if (trade_flow := inputs.get("trade_flow")) is not None:
+        request["trade_flow_path"] = trade_flow
     if (yb_mode := config.scenario.get("yb_mode")) is not None:
         request.setdefault("yb_mode", yb_mode)
     return request
@@ -270,7 +268,7 @@ def run_metadata(
             raise ConfigError(f"coordinator replay path must be below {REMOTE_BASE}") from exc
         return str(origin_workspace.joinpath(*relative.parts))
 
-    for key in ("template_path", "market_path", "price_feed_path", "cex_depth_path", "observed_state_path"):
+    for key in ("template_path", "market_path", "price_feed_path", "trade_flow_path"):
         if key in replay_session:
             replay_session[key] = replay_path(replay_session[key])
     config_path = origin_config or config.path
@@ -315,6 +313,7 @@ def run_metadata(
         metadata["compiled_policy"] = {
             "id": config.compiled_policy_id,
             "header": inputs["policy_header"],
+            **({"parameter_names": list(config.policy_parameter_names)} if config.policy_parameter_names else {}),
         }
     return metadata
 

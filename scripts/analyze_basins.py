@@ -239,6 +239,8 @@ def main() -> int:
     ):
         parser.error("limits must be non-negative; --top must be positive")
     apy_robust_rank = args.rank == "apy-net-robust"
+    yb_only_rank = args.rank == "yb-gm" and args.min_lp_gm == 0
+    single_rank = apy_robust_rank or yb_only_rank
     if apy_robust_rank and (args.min_lp_gm or args.min_yb_gm):
         parser.error("GM limits do not apply to --rank apy-net-robust")
 
@@ -247,6 +249,8 @@ def main() -> int:
         required = ["detach_energy_ungated"]
         if apy_robust_rank:
             required.append("apy_net_robust_90d")
+        elif yb_only_rank:
+            required.append("yb_apy_gm")
         else:
             required.extend(("apy_net_gm", "apy_net_robust_90d"))
             if args.rank != "lp-score":
@@ -293,8 +297,9 @@ def main() -> int:
         & np.isfinite(detach)
         & (detach >= 0)
     )
-    if apy_robust_rank:
-        apy_robust_valid = base_valid & np.isfinite(apy_robust)
+    if single_rank:
+        single_values = yb if yb_only_rank else apy_robust
+        single_valid = base_valid & np.isfinite(single_values)
     else:
         metrics = {
             "apy_net_gm": lp,
@@ -324,11 +329,11 @@ def main() -> int:
         parser.error(f"could not load robustness radii: {exc}")
 
     ranking_result = None
-    if specs and apy_robust_rank:
+    if specs and single_rank:
         try:
             ranking_result = _robust(
-                apy_robust,
-                valid=apy_robust_valid,
+                single_values,
+                valid=single_valid,
                 ordinals=ordinals,
                 axes=axes,
                 shape=shape,
@@ -336,7 +341,7 @@ def main() -> int:
             )
             robust_detach = _robust(
                 detach,
-                valid=apy_robust_valid,
+                valid=single_valid,
                 ordinals=ordinals,
                 axes=axes,
                 shape=shape,
@@ -347,7 +352,7 @@ def main() -> int:
             parser.error(f"could not score robustness: {exc}")
         complete = ranking_result.complete & robust_detach.complete
         rank_values = ranking_result.robust_score
-        point_rank = apy_robust
+        point_rank = single_values
         detach_ceiling = -robust_detach.robust_score
     elif specs:
         try:
@@ -419,10 +424,10 @@ def main() -> int:
             "gm": gm,
             "yb-gm": yb,
         }[args.rank]
-    elif apy_robust_rank:
-        complete = apy_robust_valid
-        rank_values = apy_robust
-        point_rank = apy_robust
+    elif single_rank:
+        complete = single_valid
+        rank_values = single_values
+        point_rank = single_values
         detach_ceiling = detach
     else:
         complete = lp_valid if args.rank == "lp-score" else valid
@@ -483,7 +488,9 @@ def main() -> int:
         & np.isfinite(rank_values)
         & (detach_ceiling <= args.max_detach)
     )
-    if not apy_robust_rank:
+    if yb_only_rank:
+        eligible &= rank_values >= args.min_yb_gm
+    elif not apy_robust_rank:
         eligible &= lp_floor >= args.min_lp_gm
         if args.rank != "lp-score":
             eligible &= yb_floor >= args.min_yb_gm
@@ -551,12 +558,13 @@ def main() -> int:
                 f" worst={int(ranking_result.worst_ordinal[row])}"
                 f" detach_ceiling={detach_ceiling[row]:.8g}"
             )
-            if not apy_robust_rank:
+            if not single_rank:
                 robust_fields += (
                     f" lp_floor={lp_floor[row]:.8g}"
                     f" yb_floor={yb_floor[row]:.8g}"
                 )
         metric_fields = (
+            f" yb={yb[row]:.8g}" if yb_only_rank else
             f" apy_net_robust_90d={apy_robust[row]:.8g}"
             if apy_robust_rank
             else f" lp={lp[row]:.8g} yb={yb[row]:.8g}"

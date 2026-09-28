@@ -194,7 +194,7 @@ def _axis_view(
             positional=True,
             logarithmic=False,
         )
-    name = axis.names[0]
+    name = axis.display_name or axis.names[0]
     positional = len(numeric) > 1 and not bool(np.all(np.diff(numeric) > 0))
     display_name, labels = _axis_name_and_labels(name, numeric.tolist())
     centers = np.arange(len(numeric), dtype=float) if positional else numeric
@@ -269,7 +269,7 @@ def _metric_scale_info(metric: str) -> tuple[float, str]:
         else 1.0
     )
     percent = (
-        key in {"vpminusone", "apy"}
+        key in {"vpminusone", "apy", "pool_nav_vs_hold", "pool_nav_vs_hold_masked"}
         or "apy" in key
         or "tw_real_slippage" in key
         or "geom_mean" in key

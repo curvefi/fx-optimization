@@ -93,6 +93,8 @@ def _run_trace(
     client_factory: ClientFactory | None = None,
     yb_mode: str | None = None,
     yb_cash_multiplier: float | None = None,
+    evaluator: str | Path | None = None,
+    excluded_time_ranges: list[list[int]] | None = None,
 ) -> Path:
     if not isinstance(candidate, Candidate):
         raise TypeError("candidate must be a Candidate")
@@ -106,6 +108,7 @@ def _run_trace(
     open_session = dict(replay.open_session)
     open_session["event_cursor"] = "scalar"
     open_session["metric_profile"] = "full_summary"
+    open_session.pop("early_stop_max_7d_rel_price_diff", None)  # Replay full history.
     if yb_mode is not None:
         if yb_mode not in {"off", "active_2l", "reference_2l"}:
             raise ValueError(
@@ -116,8 +119,11 @@ def _run_trace(
         if not math.isfinite(yb_cash_multiplier) or yb_cash_multiplier <= 0.0:
             raise ValueError("yb_cash_multiplier must be finite and positive")
         open_session["yb_cash_multiplier"] = yb_cash_multiplier
+    if excluded_time_ranges is not None:
+        open_session["excluded_time_ranges"] = excluded_time_ranges
+    executable = Path(evaluator).expanduser().resolve() if evaluator is not None else replay.evaluator
     factory = client_factory or local_client_factory(
-        replay.evaluator,
+        executable,
         work_dir=replay.work_dir,
         workers=1,
         timeout=600.0,
@@ -143,6 +149,7 @@ def _run_trace(
     _atomic_json(summary, {
         "run_id": replay.run_id,
         "source_ordinal": ordinal,
+        "replay": {"evaluator": str(executable), "open_session": open_session},
         "candidate": candidate.to_dict(ordinal=ordinal),
         "result": result.to_dict(),
     })
@@ -161,6 +168,8 @@ def trace_stored_candidate(
     client_factory: ClientFactory | None = None,
     yb_mode: str | None = None,
     yb_cash_multiplier: float | None = None,
+    evaluator: str | Path | None = None,
+    excluded_time_ranges: list[list[int]] | None = None,
 ) -> Path:
     """Replay from self-contained run metadata."""
     return _run_trace(
@@ -173,6 +182,8 @@ def trace_stored_candidate(
         client_factory=client_factory,
         yb_mode=yb_mode,
         yb_cash_multiplier=yb_cash_multiplier,
+        evaluator=evaluator,
+        excluded_time_ranges=excluded_time_ranges,
     )
 
 

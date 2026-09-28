@@ -1,6 +1,7 @@
 """One small CLI for grids, heatmaps, and Shift-click replay."""
 
 from pathlib import Path
+from datetime import datetime, timezone
 import json
 import platform
 import shutil
@@ -387,6 +388,10 @@ def worker_command(
 )
 @click.option("--output", type=click.Path(dir_okay=False, path_type=Path))
 @click.option("--show/--no-show", default=True, show_default=True)
+@click.option("--shiftclick-evaluator", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Use this local evaluator for Shift-click only; grid and right-click stay unchanged.")
+@click.option("--shiftclick-exclude-utc-day", type=click.DateTime(formats=["%Y-%m-%d"]),
+              help="Skip this UTC day in Shift-click replay only (YYYY-MM-DD).")
 def heatmap_command(
     run_dir: Path, x_axis: str | None, y_axis: str | None,
     log_axes: tuple[str, ...], columns: int, metrics: tuple[str, ...],
@@ -397,11 +402,16 @@ def heatmap_command(
     shiftclick_yb_mode: str,
     shiftclick_yb_cash_multiplier: float,
     output: Path | None, show: bool,
+    shiftclick_evaluator: Path | None, shiftclick_exclude_utc_day: datetime | None,
 ) -> None:
     """Open the interactive filtered heatmap explorer."""
     explorer = None
     try:
         from .explorer import open_fxopt_explorer
+        excluded = None
+        if shiftclick_exclude_utc_day is not None:
+            start = int(shiftclick_exclude_utc_day.replace(tzinfo=timezone.utc).timestamp())
+            excluded = [[start, start + 86400]]
         explorer = open_fxopt_explorer(
             run_dir, metrics=metrics, x_axis=x_axis, y_axis=y_axis,
             log_axes=log_axes, columns=columns,
@@ -411,6 +421,8 @@ def heatmap_command(
             final_price_diff_bps=final_price_diff_bps,
             shiftclick_yb_mode=shiftclick_yb_mode,
             shiftclick_yb_cash_multiplier=shiftclick_yb_cash_multiplier,
+            shiftclick_evaluator=shiftclick_evaluator,
+            shiftclick_excluded_time_ranges=excluded,
         )
         if output is not None:
             image, state = explorer.save(output)

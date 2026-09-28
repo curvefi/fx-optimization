@@ -113,6 +113,7 @@ class HeatmapAxis:
     values: tuple[Any, ...]
     scale: AxisScale = "linear"
     labels: tuple[str, ...] = ()
+    display_name: str | None = None
 
     def __post_init__(self) -> None:
         if not self.names or any(not name for name in self.names):
