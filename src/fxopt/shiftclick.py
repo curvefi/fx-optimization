@@ -107,14 +107,14 @@ def _run_trace(
 
     open_session = dict(replay.open_session)
     open_session["event_cursor"] = "scalar"
-    open_session["metric_profile"] = "full_summary"
+    open_session.pop("metric_profile", None)  # Stored runs carry this retired key.
     open_session.pop("early_stop_max_7d_rel_price_diff", None)  # Replay full history.
     if yb_mode is not None:
-        if yb_mode not in {"off", "active_2l", "reference_2l"}:
-            raise ValueError(
-                "yb_mode must be off, active_2l, or reference_2l"
-            )
+        if yb_mode not in {"off", "active_2l"}:
+            raise ValueError("yb_mode must be off or active_2l")
         open_session["yb_mode"] = yb_mode
+    if open_session.get("yb_mode") != "active_2l":
+        open_session.pop("yb_arb", None)  # The YieldBasis actor choice exists only in the active 2L model.
     if yb_cash_multiplier is not None:
         if not math.isfinite(yb_cash_multiplier) or yb_cash_multiplier <= 0.0:
             raise ValueError("yb_cash_multiplier must be finite and positive")

@@ -104,7 +104,7 @@ def ensure_remote_file(
         ["ssh", *SSH_OPTIONS, "--", remote_host, "mkdir", "-p", parent],
         check=True,
     )
-    command = ["rsync", "-a", "-e", RSYNC_SSH]
+    command = ["rsync", "-az", "-e", RSYNC_SSH]  # inputs (tapes, reports) compress about 3x on the wire
     if not replace:
         command.append("--ignore-existing")
     subprocess.run([*command, "--", str(source), f"{remote_host}:{destination}"], check=True)
@@ -157,7 +157,7 @@ def transfer_workspace(host: str, workspace: str | Path) -> None:
         )
         command = ["rsync", "-a", "-e", RSYNC_SSH]
         patterns = excludes + (
-            ("configs/", "data/", "runs/")
+            ("configs/", "data/", "runs/", "reports/")
             if name == "curve-fx-optimization"
             else ()
         )

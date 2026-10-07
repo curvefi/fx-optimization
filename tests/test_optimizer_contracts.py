@@ -21,7 +21,7 @@ def _run_toml(
     session: str = "",
     yb_mode: str = "off",
     price_feed: str = "",
-    trade_flow: str = "",
+    block_tape: str = "",
     metrics: str = '["score"]',
     axes: str = "",
 ) -> Path:
@@ -39,7 +39,7 @@ metric_fields = {metrics}
 id = "scenario"
 {market_line}
 {price_feed}
-{trade_flow}
+{block_tape}
 yb_mode = "{yb_mode}"
 {compiled_policy}
 [candidate.defaults]
@@ -51,23 +51,30 @@ pool = {{}}
     return path
 
 
-def test_trade_flow_config_omits_market_and_candle_controls(tmp_path):
+def test_block_config_omits_market_and_candle_controls(tmp_path):
     from fxopt.run import open_session_request
     from curve_fx_harness_client.models import OpenSessionFrame
-    session = '[session]\nevent_mode = "trade_flow"\nevent_cursor = "fast_skip"'
+    session = '[session]\nevent_mode = "block"\nevent_cursor = "fast_skip"'
     for mode in ("off", "active_2l"):
-        path = _run_toml(tmp_path/"flow.toml", market=None, yb_mode=mode,
-                         trade_flow='trade_flow = "flow.npz"', session=session)
+        path = _run_toml(tmp_path/"blocks.toml", market=None, yb_mode=mode,
+                         block_tape='block_tape = "blocks.npz"', session=session)
         config = RunConfig.from_toml(path)
         request = open_session_request(config)
         frame = OpenSessionFrame.model_validate(dict(request, request_id="r", session_id="s"))
-        assert frame.event_mode == "trade_flow" and frame.trade_flow_path.endswith("flow.npz")
-        assert "market_path" not in request and "market" not in run_metadata(config, effective_batch=1)
-    for values, error in (({"trade_flow": 'trade_flow = "flow.jsonl"'}, "requires NPZ"),
-                          ({"trade_flow": 'trade_flow = "flow.npz"'}, "candles events require"),
-                          ({"session": '[session]\ncandle_volume = 1'}, "candle_volume must be a boolean")):
+        assert frame.event_mode == "block" and frame.block_tape_path.endswith("blocks.npz")
+        assert request["early_stop_max_7d_rel_price_diff"] == 0.3  # default pool stop
+        assert "market_path" not in request and "market" not in run_metadata(config)
+    for values, error in (({"block_tape": 'block_tape = "blocks.jsonl"'}, "requires NPZ"),
+                          ({"block_tape": 'block_tape = "blocks.npz"'}, "block events require"),
+                          ({"block_tape": 'trade_flow = "flow.npz"'}, "unsupported retired .scenario. option"),
+                          ({"market": None, "block_tape": 'block_tape = "blocks.npz"',
+                            "session": '[session]\nevent_mode = "block"\ncandle_filter = 10'}, "block events take no"),
+                          ({"session": '[session]\narb_settle_offset_s = 1'}, "arb_settle_offset_s requires"),
+                          ({"session": '[session]\nevent_mode = "trade_flow"'}, "event_mode must be candles or block"),
+                          ({"session": '[session]\narb_role = "taker"'}, "unsupported retired"),
+                          ({"yb_mode": "reference_2l"}, "yb_mode must be off or active_2l")):
         with pytest.raises(ConfigError, match=error):
-            RunConfig.from_toml(_run_toml(tmp_path/"bad-flow.toml", **values))
+            RunConfig.from_toml(_run_toml(tmp_path/"bad-blocks.toml", **values))
 
 
 def test_config_admission_table_covers_native_compiled_and_profiles(tmp_path: Path) -> None:
@@ -91,8 +98,8 @@ def test_config_admission_table_covers_native_compiled_and_profiles(tmp_path: Pa
             {"price_feed": 'price_feed = "nav.csv"'},
             None,
         ),
-        ("trade-flow", {"market": None, "trade_flow": 'trade_flow = "flow.npz"', "session": '[session]\nevent_mode = "trade_flow"\nmetric_profile = "grid_core"'}, None),
-        ("candles-reference-yb", {"session": '[session]\ncandle_volume = false', "yb_mode": "reference_2l"}, None),
+        ("block", {"market": None, "block_tape": 'block_tape = "blocks.npz"', "session": '[session]\nevent_mode = "block"'}, None),
+        ("candles-yb", {"yb_mode": "active_2l"}, None),
         ("retired-depth", {"session": '[session]\ncex_depth_max_age_s = 30'}, "unsupported retired"),
         ("exact-skip", {"session": '[session]\nevent_cursor = "exact_skip"'}, "event_cursor must be scalar or fast_skip"),
         (
@@ -111,16 +118,10 @@ def test_config_admission_table_covers_native_compiled_and_profiles(tmp_path: Pa
             None,
         ),
         (
-            "grid-core-admission",
-            {"session": '[session]\nmetric_profile = "grid_core"', "yb_mode": "active_2l"},
-            "grid_core requires yb_mode='off' and slippage disabled",
-        ),
-        (
             "full-summary-yb-slippage",
             {
                 "session": (
                     '[session]\nevent_cursor = "scalar"\n'
-                    'metric_profile = "full_summary"\n'
                     "enable_slippage_probes = true"
                 ),
                 "yb_mode": "active_2l",
@@ -138,7 +139,7 @@ def test_config_admission_table_covers_native_compiled_and_profiles(tmp_path: Pa
         config = RunConfig.from_toml(config_path)
         if name == "compiled":
             assert config.compiled_policy_id == "compiled"
-            assert run_metadata(config, effective_batch=2)["expected_evaluator_policy"] == {
+            assert run_metadata(config)["expected_evaluator_policy"] == {
                 "policy_id": "compiled",
                 "policy_abi": "twocrypto_policy_v1",
                 "policy_parameter_count": 2,
@@ -149,11 +150,11 @@ def test_config_admission_table_covers_native_compiled_and_profiles(tmp_path: Pa
             assert config.scenario["yb_mode"] == "active_2l"
             assert config.session["enable_slippage_probes"] is True
         if name == "price-feed":
-            metadata = run_metadata(config, effective_batch=2)
+            metadata = run_metadata(config)
             assert metadata["open_session"]["price_feed_path"].endswith("nav.csv")
-        if name == "trade-flow":
-            opened = run_metadata(config, effective_batch=2)["open_session"]
-            assert opened["trade_flow_path"].endswith("flow.npz") and opened["event_mode"] == "trade_flow"
+        if name == "block":
+            opened = run_metadata(config)["open_session"]
+            assert opened["block_tape_path"].endswith("blocks.npz") and opened["event_mode"] == "block"
 
 
 class _GridClient:
@@ -236,7 +237,6 @@ def _write_partition(path: Path, ordinals: tuple[int, ...]) -> Path:
         path,
         run_id="partitioned",
         total=4,
-        expected_count=len(ordinals),
         metadata={"worker": path.name},
         metric_names=("score",),
     )
@@ -327,10 +327,37 @@ def test_worker_keeps_completed_rows_after_evaluator_failure(
     output = tmp_path / "partial-worker"
     merge_grid_partitions(
         output, (partition,), run_id="contract", total=4,
-        metadata=run_metadata(RunConfig.from_toml(config), effective_batch=2),
+        metadata=run_metadata(RunConfig.from_toml(config)),
         metric_names=("score",),
     )
     columns = read_result_columns(output)
     assert columns.ok_mask.tolist() == [True, True, False, False]
     np.testing.assert_equal(columns.metrics["score"], [0.0, 1.0, np.nan, np.nan])
 
+
+
+def test_replay_without_active_yb_drops_the_yb_actor_choice(tmp_path: Path) -> None:
+    from fxopt.config import EVALUATOR_POLICY_METADATA_KEY
+    from fxopt.contract import Candidate
+    from fxopt.shiftclick import trace_stored_candidate
+
+    seen: list[tuple[dict[str, object], list[dict[str, object]]]] = []
+
+    class Client(_GridClient):
+        def evaluate_batch(self, candidates, **request):
+            seen.append((self.open_request, list(candidates)))
+            return {"results": [{"candidate_id": c["candidate_id"], "status": "ok", "metrics": {}} for c in candidates]}
+
+    metadata = {
+        "replay": {"evaluator": "evaluator", "work_dir": str(tmp_path),
+                   "open_session": {"yb_mode": "active_2l", "yb_arb": "none", "metric_profile": "full_summary"}},
+        EVALUATOR_POLICY_METADATA_KEY: {"policy_id": "p", "policy_abi": "1", "policy_parameter_count": 0},
+    }
+    candidate = Candidate("c0", (), {"run": {"arb_report_offset": 1}})
+    for yb_mode in ("off", "active_2l"):
+        trace_stored_candidate("run", metadata, candidate=candidate, ordinal=0, output_dir=tmp_path / yb_mode,
+                               yb_mode=yb_mode, client_factory=Client)
+    (off_session, off_batch), (active_session, active_batch) = seen
+    assert "yb_arb" not in off_session and active_session["yb_arb"] == "none"
+    assert "metric_profile" not in off_session and "metric_profile" not in active_session
+    assert off_batch[0]["pool_overrides"] == active_batch[0]["pool_overrides"] == {"run": {"arb_report_offset": 1}}

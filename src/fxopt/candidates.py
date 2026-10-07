@@ -107,14 +107,6 @@ class CandidateSpec:
     candidate_id: str
     payload: Mapping[str, Any]
 
-    @classmethod
-    def from_payload(cls, payload: Mapping[str, Any], *, ordinal: int = 0) -> "CandidateSpec":
-        copied = canonical_payload(payload)
-        return cls(candidate_id(ordinal), copied)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {"candidate_id": self.candidate_id, "payload": dict(self.payload)}
-
 
 __all__ = [
     "CandidateError",

@@ -14,7 +14,6 @@ shift 2
 
 # Completed local artifacts can be opened without contacting the cluster.
 if [[ ! -f "$run_dir/run.json" || ! -f "$run_dir/results.npz" ]]; then
-  env -u VIRTUAL_ENV uv run fxopt run "$config" --output "$run_dir" --status
   env -u VIRTUAL_ENV uv run fxopt run "$config" --output "$run_dir" --follow
 fi
 

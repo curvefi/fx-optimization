@@ -11,7 +11,7 @@ from .config import ConfigError
 def dataset_metadata(inputs: Mapping[str, str]) -> dict[str, Any]:
     """Verify only the selected published files and return portable identities."""
     result = {}
-    for name in ("market", "price_feed", "trade_flow"):
+    for name in ("market", "price_feed", "block_tape"):
         if name not in inputs:
             continue
         path = Path(inputs[name])

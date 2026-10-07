@@ -375,7 +375,7 @@ def worker_command(
 @click.option("--final-price-diff-bps", type=float)
 @click.option(
     "--shiftclick-yb-mode",
-    type=click.Choice(("off", "active_2l", "reference_2l")),
+    type=click.Choice(("off", "active_2l")),
     default="active_2l",
     show_default=True,
     help="YB mode for local Shift-click replay; right-click stays off.",
@@ -447,7 +447,7 @@ def heatmap_command(
 @click.option("--actions/--no-actions", default=False, show_default=True)
 @click.option(
     "--yb-mode",
-    type=click.Choice(("off", "active_2l", "reference_2l")),
+    type=click.Choice(("off", "active_2l")),
     default="active_2l",
     show_default=True,
 )

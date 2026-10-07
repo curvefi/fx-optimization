@@ -29,9 +29,7 @@
       },
       "costs": {
         "arb_fee_bps": 10,
-        "gas_coin0": 0.0,
-        "use_volume_cap": false,
-        "volume_cap_mult": 1
+        "gas_coin0": 0.0
       }
     }
   ]

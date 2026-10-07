@@ -40,8 +40,9 @@ uv sync --frozen --group dev
 
 ## Prepared inputs and data workbench
 
-Selected candles, trade-flow tapes, and oracle feeds live in [`data/`](data/README.md)
-under Git LFS, with small provenance manifests in ordinary Git. Experiment
+Selected candles, block tapes, and oracle feeds live in the local, Git-ignored
+[`data/`](data/README.md) beside small provenance manifests; only the legacy
+`candles.xz` archives are tracked, under Git LFS. Experiment
 TOMLs use relative paths into this collection or the sibling data workbench.
 Each selected input is checked against its adjacent `dataset.json`, and the
 dataset revision and checksums are recorded in `run.json`.
@@ -51,24 +52,30 @@ sibling [`../data/`](../data/README.md) workbench, with their own dependencies.
 The optimizer consumes prepared files without importing or running those
 generators. External input paths remain supported.
 
-The harness arbitrageur is a maker that hedges each bin's trade-through fills.
-Pick one market mode per config:
+The harness arbitrages by the fixed rules in
+[`arbitrage_rules.md`](../curve-fx-arb-harness/docs/arbitrage_rules.md): one
+native arbitrageur per pool and, with `scenario.yb_mode = "active_2l"`, the
+YieldBasis LEVAMM actor. Their settings are `pool.costs.entry_edge_bps`,
+`pool.costs.arb_fee_bps`, `pool.costs.gas_coin0`, `session.yb_execution_bps` and
+`session.yb_min_net_profit_coin0`. Pick one market mode per config:
 
 - **Candles:** `scenario.market` (OHLC JSON) with the default
-  `session.event_mode = "candles"`. `session.candle_volume` (default true)
-  spreads candle volume along the OHLC path; false leaves the wicks unlimited.
-  Use this to ballpark assets without trade data.
-- **Measured trades:** `scenario.trade_flow` (NPZ from
-  `data/market/pack_trade_flow.py`) with `session.event_mode = "trade_flow"`.
-  For example, Binance ETHUSDT 12s bins for 2025-03-24 through 2026-08-20.
+  `session.event_mode = "candles"`. Use this to ballpark assets without trade data.
+- **Blocks:** `scenario.block_tape` (NPZ from `data/market/build_block_tape.py`)
+  with `session.event_mode = "block"`. The event price of each block is the
+  external price `session.arb_settle_offset_s` seconds after its timestamp.
 
 `session.excluded_time_ranges = [[start, end)]` removes UTC intervals (for
 example 10 October 2025, `[[1760054400, 1760140800]]`). Their events and
 price-feed samples are omitted, calendar time advances across the gap, and
 pool/YB state resumes at the next retained event. The
 [harness protocol](../curve-fx-arb-harness/protocol/protocol_spec.md) defines
-both modes, the clock and trace behavior. Build a new evaluator remotely with
+these modes, the clock and trace behavior. Build a new evaluator remotely with
 `fxopt run ... --rebuild` before its first cluster run.
+
+`session.early_stop_max_7d_rel_price_diff` ends a pool's run once its maximum
+7-day price divergence passes the value (default 0.3; 0 never stops). Shift-click
+replays always run the full history.
 
 `pool_nav_vs_hold` is final total pool assets divided by the final marked value
 of the starting token basket, minus one, with both portfolios at the final
@@ -169,13 +176,13 @@ Workers send compact progress snapshots every two seconds and the coordinator
 prints one aggregate heartbeat every two seconds. Rate and ETA remain hidden
 until every worker has produced a batch; afterward ETA uses the remaining
 global queue and currently active worker rate. Deterministic candidate failures
-remain result rows; an evaluator transport failure is retried locally three
-times; if the worker still fails, healthy workers continue and completed rows
-are published as a partial grid. Final
+remain result rows; an evaluator transport failure ends that worker and its
+unfinished lease is not reassigned, while healthy workers continue and completed
+rows are published as a partial grid. Final
 `run.json` records the schedule, configured evaluator path, validated policy
 contract, per-worker timing, and aggregate status counts.
-Remote manifests must declare `run.metric_fields`, which fixes the typed result
-schema even when the first chunk fails. Subsequent runs can omit preparation
+Every manifest must declare `run.metric_fields`, which fixes the typed result
+schema. Subsequent runs can omit preparation
 flags when the requested evaluator target and sources are already present.
 
 Evaluator builds select either native/no-policy behavior or one compiled
@@ -189,18 +196,15 @@ id = "yieldbasis_twocrypto_policy"
 header = "../../../twocrypto-cpp/include/pools/twocrypto_fx/policies/yieldbasis.hpp"
 ```
 
-The same build input supports `fair_price_fee` (base fee and capture),
-`implied_fair_fee` (plus assumed arb cost), `revealed_fair_fee` (plus revelation
-weight; floating-only), and `price_feed_passthrough` (no parameters). Select the
-matching header under `twocrypto-cpp/include/pools/twocrypto_fx/policies/` and
-use its descriptor's parameter order. Experimental headers are repository-local
+Select the header under `twocrypto-cpp/include/pools/twocrypto_fx/policies/` and
+use its descriptor's parameter order. Policy headers are repository-local
 build inputs, not part of the installed pool library.
 
-The current research policy is
-`autoresearch/ar-superset-v5.hpp` (id `ar_superset_v5_report_driver_dual_ema`), which carries
-the rs1#6567 design: an oraclized report fee with a hybrid dual-EMA
-price-scale driver. `autoresearch/ar-superset-v11.hpp` is its latest superset,
-with launch warm-up parameters. Report probabilities grid independently of the
+The current research policy is `report_dual_ema.hpp` (id `report_dual_ema`): a
+report fee over the dual-EMA price-scale driver. Its 13 parameters, in order:
+`base_fee`, `away_capture`, `toward_ratio`, `fallback_fee`, `fast_half_life_s`,
+`slow_half_life_s`, `kappa`, `deadband`, `min_cap`, `max_cap`, `age_offset_s`,
+`future_window_s`, `aging_s`. Report probabilities grid independently of the
 policy parameters, for example
 `"pool.run.arb_report_rate" = { start = 0.1, stop = 1.0, count = 10 }`.
 
@@ -238,8 +242,8 @@ uv run fxopt heatmap runs/GRID \
   --no-show
 ```
 
-The explorer supports metric filters, slice-local color limits, interactive
-adaptive limits for price difference and detachment, fixed CLI filters for
+The explorer supports metric filters, slice-local color limits, an interactive
+adaptive limit for price difference, fixed CLI filters for detachment,
 slippage and final price difference, axis selection,
 and multi-metric views. `--columns` controls the panel layout. Clicking a cell
 selects its exact candidate. Right-click replays that candidate with YieldBasis
@@ -249,11 +253,11 @@ replay traces are temporary and removed after plotting; titles and summaries
 use the local replay metrics.
 
 Raw panels never hide observations. Append `_masked` to any stored metric name
-to filter that panel by the interactive 7-day price-difference and detachment
-controls—for example `apy_masked`, `apy_net_masked`, or
-`apy_net_robust_90d_masked`. `--max-price-diff-bps` and
-`--max-detach-energy` set their initial thresholds. The fixed
-`--final-price-diff-bps` and `--slippage-bps` filters apply when explicitly
+to filter that panel by the interactive 7-day price-difference control and the
+fixed detachment limit—for example `apy_net_masked` or
+`apy_net_robust_90d_masked` (`apy_masked` is an alias that shows `apy_net`).
+`--max-price-diff-bps` sets the initial threshold. The fixed
+`--max-detach-energy`, `--final-price-diff-bps` and `--slippage-bps` filters apply when explicitly
 provided; unsuffixed diagnostic panels remain unmasked.
 
 The legacy-compatible `apy_1_masked` and `apy_5_masked` views use `apy_net`
@@ -291,7 +295,7 @@ YB off. Override these defaults with `--shiftclick-yb-mode` and
 
 ## Results and configuration
 
-`run.json` contains the resolved run metadata, config origin, axes, robustness
+`run.json` contains the resolved run metadata, config path, axes, robustness
 radii, configured evaluator path, validated policy contract, session settings,
 and local replay inputs. `results.npz` contains candidate results and metrics.
 Heatmaps and Shift-click use this bundle directly.

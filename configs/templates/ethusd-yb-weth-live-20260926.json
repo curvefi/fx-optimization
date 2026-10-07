@@ -1,26 +1,26 @@
 {
   "pools": [
     {
-      "tag": "ethusd_native_fresh_10m",
+      "tag": "ethusd_yb_weth_live_20260926",
       "pool": {
         "initial_liquidity": [
-          "5000000000000000000000000",
-          "2190868460257646130926"
+          "28763512000000000000000000",
+          "12603414249408466000000"
         ],
         "A": "50000",
         "gamma": "100000000000000",
         "mid_fee": "136000000",
-        "out_fee": "136000000",
-        "fee_gamma": "30000000000000000",
+        "out_fee": "282000000",
+        "fee_gamma": "4961947600000000",
         "adjustment_step_min": "100000000",
-        "adjustment_step_max": "30000000000000000",
-        "ma_time": "600",
-        "reserved_profit_fraction": "3000000000",
+        "adjustment_step_max": "5000000000000000",
+        "ma_time": "865",
+        "reserved_profit_fraction": "4500000000",
         "admin_fee": "0",
         "policy": {"kind": "none"},
         "initial_price": "2282200000000000000000",
         "start_timestamp": "1704067195",
-        "donation_apy": "0.01",
+        "donation_apy": "0.05",
         "donation_frequency": "86400",
         "donation_duration": "604800",
         "initial_donation_days": "0",
@@ -28,7 +28,7 @@
       },
       "costs": {
         "arb_fee_bps": 2,
-        "gas_coin0": 0
+        "gas_coin0": 1
       }
     }
   ]
