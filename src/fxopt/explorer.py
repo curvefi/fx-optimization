@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
+from dataclasses import replace
 import tempfile
 from pathlib import Path
 from typing import Sequence
@@ -90,7 +92,12 @@ def _dataset(columns: ResultColumns) -> HeatmapDataset:
     if not isinstance(raw_axes, dict) or not isinstance(raw_shape, list):
         raise ValueError("run has no Cartesian axis metadata")
     names = tuple(sorted(raw_axes))
-    axes = tuple(_heatmap_axis(name, raw_axes[name]) for name in names)
+    parameter_names = columns.metadata.get("compiled_policy", {}).get("parameter_names", [])
+    aliases = {f"policy_params.{index}": name for index, name in enumerate(parameter_names)}
+    axes = tuple(
+        replace(_heatmap_axis(name, raw_axes[name]), display_name=aliases.get(name))
+        for name in names
+    )
     shape = tuple(int(value) for value in raw_shape)
     if shape != tuple(len(axis.values) for axis in axes):
         raise ValueError("run axis metadata and shape disagree")
@@ -123,6 +130,8 @@ def open_fxopt_explorer(
     final_price_diff_bps: float | None = None,
     shiftclick_yb_mode: str = "active_2l",
     shiftclick_yb_cash_multiplier: float = 3.0,
+    shiftclick_evaluator: str | Path | None = None,
+    shiftclick_excluded_time_ranges: list[list[int]] | None = None,
 ) -> HeatmapExplorer:
     """Open the interactive UI from columnar run results."""
     root = Path(run_dir).expanduser().resolve()
@@ -156,8 +165,15 @@ def open_fxopt_explorer(
                 trace_interval=200, trace_actions=False,
                 yb_mode=shiftclick_yb_mode if mode == "shift" else "off",
                 yb_cash_multiplier=shiftclick_yb_cash_multiplier if mode == "shift" else None,
+                evaluator=shiftclick_evaluator if mode == "shift" else None,
+                excluded_time_ranges=shiftclick_excluded_time_ranges if mode == "shift" else None,
             )
-            figure = shiftclick_figure(summary, title=f"{results.run_id}: {ordinal}")
+            title = f"{results.run_id}: {ordinal}"
+            if mode == "shift" and shiftclick_excluded_time_ranges:
+                days = ", ".join(datetime.fromtimestamp(start, timezone.utc).date().isoformat()
+                                 for start, _ in shiftclick_excluded_time_ranges)
+                title += f" | replay excludes UTC {days}; grid unchanged"
+            figure = shiftclick_figure(summary, title=title)
         figure.show()
         return figure
 

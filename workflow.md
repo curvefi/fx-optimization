@@ -30,8 +30,7 @@ For a new pair or policy, an agent should do exactly this:
 1. Read this file, the repository `README.md`, the current `fxopt ... --help`,
    and `../curve-fx-arb-harness/protocol/protocol_spec.md`.
 2. Inspect all three repository worktrees and preserve unrelated changes.
-3. Start from a maintained manifest in `configs/experiments/` when one exists;
-   keep exploratory copies and their `report.md` under ignored
+3. Keep manifests and their `report.md` under ignored
    `configs/autoresearch/<pair>-optimization/<policy>/`.
 4. Freeze the objective, hard constraints, units, perturbation radii, dataset,
    template, policy, arb cost, and wall-time budget in the report **before** the
@@ -69,10 +68,6 @@ ask/tell loop merely to complete an ordinary grid campaign.
 Use a workbench layout like:
 
 ```text
-configs/experiments/
-    btcusd-native-discovery-f64.toml
-    btcusd-dual-ema-robust-f64.toml
-    btcusd-p3-finalist-comparison.toml
 configs/autoresearch/<pair>-optimization/<policy>/
     report.md
     00-source.toml
@@ -91,7 +86,7 @@ dataset path and covered timestamps
 pool template and compiled-policy identity
 fixed parameters and searchable parameters
 numeric mode, YB mode, metric profile, event cursor, and slippage setting
-arb cost and any volume/gas assumptions
+arb cost and any gas assumptions
 hard fee, donation, attachment, and detachment constraints
 ranking metric and promotion reducer
 physical perturbation radii
@@ -186,12 +181,7 @@ axis for a flat fee so mid and out fees move together:
 
 ```toml
 [candidate.axes]
-flat_fee = {
-  start = 0.0100,
-  stop = 0.0200,
-  step = 0.0001,
-  targets = ["pool.mid_fee", "pool.out_fee"],
-}
+flat_fee = { start = 0.0100, stop = 0.0200, step = 0.0001, targets = ["pool.mid_fee", "pool.out_fee"] }
 ```
 
 An established config-only research iteration needs this parse gate, not new
@@ -219,8 +209,7 @@ Use:
 arb_evaluator_f64 (native/no-policy build)
 yb_mode = "off"
 policy_params = []
-event_cursor = "exact_skip"
-metric_profile = "grid_core"
+event_cursor = "scalar"
 slippage disabled
 ```
 
@@ -453,18 +442,17 @@ compute the known group floors and ceilings explicitly.
 This small-star form is also useful when one axis is an external scenario input,
 such as arb cost, rather than a parameter being optimized.
 
-The tracked BTC `btcusd-p3-finalist-comparison.toml` is the reusable form of
-this gate. It keeps one candidate star and the 2/3/4/5-bps arb-cost axis while
-the operator varies only two scalar settings between runs:
+A finalist-comparison manifest is the reusable form of this gate. It keeps one
+candidate star and an arb-cost axis (for example 2/3/4/5 bps) while the
+operator varies only two scalar settings between runs:
 
 ```text
 numeric: evaluator_f64 -> evaluator_ld
-YB model: off -> active_2l -> reference_2l
+YB model: off -> active_2l
 ```
 
-Keep `full_summary`, `event_cursor = "scalar"`, and the metric list unchanged
-across the comparison. `reference_2l` is a small model-sensitivity check, not
-an onchain-parity claim.
+Keep `event_cursor = "scalar"` and the metric list unchanged
+across the comparison. `active_2l` is not an onchain-parity claim.
 
 ## 8. Native promotion gates
 
@@ -521,7 +509,6 @@ call the collection stable.
 YB is a secondary gate after native convergence. Use:
 
 ```text
-metric_profile = "full_summary"
 event_cursor = "scalar"
 yb_mode = "active_2l"
 slippage disabled unless explicitly needed
@@ -558,8 +545,7 @@ donations occur as causal sublegs of YB routes. Check whether
 route necessarily donated. Never add LP APY and YB APY without a defined
 consolidated accounting boundary.
 
-Use `reference_2l` only for a small final model-sensitivity sample. Neither
-enabled YB mode is proven historical or onchain parity.
+`active_2l` is not proven historical or onchain parity.
 
 ## 10. ShiftClick the exact stored candidate
 
@@ -572,9 +558,11 @@ env -u VIRTUAL_ENV UV_CACHE_DIR=/tmp/uv-cache \
   --output runs/RUN/inspections/ordinal-ORDINAL
 ```
 
-ShiftClick preserves the run's YB mode, fee, cash multiplier, session, and exact
-candidate payload. Right-click in the explorer intentionally replays with YB
-off; Shift-click uses the stored mode.
+ShiftClick replays the exact stored candidate payload with the session recorded
+in `run.json`, on the scalar cursor and over the full history (no early stop).
+It defaults to YB `active_2l` with cash multiplier 3, even when the grid ran
+without YB; override with `--yb-mode` and `--yb-cash-multiplier`. Right-click in
+the explorer intentionally replays with YB off.
 
 The replay is local. Its plot is a path diagnostic, not blade-LD ranking
 evidence. Put canonical blade metrics and local replay metrics side by side when

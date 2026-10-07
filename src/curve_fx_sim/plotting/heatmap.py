@@ -8,7 +8,6 @@ import os
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal
 
@@ -43,8 +42,6 @@ class HeatmapValidationError(ValueError):
 def _python_value(value: Any) -> Any:
     if isinstance(value, np.generic):
         return value.item()
-    if isinstance(value, Decimal):
-        return int(value) if value == value.to_integral_value() else format(value, "f")
     if isinstance(value, tuple):
         return [_python_value(item) for item in value]
     if isinstance(value, list):
@@ -112,7 +109,7 @@ class HeatmapAxis:
     names: tuple[str, ...]
     values: tuple[Any, ...]
     scale: AxisScale = "linear"
-    labels: tuple[str, ...] = ()
+    display_name: str | None = None
 
     def __post_init__(self) -> None:
         if not self.names or any(not name for name in self.names):
@@ -121,8 +118,6 @@ class HeatmapAxis:
             raise HeatmapValidationError(f"heatmap axis {self.key!r} is empty")
         if len(set(self.names)) != len(self.names):
             raise HeatmapValidationError(f"heatmap axis names are duplicated: {self.names!r}")
-        if self.labels and len(self.labels) != len(self.values):
-            raise HeatmapValidationError(f"heatmap axis {self.key!r} label count is invalid")
         if len(self.names) > 1:
             for row in self.values:
                 if not isinstance(row, (tuple, list)) or len(row) != len(self.names):
@@ -138,8 +133,7 @@ class HeatmapAxis:
                 ) from exc
             if np.any(~np.isfinite(values)):
                 raise HeatmapValidationError(f"numeric axis {self.key!r} must be finite")
-            exact_values = {Decimal(str(value)) for value in self.values}
-            if len(exact_values) != len(self.values):
+            if len(set(self.values)) != len(self.values):
                 raise HeatmapValidationError(f"numeric axis {self.key!r} must be unique")
             if self.scale == "log" and np.any(values <= 0):
                 raise HeatmapValidationError(f"log axis {self.key!r} must be finite and positive")
@@ -160,7 +154,7 @@ class HeatmapAxis:
 
     @property
     def display_labels(self) -> tuple[str, ...]:
-        return self.labels or _labels(self.values)
+        return _labels(self.values)
 
     def coordinate(self, index: int) -> dict[str, Any]:
         value = self.values[index]
@@ -398,7 +392,6 @@ class HeatmapTilesState:
     mask: MaskSpec = field(default_factory=MaskSpec)
     ncol: int = 2
     log_axes: tuple[str, ...] = ()
-    source: str | None = None
 
     def __post_init__(self) -> None:
         keys = tuple(axis.key for axis in self.axes)
@@ -438,17 +431,8 @@ class HeatmapTilesState:
     def singleton_axes(self) -> tuple[str, ...]:
         return tuple(axis.key for axis in self.axes if axis.is_singleton)
 
-    @property
-    def slider_axes(self) -> tuple[HeatmapAxis, ...]:
-        return tuple(
-            axis
-            for axis in self.axes
-            if axis.key not in {self.x_axis, self.y_axis} and not axis.is_singleton
-        )
-
     def to_dict(self) -> dict[str, Any]:
         tile_data = {
-            "source": self.source,
             "shape": [len(axis.values) for axis in self.axes],
             "axis_keys": [axis.key for axis in self.axes],
             "x_axis": self.x_axis,
@@ -485,7 +469,6 @@ class HeatmapTilesState:
                 for axis in self.axes
             ],
             "data": {
-                "source": self.source,
                 "shape": [len(axis.values) for axis in self.axes],
                 "axis_keys": [axis.key for axis in self.axes],
             },

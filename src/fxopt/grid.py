@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from itertools import product
 from typing import Any
 
 from .candidates import CandidateSpec, candidate_id, canonical_payload, merge_payload
@@ -12,7 +11,7 @@ from .candidates import CandidateSpec, candidate_id, canonical_payload, merge_pa
 
 @dataclass(frozen=True, slots=True)
 class CartesianGrid:
-    """A Cartesian product that materializes only candidates being consumed."""
+    """A Cartesian product that materializes only the candidate asked for by ordinal."""
 
     defaults: Mapping[str, Any]
     axes: Mapping[str, Sequence[Any]]
@@ -53,19 +52,6 @@ class CartesianGrid:
 
     def __len__(self) -> int:
         return self._size
-
-    def __iter__(self) -> Iterator[CandidateSpec]:
-        for ordinal, point in enumerate(product(*self._values)):
-            updates: dict[str, Any] = {}
-            for name, value in zip(self._names, point, strict=True):
-                if isinstance(value, Mapping):
-                    updates.update(value)
-                else:
-                    updates[name] = value
-            yield CandidateSpec(
-                candidate_id(ordinal),
-                merge_payload(self.defaults, updates),
-            )
 
     def candidate_at(self, ordinal: int) -> CandidateSpec:
         """Resolve one product position without constructing preceding candidates."""

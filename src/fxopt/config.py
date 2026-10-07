@@ -213,11 +213,6 @@ class CandidateConfig:
 
         return cls(dict(defaults), axes)
 
-    @classmethod
-    def from_toml(cls, path: str | Path) -> "CandidateConfig":
-        with Path(path).open("rb") as stream:
-            return cls.from_mapping(tomllib.load(stream))
-
     def grid(self) -> CartesianGrid:
         return CartesianGrid(dict(self.defaults), self.axes)
 
@@ -225,8 +220,8 @@ class CandidateConfig:
 _RUN_KEYS = frozenset({"id", "evaluator", "template", "batch_size", "workers", "metric_fields"})
 _PLACEMENT_KEYS = frozenset({"hosts", "numa_nodes"})
 _CANDIDATE_KEYS = frozenset({"defaults", "axes"})
-_SCENARIO_KEYS = frozenset({"id", "market", "price_feed", "cex_depth", "observed_state", "yb_mode"})
-_COMPILED_POLICY_KEYS = frozenset({"header", "id"})
+_SCENARIO_KEYS = frozenset({"id", "market", "price_feed", "block_tape", "yb_mode"})
+_COMPILED_POLICY_KEYS = frozenset({"header", "id", "parameter_names"})
 EVALUATOR_POLICY_METADATA_KEY = "expected_evaluator_policy"
 _COMPILED_POLICY_ABI = "twocrypto_policy_v1"
 
@@ -261,6 +256,7 @@ class RunConfig:
     robustness: tuple[RobustnessAxis, ...]
     compiled_policy_header: Path | None
     compiled_policy_id: str | None
+    policy_parameter_names: tuple[str, ...] = ()
 
     @classmethod
     def from_toml(cls, path: str | Path) -> "RunConfig":
@@ -336,48 +332,31 @@ class RunConfig:
             raise ConfigError("[session] must be a mapping")
         forbidden_session = {
             "session_id", "template_path", "scenario_id", "market_path",
-            "price_feed_path", "cex_depth_path", "actor_timeline_path", "yb_oracle_path", "observed_state_path",
+            "price_feed_path", "block_tape_path",
         } & set(session)
         if forbidden_session:
             raise ConfigError(
                 "[session] cannot set " + ", ".join(sorted(forbidden_session))
             )
         retired_session = {
-            "actor_hedge_mode", "actor_hedge_delay_ns",
-            "equalization_interval_s", "pool_ping_timestamps",
+            "actor_hedge_mode", "actor_hedge_delay_ns", "equalization_interval_s", "pool_ping_timestamps",
+            "cex_depth_max_age_s", "actor_timing_mode", "observation_interval_s", "state_reconciliation_mode",
+            "equalization_delay_s", "reset_threshold_bps", "arb_flow", "arb_role", "candle_volume",
+            "metric_profile", "trade_flow_path",
         } & set(session)
         if retired_session:
             raise ConfigError("unsupported retired [session] options: " + ", ".join(sorted(retired_session)))
         resolved_session = dict(session)
         resolved_session.setdefault("event_cursor", "scalar")
-        resolved_session.setdefault("metric_profile", "full_summary")
         resolved_session.setdefault("enable_slippage_probes", False)
         if "yb_min_net_profit_coin0" in resolved_session:
             margin = resolved_session["yb_min_net_profit_coin0"]
             if isinstance(margin, bool) or not isinstance(margin, (int, float)) or not math.isfinite(margin) or margin < 0:
                 raise ConfigError("session.yb_min_net_profit_coin0 must be finite and nonnegative")
-        resolved_session.setdefault("cex_depth_max_age_s", 30)
-        depth_max_age = resolved_session["cex_depth_max_age_s"]
-        if (
-            type(depth_max_age) is not int
-            or not 0 <= depth_max_age <= 2**64 - 1
-        ):
-            raise ConfigError("session.cex_depth_max_age_s must be a non-negative uint64")
-        actor_timing_mode = resolved_session.setdefault("actor_timing_mode", "legacy_event")
-        if actor_timing_mode not in {"legacy_event", "minute_sequential"}:
-            raise ConfigError("session.actor_timing_mode must be legacy_event or minute_sequential")
-        observation_interval = resolved_session.get("observation_interval_s", 60)
-        if type(observation_interval) is not int or not 0 < observation_interval <= 2**64-1:
-            raise ConfigError("session.observation_interval_s must be a positive uint64")
-        reconciliation_mode = resolved_session.get("state_reconciliation_mode", "off")
-        if reconciliation_mode not in {"off", "on_price_scale_detach"}:
-            raise ConfigError("session.state_reconciliation_mode must be off or on_price_scale_detach")
-        delay = resolved_session.get("equalization_delay_s", 60)
-        if type(delay) is not int or not 0 <= delay <= (2**64-1)//1_000_000_000:
-            raise ConfigError("session.equalization_delay_s must be nonnegative seconds representable in uint64 nanoseconds")
-        threshold = resolved_session.get("reset_threshold_bps", 100)
-        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not math.isfinite(threshold) or threshold <= 0:
-            raise ConfigError("session.reset_threshold_bps must be finite and positive")
+        # Unless configured, a pool's run ends once its 7-day price divergence passes 30%.
+        early_stop = resolved_session.setdefault("early_stop_max_7d_rel_price_diff", 0.3)
+        if isinstance(early_stop, bool) or not isinstance(early_stop, (int, float)) or not math.isfinite(early_stop) or early_stop < 0:
+            raise ConfigError("session.early_stop_max_7d_rel_price_diff must be finite and nonnegative")
 
         candidate = raw.get("candidate")
         if not isinstance(candidate, Mapping):
@@ -389,6 +368,7 @@ class RunConfig:
         scenario = raw.get("scenario")
         if not isinstance(scenario, Mapping):
             raise ConfigError("config requires a [scenario] table")
+        if "trade_flow" in scenario: raise ConfigError("unsupported retired [scenario] option: trade_flow")
         unknown_scenario = set(scenario) - _SCENARIO_KEYS
         if unknown_scenario:
             raise ConfigError(f"unknown [scenario] keys: {sorted(unknown_scenario)}")
@@ -404,64 +384,30 @@ class RunConfig:
             resolved_scenario["price_feed"] = str(
                 _resolve_path(price_feed, config_path.parent)
             )
-        cex_depth = scenario.get("cex_depth")
-        if cex_depth is not None:
-            if not isinstance(cex_depth, str) or not cex_depth.strip():
-                raise ConfigError("scenario.cex_depth must be a non-empty string")
-            resolved_scenario["cex_depth"] = str(
-                _resolve_path(cex_depth, config_path.parent)
-            )
-        observed_state = scenario.get("observed_state")
-        if observed_state is not None:
-            if not isinstance(observed_state, str) or not observed_state.strip():
-                raise ConfigError("scenario.observed_state must be a non-empty string")
-            resolved_scenario["observed_state"] = str(_resolve_path(observed_state, config_path.parent))
+        block_tape = scenario.get("block_tape")
+        if block_tape is not None:
+            if not isinstance(block_tape, str) or Path(block_tape).suffix != ".npz":
+                raise ConfigError("scenario.block_tape requires NPZ; build it with data/market/build_block_tape.py")
+            resolved_scenario["block_tape"] = str(_resolve_path(block_tape, config_path.parent))
         scenario_yb_mode = scenario.get("yb_mode", "off")
-        if not isinstance(scenario_yb_mode, str):
-            raise ConfigError("scenario.yb_mode must be a string")
+        if scenario_yb_mode not in {"off", "active_2l"}:
+            raise ConfigError("scenario.yb_mode must be off or active_2l")
         resolved_scenario["yb_mode"] = scenario_yb_mode
-        if observed_state is not None or reconciliation_mode != "off":
-            if observed_state is None or actor_timing_mode != "minute_sequential" or scenario_yb_mode != "reference_2l":
-                raise ConfigError("observed state and reconciliation require observed_state, minute_sequential, and reference_2l")
-        if actor_timing_mode == "minute_sequential":
-            resolved_session.setdefault("event_mode", "depth")
-            resolved_session.setdefault("dustswap_freq_s", 0)
-            resolved_session.setdefault("user_swap_freq_s", 0)
-            if (cex_depth is None or scenario_yb_mode not in {"reference_2l", "active_2l"} or
-                    resolved_session["event_mode"] != "depth" or
-                    resolved_session["dustswap_freq_s"] != 0 or resolved_session["user_swap_freq_s"] != 0 or
-                    resolved_session["event_cursor"] != "scalar" or resolved_session["metric_profile"] != "full_summary"):
-                raise ConfigError("minute_sequential requires depth, active_2l or reference_2l, depth events, scalar full_summary, and no synthetic swaps")
-        event_mode = resolved_session.setdefault("event_mode", "candle_path")
-        if event_mode not in {"candle_path", "depth", "mixed_depth"}:
-            raise ConfigError("session.event_mode must be candle_path, depth, or mixed_depth")
-        if cex_depth is not None and Path(cex_depth).suffix != ".npz":
-            raise ConfigError("scenario.cex_depth requires NPZ; convert JSONL with cryptolake.depth_archive in data/cryptolake")
-        if event_mode == "depth":
-            if cex_depth is None or "market" in resolved_scenario or resolved_session.get("candle_filter", 0) != 0:
-                raise ConfigError("depth event_mode requires scenario.cex_depth and no scenario.market or candle_filter")
-        elif event_mode == "mixed_depth":
-            if cex_depth is None or "market" not in resolved_scenario:
-                raise ConfigError("mixed_depth requires scenario.cex_depth and scenario.market")
+        event_mode = resolved_session.setdefault("event_mode", "candles")
+        if event_mode not in {"candles", "block"}:
+            raise ConfigError("session.event_mode must be candles or block")
+        if (event_mode == "block") != (block_tape is not None):
+            raise ConfigError("block events require scenario.block_tape and vice versa")
+        if event_mode == "block":
+            if ("market" in resolved_scenario or resolved_session.get("candle_filter", 0) != 0
+                    or resolved_session.get("n_candles", 0) != 0):
+                raise ConfigError("block events take no scenario.market, candle_filter or n_candles")
+        elif "arb_settle_offset_s" in resolved_session:
+            raise ConfigError("session.arb_settle_offset_s requires event_mode = \"block\"")
         elif "market" not in resolved_scenario:
-            raise ConfigError("candle_path event_mode requires scenario.market")
-        if (
-            resolved_session["event_cursor"] == "exact_skip"
-            and resolved_session["metric_profile"] != "grid_core"
-        ):
-            raise ConfigError(
-                "exact_skip requires metric_profile='grid_core'"
-            )
-        if (
-            resolved_session["metric_profile"] == "grid_core"
-            and (
-                scenario_yb_mode != "off"
-                or bool(resolved_session["enable_slippage_probes"])
-            )
-        ):
-            raise ConfigError(
-                "grid_core requires yb_mode='off' and slippage disabled"
-            )
+            raise ConfigError("candles events require scenario.market")
+        if resolved_session["event_cursor"] not in {"scalar", "fast_skip"}:
+            raise ConfigError("session.event_cursor must be scalar or fast_skip")
         if (
             any(name.startswith("tw_real_slippage_") for name in raw_metric_fields)
             and resolved_session["enable_slippage_probes"] is not True
@@ -491,6 +437,16 @@ class RunConfig:
                 compiled_policy, "id", "compiled_policy"
             )
         candidate_config = CandidateConfig.from_mapping(candidate)
+        parameter_names = compiled_policy.get("parameter_names", []) if compiled_policy else []
+        if not isinstance(parameter_names, list) or any(
+            not isinstance(name, str) or not name.strip() for name in parameter_names
+        ):
+            raise ConfigError("compiled_policy.parameter_names must be nonempty strings")
+        if parameter_names and (
+            len(parameter_names) != len(candidate_config.defaults["policy_params"])
+            or len(set(parameter_names)) != len(parameter_names)
+        ):
+            raise ConfigError("compiled_policy.parameter_names must uniquely name every policy parameter")
         if (
             compiled_policy_header is None
             and candidate_config.defaults["policy_params"]
@@ -517,6 +473,7 @@ class RunConfig:
             ),
             compiled_policy_header=compiled_policy_header,
             compiled_policy_id=compiled_policy_id,
+            policy_parameter_names=tuple(parameter_names),
         )
         if hosts:
             _execution_inputs(config, remote=True)
@@ -531,10 +488,8 @@ def _execution_inputs(config: RunConfig, *, remote: bool) -> dict[str, str]:
     }
     if (price_feed := config.scenario.get("price_feed")) is not None:
         inputs["price_feed"] = price_feed
-    if (cex_depth := config.scenario.get("cex_depth")) is not None:
-        inputs["cex_depth"] = cex_depth
-    if (observed_state := config.scenario.get("observed_state")) is not None:
-        inputs["observed_state"] = observed_state
+    if (block_tape := config.scenario.get("block_tape")) is not None:
+        inputs["block_tape"] = block_tape
     if config.compiled_policy_header is not None:
         inputs["policy_header"] = str(config.compiled_policy_header)
     if remote:
@@ -555,6 +510,8 @@ def _execution_inputs(config: RunConfig, *, remote: bool) -> dict[str, str]:
                 relative = Path(value).resolve().relative_to(workspace)
             except ValueError as exc:
                 raise ConfigError(f"remote {name} path must be inside {workspace}") from exc
+            if name == "policy_header" and relative.parts[:2] == ("curve-fx-optimization", "reports"):
+                raise ConfigError("remote policy headers must live outside curve-fx-optimization/reports (not transferred)")
             mapped[name] = str(REMOTE_BASE.joinpath(*relative.parts))
         return mapped
     return inputs

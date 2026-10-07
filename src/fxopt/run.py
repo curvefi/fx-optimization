@@ -111,13 +111,12 @@ class GridLeases(Sequence):
 
 def _shuffled_block_leases(
     total: int, block_size: int, batch_size: int, slots: int,
-    *, seed: int = _BLOCK_SHUFFLE_SEED,
 ) -> GridLeases:
     if total < 1 or block_size < 1 or batch_size < 1 or slots < 1:
         raise ValueError("total, block size, batch size, and slots must be positive")
     count = (total + block_size - 1) // block_size
     blocks = np.arange(count, dtype=np.uint32 if count <= 2**32 else np.uint64)
-    random.Random(seed).shuffle(blocks)
+    random.Random(_BLOCK_SHUFFLE_SEED).shuffle(blocks)
     return GridLeases(blocks, total, block_size, max(1, batch_size // block_size) * slots)
 
 
@@ -165,7 +164,7 @@ def stage_remote_run(config: RunConfig) -> str:
     remote_inputs = _execution_inputs(config, remote=True)
     datasets = dataset_metadata(local_inputs)
     first = config.hosts[0]
-    for name in ("template", "market", "price_feed", "cex_depth", "observed_state"):
+    for name in ("template", "market", "price_feed", "block_tape"):
         if name in remote_inputs:
             ensure_remote_file(
                 first,
@@ -239,10 +238,8 @@ def open_session_request(config: RunConfig, *, remote: bool | None = None) -> di
     }
     if (price_feed := inputs.get("price_feed")) is not None:
         request["price_feed_path"] = price_feed
-    if (cex_depth := inputs.get("cex_depth")) is not None:
-        request["cex_depth_path"] = cex_depth
-    if (observed_state := inputs.get("observed_state")) is not None:
-        request["observed_state_path"] = observed_state
+    if (block_tape := inputs.get("block_tape")) is not None:
+        request["block_tape_path"] = block_tape
     if (yb_mode := config.scenario.get("yb_mode")) is not None:
         request.setdefault("yb_mode", yb_mode)
     return request
@@ -251,7 +248,6 @@ def open_session_request(config: RunConfig, *, remote: bool | None = None) -> di
 def run_metadata(
     config: RunConfig,
     *,
-    effective_batch: int,
     origin_workspace: Path | None = None,
     origin_config: Path | None = None,
 ) -> dict[str, Any]:
@@ -270,32 +266,21 @@ def run_metadata(
             raise ConfigError(f"coordinator replay path must be below {REMOTE_BASE}") from exc
         return str(origin_workspace.joinpath(*relative.parts))
 
-    for key in ("template_path", "market_path", "price_feed_path", "cex_depth_path", "observed_state_path"):
+    for key in ("template_path", "market_path", "price_feed_path", "block_tape_path"):
         if key in replay_session:
             replay_session[key] = replay_path(replay_session[key])
     config_path = origin_config or config.path
     config_parent = config_path.parent
-    origin = "external"
-    for parent in config_path.parents:
-        if (
-            parent.parent.name == "configs"
-            and parent.name in {"autoresearch", "experiments"}
-        ):
-            origin = parent.name
-            break
     metadata = {
         "config": str(config_path),
-        "config_origin": origin,
         "evaluator": inputs["evaluator"],
         "template": inputs["template"],
         **({"market": inputs["market"]} if "market" in inputs else {}),
-        "placement": "ssh" if config.hosts else "local",
+        "placement": "machine_workers" if config.hosts else "local",
         "hosts": list(config.hosts),
         "numa_nodes": list(config.numa_nodes),
         "batch_size": config.batch_size,
-        "effective_batch_size": effective_batch,
         "workers": config.workers,
-        "metric_fields": list(config.metric_fields),
         "axes": {name: list(grid.axes[name]) for name in sorted(grid.axes)},
         "shape": list(grid.shape),
         "candidate_defaults": config.candidate.defaults,
@@ -315,6 +300,7 @@ def run_metadata(
         metadata["compiled_policy"] = {
             "id": config.compiled_policy_id,
             "header": inputs["policy_header"],
+            **({"parameter_names": list(config.policy_parameter_names)} if config.policy_parameter_names else {}),
         }
     return metadata
 
@@ -380,7 +366,7 @@ def _run(
     grid, compact_grid = _grid_request(config)
     total = len(grid)
     batch_size = min(config.batch_size, total)
-    metadata = run_metadata(config, effective_batch=batch_size)
+    metadata = run_metadata(config)
     metadata["execution_order"] = {
         "kind": "contiguous_ranges_v1",
         "block_size": batch_size,
@@ -456,7 +442,6 @@ def _run_leased_worker(
             "worker_index": worker_index,
             "block_size": block_size,
             "batch_size": batch_size,
-            "seed": _BLOCK_SHUFFLE_SEED,
         },
         metric_names=metric_names,
     )
@@ -664,13 +649,12 @@ def run_distributed_config(
 ) -> ArtifactPaths:
     """Launch one portable machine worker per placement and merge its partition."""
     config = RunConfig.from_toml(config_path)
-    if not config.hosts or not config.metric_fields:
-        raise ConfigError("distributed grids require hosts and metric fields")
+    if not config.hosts:
+        raise ConfigError("distributed grids require hosts")
     total = len(config.candidate.grid())
     batch_size = _evaluator_batch_size(config, total)
     metadata = run_metadata(
         config,
-        effective_batch=batch_size,
         origin_workspace=(
             None if origin_workspace is None else Path(origin_workspace).resolve()
         ),
@@ -900,14 +884,12 @@ def run_distributed_config(
         progress.close()
         progress_closed = True
 
-        metadata["placement"] = "machine_workers"
         metadata["execution_order"] = {
             "kind": "dynamic_shuffled_leases_v1",
             "block_size": block_size,
             "batch_size": batch_size,
             "lease_size": leases.max_rows,
             "lease_count": len(leases),
-            "seed": _BLOCK_SHUFFLE_SEED,
             "worker_count": len(active),
         }
         metadata["worker_stats"] = [
@@ -922,7 +904,6 @@ def run_distributed_config(
             }
             for index, (host, receipt) in sorted(receipts.items())
         ]
-        metadata["transport"] = "heartbeat_and_partition"
         if errors:
             metadata["worker_errors"] = errors
         calculation_times = [

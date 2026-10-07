@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -194,7 +195,7 @@ def _axis_view(
             positional=True,
             logarithmic=False,
         )
-    name = axis.names[0]
+    name = axis.display_name or axis.names[0]
     positional = len(numeric) > 1 and not bool(np.all(np.diff(numeric) > 0))
     display_name, labels = _axis_name_and_labels(name, numeric.tolist())
     centers = np.arange(len(numeric), dtype=float) if positional else numeric
@@ -269,8 +270,9 @@ def _metric_scale_info(metric: str) -> tuple[float, str]:
         else 1.0
     )
     percent = (
-        key in {"vpminusone", "apy"}
+        key in {"vpminusone", "apy", "pool_nav_vs_hold", "pool_nav_vs_hold_masked"}
         or "apy" in key
+        or re.fullmatch(r"yb_gm\d+(_unfloored)?(_masked)?", key) is not None
         or "tw_real_slippage" in key
         or "geom_mean" in key
         or "rel_price_diff" in key
@@ -631,17 +633,12 @@ class HeatmapExplorer:
         label_font = max(8, tick_font + 2)
         title_font = max(label_font, tick_font + 4)
         for index, (axis, metric) in enumerate(zip(self._metric_axes, self.state.tiles, strict=True)):
-            tile_mask = (
-                self.state.mask
-                if is_masked_metric(metric, self.dataset.metrics)
-                else MaskSpec()
-            )
             values = self.dataset.slice_metric(
                 metric,
                 x_axis=x_axis.key,
                 y_axis=y_axis.key,
                 fixed_indices=self.state.slider_indices,
-                mask=tile_mask,
+                mask=self.state.mask,
             )
             metric_scale, metric_suffix = _metric_scale_info(metric)
             display_values = np.ma.masked_invalid(values) * metric_scale
@@ -704,12 +701,7 @@ class HeatmapExplorer:
                 self.dataset.point(indices)
             except ValueError:
                 return ""
-            tile_mask = (
-                self.state.mask
-                if is_masked_metric(metric, self.dataset.metrics)
-                else MaskSpec()
-            )
-            value = self.dataset.metric_array(metric, tile_mask)[tuple(indices)]
+            value = self.dataset.metric_array(metric, self.state.mask)[tuple(indices)]
             return (
                 f"x={x_view.labels[xi]}, y={y_view.labels[yi]}, "
                 f"{metric}={format_metric_value(metric, value)}"
@@ -751,12 +743,7 @@ class HeatmapExplorer:
             )
             metrics = []
             for metric in self.state.tiles:
-                tile_mask = (
-                    self.state.mask
-                    if is_masked_metric(metric, self.dataset.metrics)
-                    else MaskSpec()
-                )
-                value = self.dataset.metric_array(metric, tile_mask, selection=selection.grid_indices)
+                value = self.dataset.metric_array(metric, self.state.mask, selection=selection.grid_indices)
                 metrics.append(f"{metric}={format_metric_value(metric, value)}")
             print(
                 f"selection candidate={selection.candidate_id} ordinal={selection.ordinal} "

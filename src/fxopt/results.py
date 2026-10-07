@@ -286,7 +286,6 @@ class GridResultWriter:
         metadata: Mapping[str, Any],
         metric_names: Sequence[str],
         shard_rows: int = 65_536,
-        expected_count: int | None = None,
     ) -> None:
         if not isinstance(run_id, str) or not run_id.strip():
             raise ValueError("run_id must be a non-empty string")
@@ -301,12 +300,6 @@ class GridResultWriter:
             raise ValueError("metric names must be unique non-empty strings")
         if type(shard_rows) is not int or shard_rows < 1:
             raise ValueError("shard_rows must be a positive integer")
-        if expected_count is not None and (
-            type(expected_count) is not int
-            or expected_count < 1
-            or expected_count > total
-        ):
-            raise ValueError("expected count must be in [1, total]")
 
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -326,8 +319,8 @@ class GridResultWriter:
         self._metadata = dict(metadata)
         self._metric_names = names
         self._shard_rows = shard_rows
-        self._expected_count = total if expected_count is None else expected_count
-        self._partition = expected_count is not None
+        self._expected_count = total
+        self._partition = False
         self._written = np.zeros(total, dtype=np.bool_)
         self._ordinal_dtype = np.dtype("<u4" if total <= np.iinfo(np.uint32).max else "<u8")
         self._index_dtype = np.dtype(

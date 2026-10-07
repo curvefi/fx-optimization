@@ -1,29 +1,14 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import numpy as np
 import pytest
-from click.testing import CliRunner
 
-os.environ["MPLBACKEND"] = "Agg"
-
-from curve_fx_sim.plotting.heatmap import (
-    HeatmapAxis,
-    HeatmapDataset,
-    HeatmapValidationError,
-    MaskSpec,
-)
-from curve_fx_sim.plotting.masked_metrics import masked_metric_slippage_sources
-from curve_fx_sim.plotting.shiftclick_view import ROLLING_APY_WINDOW_S, _rolling_window_growth_apy
-from fxopt import Candidate, EvaluatorSession
-from fxopt.cli import main
-from fxopt.config import ConfigError
+from fxopt.config import ConfigError, RunConfig
 from fxopt.engine import ProjectedBatch
 from fxopt.results import GridResultWriter, merge_grid_partitions, read_result_columns
-from fxopt.config import RunConfig
 from fxopt.run import run_config, run_metadata, run_leased_worker
 
 
@@ -36,7 +21,7 @@ def _run_toml(
     session: str = "",
     yb_mode: str = "off",
     price_feed: str = "",
-    cex_depth: str = "",
+    block_tape: str = "",
     metrics: str = '["score"]',
     axes: str = "",
 ) -> Path:
@@ -54,7 +39,7 @@ metric_fields = {metrics}
 id = "scenario"
 {market_line}
 {price_feed}
-{cex_depth}
+{block_tape}
 yb_mode = "{yb_mode}"
 {compiled_policy}
 [candidate.defaults]
@@ -66,52 +51,30 @@ pool = {{}}
     return path
 
 
-def test_depth_config_omits_market_and_preserves_runtime_interval(tmp_path):
+def test_block_config_omits_market_and_candle_controls(tmp_path):
     from fxopt.run import open_session_request
     from curve_fx_harness_client.models import OpenSessionFrame
-    for mode in ("reference_2l", "active_2l"):
-        path = _run_toml(tmp_path/"depth.toml", market=None, yb_mode=mode,
-                         cex_depth='cex_depth = "book.npz"',
-                         session='[session]\nactor_timing_mode = "minute_sequential"\nobservation_interval_s = 37')
+    session = '[session]\nevent_mode = "block"\nevent_cursor = "fast_skip"'
+    for mode in ("off", "active_2l"):
+        path = _run_toml(tmp_path/"blocks.toml", market=None, yb_mode=mode,
+                         block_tape='block_tape = "blocks.npz"', session=session)
         config = RunConfig.from_toml(path)
         request = open_session_request(config)
         frame = OpenSessionFrame.model_validate(dict(request, request_id="r", session_id="s"))
-        assert frame.event_mode == "depth" and frame.observation_interval_s == 37
-        assert "market_path" not in request and "market" not in run_metadata(config, effective_batch=1)
-    with pytest.raises(ConfigError, match="requires NPZ"):
-        RunConfig.from_toml(_run_toml(tmp_path/"old.toml", cex_depth='cex_depth = "book.jsonl"'))
-
-
-def test_vp_margin_config_and_public_frame(tmp_path: Path) -> None:
-    from curve_fx_harness_client.models import OpenSessionFrame
-    from fxopt.run import open_session_request
-    from pydantic import ValidationError
-    base = dict(request_id="r", session_id="s", template_path="t", scenario_id="x", market_path="m")
-    for value in (None, 0, 1):
-        session = "" if value is None else f"[session]\nyb_min_net_profit_coin0 = {value}"
-        request = open_session_request(RunConfig.from_toml(_run_toml(tmp_path / "margin.toml", session=session)))
-        frame = OpenSessionFrame.model_validate(dict(request, request_id="r", session_id="s"))
-        assert ("yb_min_net_profit_coin0" in request) == (value is not None)
-        assert frame.model_dump(exclude_none=True).get("yb_min_net_profit_coin0") == value
-    assert not {"yb_min_net_profit_coin0", "state_reconciliation_mode", "equalization_interval_s", "equalization_delay_s"} & OpenSessionFrame(**base).model_dump(exclude_none=True).keys()
-    explicit = OpenSessionFrame(**base, state_reconciliation_mode="off", equalization_delay_s=0).model_dump(exclude_none=True)
-    assert explicit["state_reconciliation_mode"] == "off" and explicit["equalization_delay_s"] == 0
-    reconciled = open_session_request(RunConfig.from_toml(_run_toml(
-        tmp_path / "reconciled.toml", market=None, yb_mode="reference_2l",
-        cex_depth='cex_depth = "depth.npz"\nobserved_state = "observed.jsonl"',
-        session='[session]\nstate_reconciliation_mode = "on_price_scale_detach"\nactor_timing_mode = "minute_sequential"\nequalization_delay_s = 20')))
-    assert OpenSessionFrame.model_validate(dict(reconciled, request_id="r", session_id="s")).equalization_delay_s == 20
-    minute = open_session_request(RunConfig.from_toml(_run_toml(
-        tmp_path / "minute.toml", market=None, yb_mode="reference_2l", cex_depth='cex_depth = "deep.npz"',
-        session='[session]\nactor_timing_mode = "minute_sequential"')))
-    minute_frame = OpenSessionFrame.model_validate(dict(minute, request_id="r", session_id="s"))
-    assert minute_frame.actor_timing_mode == "minute_sequential"
-    assert minute_frame.event_mode == "depth" and minute_frame.dustswap_freq_s == minute_frame.user_swap_freq_s == 0
-    for bad in (-1., float("nan"), float("inf")):
-        with pytest.raises(ConfigError):
-            RunConfig.from_toml(_run_toml(tmp_path / "bad.toml", session=f"[session]\nyb_min_net_profit_coin0 = {bad}"))
-        with pytest.raises(ValidationError):
-            OpenSessionFrame.model_validate(dict(base, yb_min_net_profit_coin0=bad))
+        assert frame.event_mode == "block" and frame.block_tape_path.endswith("blocks.npz")
+        assert request["early_stop_max_7d_rel_price_diff"] == 0.3  # default pool stop
+        assert "market_path" not in request and "market" not in run_metadata(config)
+    for values, error in (({"block_tape": 'block_tape = "blocks.jsonl"'}, "requires NPZ"),
+                          ({"block_tape": 'block_tape = "blocks.npz"'}, "block events require"),
+                          ({"block_tape": 'trade_flow = "flow.npz"'}, "unsupported retired .scenario. option"),
+                          ({"market": None, "block_tape": 'block_tape = "blocks.npz"',
+                            "session": '[session]\nevent_mode = "block"\ncandle_filter = 10'}, "block events take no"),
+                          ({"session": '[session]\narb_settle_offset_s = 1'}, "arb_settle_offset_s requires"),
+                          ({"session": '[session]\nevent_mode = "trade_flow"'}, "event_mode must be candles or block"),
+                          ({"session": '[session]\narb_role = "taker"'}, "unsupported retired"),
+                          ({"yb_mode": "reference_2l"}, "yb_mode must be off or active_2l")):
+        with pytest.raises(ConfigError, match=error):
+            RunConfig.from_toml(_run_toml(tmp_path/"bad-blocks.toml", **values))
 
 
 def test_config_admission_table_covers_native_compiled_and_profiles(tmp_path: Path) -> None:
@@ -135,14 +98,10 @@ def test_config_admission_table_covers_native_compiled_and_profiles(tmp_path: Pa
             {"price_feed": 'price_feed = "nav.csv"'},
             None,
         ),
-        ("depth-exact-skip", {"market": None, "cex_depth": 'cex_depth = "book.npz"', "session": '[session]\nevent_mode = "depth"\nevent_cursor = "exact_skip"\nmetric_profile = "grid_core"'}, None),
-        ("depth-yb", {"cex_depth": 'cex_depth = "book.npz"', "yb_mode": "active_2l"}, None),
-        ("depth-reference-yb", {"cex_depth": 'cex_depth = "book.npz"', "yb_mode": "reference_2l"}, None),
-        (
-            "exact-skip-profile",
-            {"session": '[session]\nevent_cursor = "exact_skip"\nmetric_profile = "full_summary"'},
-            "exact_skip requires metric_profile='grid_core'",
-        ),
+        ("block", {"market": None, "block_tape": 'block_tape = "blocks.npz"', "session": '[session]\nevent_mode = "block"'}, None),
+        ("candles-yb", {"yb_mode": "active_2l"}, None),
+        ("retired-depth", {"session": '[session]\ncex_depth_max_age_s = 30'}, "unsupported retired"),
+        ("exact-skip", {"session": '[session]\nevent_cursor = "exact_skip"'}, "event_cursor must be scalar or fast_skip"),
         (
             "singleton-mismatch",
             {"axes": '[candidate.axes]\n"pool.A" = {start = 1, stop = 2, count = 1}'},
@@ -159,16 +118,10 @@ def test_config_admission_table_covers_native_compiled_and_profiles(tmp_path: Pa
             None,
         ),
         (
-            "grid-core-admission",
-            {"session": '[session]\nmetric_profile = "grid_core"', "yb_mode": "active_2l"},
-            "grid_core requires yb_mode='off' and slippage disabled",
-        ),
-        (
             "full-summary-yb-slippage",
             {
                 "session": (
                     '[session]\nevent_cursor = "scalar"\n'
-                    'metric_profile = "full_summary"\n'
                     "enable_slippage_probes = true"
                 ),
                 "yb_mode": "active_2l",
@@ -186,7 +139,7 @@ def test_config_admission_table_covers_native_compiled_and_profiles(tmp_path: Pa
         config = RunConfig.from_toml(config_path)
         if name == "compiled":
             assert config.compiled_policy_id == "compiled"
-            assert run_metadata(config, effective_batch=2)["expected_evaluator_policy"] == {
+            assert run_metadata(config)["expected_evaluator_policy"] == {
                 "policy_id": "compiled",
                 "policy_abi": "twocrypto_policy_v1",
                 "policy_parameter_count": 2,
@@ -197,11 +150,11 @@ def test_config_admission_table_covers_native_compiled_and_profiles(tmp_path: Pa
             assert config.scenario["yb_mode"] == "active_2l"
             assert config.session["enable_slippage_probes"] is True
         if name == "price-feed":
-            metadata = run_metadata(config, effective_batch=2)
+            metadata = run_metadata(config)
             assert metadata["open_session"]["price_feed_path"].endswith("nav.csv")
-        if name == "depth-exact-skip":
-            opened = run_metadata(config, effective_batch=2)["open_session"]
-            assert opened["cex_depth_path"].endswith("book.npz") and opened["cex_depth_max_age_s"] == 30 and opened["event_mode"] == "depth"
+        if name == "block":
+            opened = run_metadata(config)["open_session"]
+            assert opened["block_tape_path"].endswith("blocks.npz") and opened["event_mode"] == "block"
 
 
 class _GridClient:
@@ -284,7 +237,6 @@ def _write_partition(path: Path, ordinals: tuple[int, ...]) -> Path:
         path,
         run_id="partitioned",
         total=4,
-        expected_count=len(ordinals),
         metadata={"worker": path.name},
         metric_names=("score",),
     )
@@ -375,7 +327,7 @@ def test_worker_keeps_completed_rows_after_evaluator_failure(
     output = tmp_path / "partial-worker"
     merge_grid_partitions(
         output, (partition,), run_id="contract", total=4,
-        metadata=run_metadata(RunConfig.from_toml(config), effective_batch=2),
+        metadata=run_metadata(RunConfig.from_toml(config)),
         metric_names=("score",),
     )
     columns = read_result_columns(output)
@@ -383,308 +335,29 @@ def test_worker_keeps_completed_rows_after_evaluator_failure(
     np.testing.assert_equal(columns.metrics["score"], [0.0, 1.0, np.nan, np.nan])
 
 
-class _PointClient:
-    def __init__(self, *, fields: list[str] | None = None) -> None:
-        self.fields = fields or ["score", "apy"]
-        self.requests: list[dict[str, object]] = []
 
-    def start(self) -> None:
-        pass
+def test_replay_without_active_yb_drops_the_yb_actor_choice(tmp_path: Path) -> None:
+    from fxopt.config import EVALUATOR_POLICY_METADATA_KEY
+    from fxopt.contract import Candidate
+    from fxopt.shiftclick import trace_stored_candidate
 
-    def open_session(self, session_id: str, **request: object) -> None:
-        pass
+    seen: list[tuple[dict[str, object], list[dict[str, object]]]] = []
 
-    def register_grid(self, grid_id: str, grid: object, **request: object) -> None:
-        pass
+    class Client(_GridClient):
+        def evaluate_batch(self, candidates, **request):
+            seen.append((self.open_request, list(candidates)))
+            return {"results": [{"candidate_id": c["candidate_id"], "status": "ok", "metrics": {}} for c in candidates]}
 
-    def evaluate_batch(self, candidates: list[dict[str, object]], **request: object) -> dict[str, object]:
-        self.requests.append(request)
-        return {
-            "metric_fields": self.fields,
-            "results": [
-                {"candidate_id": item["candidate_id"], "metrics": [2.0, 0.1]}
-                for item in reversed(candidates)
-            ],
-        }
-
-    def close_session(self, session_id: str | None = None) -> None:
-        pass
-
-    def shutdown(self) -> None:
-        pass
-
-
-def test_candidate_keeps_exact_integer_overrides_and_owns_input_copy() -> None:
-    overrides = {"precisions": [1, 10**18 - 1]}
-    candidate = Candidate("exact", pool_overrides=overrides)
-    overrides["precisions"][1] = 2
-    assert candidate.to_dict(ordinal=0)["pool_overrides"] == {"precisions": [1, 10**18 - 1]}
-
-
-def test_point_batch_preserves_candidate_identity_and_metric_schema() -> None:
-    client = _PointClient()
-    with EvaluatorSession(
-        lambda: client,
-        session_id="points",
-        metric_fields=("score", "apy"),
-    ) as session:
-        results = session.evaluate((Candidate("b", [2]), Candidate("a", [1])))
-
-    assert [result.candidate_id for result in results] == ["b", "a"]
-    assert [result.ordinal for result in results] == [0, 1]
-    assert [dict(result.metrics) for result in results] == [
-        {"score": 2.0, "apy": 0.1},
-        {"score": 2.0, "apy": 0.1},
-    ]
-    assert client.requests[0]["metric_fields"] == ["score", "apy"]
-    assert client.requests[0]["metrics_format"] == "array"
-
-
-def _write_heatmap_result(path: Path) -> Path:
-    writer = GridResultWriter(
-        path,
-        run_id="heatmap",
-        total=4,
-        metadata={
-            "candidate_defaults": {"policy_params": [], "pool": {}},
-            "axes": {"pool.A": [1, 2], "pool.donation_apy": [0.0, 0.1]},
-            "shape": [2, 2],
-        },
-        metric_names=("score",),
-    )
-    writer.append_projected(
-        range(4),
-        ProjectedBatch(
-            ("score",),
-            tuple(
-                {
-                    "candidate_id": f"p{ordinal:08d}",
-                    "status": "ok",
-                    "metrics": [float(ordinal)],
-                }
-                for ordinal in range(4)
-            ),
-        ),
-    )
-    writer.finalize()
-    return path
-
-
-def test_public_heatmap_command_reads_run_json_and_results_npz(tmp_path: Path) -> None:
-    result_dir = _write_heatmap_result(tmp_path / "run")
-    output = tmp_path / "heatmap.png"
-    result = CliRunner().invoke(
-        main,
-        [
-            "heatmap",
-            str(result_dir),
-            "--metric",
-            "score",
-            "--x",
-            "pool.A",
-            "--y",
-            "pool.donation_apy",
-            "--columns",
-            "2",
-            "--output",
-            str(output),
-            "--no-show",
-        ],
-    )
-    assert result.exit_code == 0, result.output
-    state = json.loads(output.with_suffix(".state.json").read_text())
-    assert output.is_file() and output.stat().st_size > 0
-    assert state["data"]["shape"] == [2, 2]
-    assert state["metric"] == "score"
-    assert state["x_axis"] == "pool.A"
-    assert state["y_axis"] == "pool.donation_apy"
-
-
-def _mask_dataset(*, omit: str | None = None) -> HeatmapDataset:
-    metrics: dict[str, np.ndarray] = {
-        "apy_net": np.ones((2, 2)),
-        "max_7d_rel_price_diff": np.array([[0.001, 0.003], [-1.0, 0.002]]),
-        "detach_energy_ungated": np.array([[0.0, 1.0], [2.0, 3.0]]),
-        "final_rel_price_diff": np.array([[0.001, 0.003], [-1.0, 0.002]]),
-        "tw_real_slippage_1pct": np.array([[0.001, -1.0], [0.003, 0.002]]),
+    metadata = {
+        "replay": {"evaluator": "evaluator", "work_dir": str(tmp_path),
+                   "open_session": {"yb_mode": "active_2l", "yb_arb": "none", "metric_profile": "full_summary"}},
+        EVALUATOR_POLICY_METADATA_KEY: {"policy_id": "p", "policy_abi": "1", "policy_parameter_count": 0},
     }
-    if omit is not None:
-        metrics.pop(omit)
-    return HeatmapDataset(
-        axes=(HeatmapAxis(("x",), (1, 2)), HeatmapAxis(("y",), (10, 20))),
-        metrics=metrics,
-        valid=np.ones((2, 2), dtype=bool),
-    )
-
-
-def test_generic_mask_thresholds_fail_closed_and_require_source_metrics() -> None:
-    cases = (
-        (MaskSpec(), None, 4),
-        (MaskSpec(max_price_diff_bps=20), "max_7d_rel_price_diff", 2),
-        (MaskSpec(max_detach_energy=1), "detach_energy_ungated", 2),
-        (MaskSpec(max_final_price_diff_bps=20), "final_rel_price_diff", 2),
-        (MaskSpec(slippage_thr_bps=20), "tw_real_slippage_1pct", 2),
-    )
-    for mask, source, expected in cases:
-        dataset = _mask_dataset()
-        whole = dataset.metric_array("apy_net_masked", mask)
-        assert np.isfinite(whole).sum() == expected
-        np.testing.assert_equal(
-            dataset.slice_metric("apy_net_masked", x_axis="x", y_axis="y", fixed_indices={}, mask=mask),
-            whole.T,
-        )
-        if source is not None:
-            with pytest.raises(HeatmapValidationError, match="mask metric.*unavailable"):
-                _mask_dataset(omit=source).metric_array("apy_net_masked", mask)
-
-
-def test_legacy_apy_mask_aliases_use_matching_slippage_sources() -> None:
-    dataset = _mask_dataset()
-    dataset.metrics["max_7d_rel_price_diff"] = np.full((2, 2), 0.001)
-    dataset.metrics["tw_real_slippage_5pct"] = np.array(
-        [[0.003, 0.001], [0.003, 0.001]]
-    )
-    mask = MaskSpec(slippage_thr_bps=20)
-
-    assert np.isfinite(dataset.metric_array("apy_masked", mask)).all()
-    assert np.isfinite(dataset.metric_array("apy_1_masked", mask)).tolist() == [
-        [True, False],
-        [False, True],
-    ]
-    assert np.isfinite(dataset.metric_array("apy_5_masked", mask)).tolist() == [
-        [False, True],
-        [False, True],
-    ]
-    assert np.isfinite(
-        dataset.metric_array("tw_real_slippage_5pct_masked", mask)
-    ).all()
-    assert masked_metric_slippage_sources(
-        ("apy_masked", "apy_1_masked", "apy_5_masked"), dataset.metrics
-    ) == ("tw_real_slippage_1pct", "tw_real_slippage_5pct")
-
-
-def test_rolling_growth_leaves_nonfinite_windows_unavailable() -> None:
-    timestamps = np.array([0.0, ROLLING_APY_WINDOW_S])
-    for growth in (np.array([1.0, np.nan]), np.array([1.0, np.inf]), np.array([np.inf, 1.0])):
-        rolling, floored = _rolling_window_growth_apy(timestamps, growth)
-        assert np.isnan(rolling[1]) and not floored[1]
-    rolling, floored = _rolling_window_growth_apy(timestamps, np.array([1.0, 0.0]))
-    assert rolling[1] == 0.0 and floored[1]
-
-
-class _TraceClient:
-    def __init__(self, trace_paths: dict[str, Path]) -> None:
-        self.trace_paths = trace_paths
-        self.payloads: list[dict[str, object]] = []
-        self.open_requests: list[dict[str, object]] = []
-        self.mode = "off"
-
-    def start(self) -> None:
-        pass
-
-    def open_session(self, session_id: str, **request: object) -> None:
-        self.open_requests.append(request)
-        self.mode = str(request["yb_mode"])
-
-    def evaluate_batch(self, candidates: list[dict[str, object]], **request: object) -> dict[str, object]:
-        self.payloads.extend(candidates)
-        item = candidates[0]
-        return {
-            "results": [{
-                "candidate_id": item["candidate_id"],
-                "status": "ok",
-                "metrics": {"score": 1.0, "apy_net": 0.123, "apy_net_gm": 0.045},
-                "artifacts": {
-                    "trace_path": str(self.trace_paths[self.mode]),
-                    "effective_inputs": {"pool.donation_frequency": 3600.0},
-                },
-            }],
-        }
-
-    def close_session(self, session_id: str | None = None) -> None:
-        pass
-
-    def shutdown(self) -> None:
-        pass
-
-
-def test_stored_ordinal_replay_passes_exact_candidate_for_yb_off_and_enabled(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from fxopt.explorer import open_fxopt_explorer
-
-    run_dir = _write_heatmap_result(tmp_path / "run")
-    manifest = json.loads((run_dir / "run.json").read_text())
-    manifest["metadata"].update(
-        {
-            "expected_evaluator_policy": {
-                "policy_id": "none",
-                "policy_abi": "none",
-                "policy_parameter_count": 0,
-            },
-            "replay": {
-                "evaluator": str(tmp_path / "evaluator"),
-                "work_dir": str(tmp_path),
-                "open_session": {
-                    "scenario_id": "scenario",
-                    "yb_mode": "off",
-                },
-            },
-        }
-    )
-    (run_dir / "run.json").write_text(json.dumps(manifest))
-    trace_paths: dict[str, Path] = {}
-    for mode in ("off", "active_2l"):
-        trace_paths[mode] = tmp_path / f"{mode}.json"
-        trace_paths[mode].write_text(json.dumps([
-            {
-                "t": 1_700_000_000 + index * 8_640_000,
-                "price_scale": 1.0,
-                "p_cex": 1.0,
-                "token0": 1_000.0,
-                "token1": 1_000.0,
-                "fee": 0.001,
-                "slippage_1pct_0to1": 0.001,
-                "slippage_1pct_1to0": 0.001,
-                "lp_xcp_profit": 1.0 + index * 0.01,
-                "donation_apy": 0.02,
-                "yb_initialized": float(mode != "off"),
-                "yb_growth": 1.0 + index * 0.01 if mode != "off" else None,
-            }
-            for index in range(2)
-        ]))
-    clients: list[_TraceClient] = []
-
-    def local_factory(*_args: object, **_kwargs: object):
-        client = _TraceClient(trace_paths)
-        clients.append(client)
-        return lambda: client
-
-    monkeypatch.setattr("fxopt.shiftclick.local_client_factory", local_factory)
-    ordinal = 3
-    explorer = open_fxopt_explorer(
-        run_dir,
-        metrics=("score",),
-        x_axis="pool.A",
-        y_axis="pool.donation_apy",
-        max_price_diff_bps=None,
-    )
-    try:
-        selection = explorer.dataset.point((1, 1))
-        assert selection.ordinal == ordinal and selection.candidate_id == "p00000003"
-        shift_figure = explorer.on_replay(selection, "shift")
-        right_figure = explorer.on_replay(selection, "right")
-        for figure in (shift_figure, right_figure):
-            assert any("12.3%" in axis.get_title() for axis in figure.axes)
-        assert not (run_dir / "inspections").exists()
-    finally:
-        explorer.close()
-        from matplotlib import pyplot as plt
-        plt.close("all")
-
-    assert [client.open_requests[0]["yb_mode"] for client in clients] == [
-        "active_2l", "off"
-    ]
-    assert clients[0].open_requests[0]["yb_cash_multiplier"] == 3.0
-    assert "yb_cash_multiplier" not in clients[1].open_requests[0]
-    assert all(client.payloads[0]["candidate_id"] == "p00000003" for client in clients)
+    candidate = Candidate("c0", (), {"run": {"arb_report_offset": 1}})
+    for yb_mode in ("off", "active_2l"):
+        trace_stored_candidate("run", metadata, candidate=candidate, ordinal=0, output_dir=tmp_path / yb_mode,
+                               yb_mode=yb_mode, client_factory=Client)
+    (off_session, off_batch), (active_session, active_batch) = seen
+    assert "yb_arb" not in off_session and active_session["yb_arb"] == "none"
+    assert "metric_profile" not in off_session and "metric_profile" not in active_session
+    assert off_batch[0]["pool_overrides"] == active_batch[0]["pool_overrides"] == {"run": {"arb_report_offset": 1}}
