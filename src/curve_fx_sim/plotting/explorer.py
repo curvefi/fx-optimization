@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 import os
-import re
 import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -272,7 +271,6 @@ def _metric_scale_info(metric: str) -> tuple[float, str]:
     percent = (
         key in {"vpminusone", "apy", "pool_nav_vs_hold", "pool_nav_vs_hold_masked"}
         or "apy" in key
-        or re.fullmatch(r"yb_gm\d+(_unfloored)?(_masked)?", key) is not None
         or "tw_real_slippage" in key
         or "geom_mean" in key
         or "rel_price_diff" in key

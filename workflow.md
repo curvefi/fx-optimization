@@ -525,7 +525,7 @@ Retain and report at least:
 yb_apy
 yb_apy_gm
 yb_final_growth
-yb_gm_floored_windows and yb_gm_floor_share
+yb_apy_gm90_floor_share
 yb_releverage_trades
 apy_net and apy_net_gm
 max_7d_rel_price_diff and detach_energy_ungated

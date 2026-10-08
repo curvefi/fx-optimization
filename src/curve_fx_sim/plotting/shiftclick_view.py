@@ -1,6 +1,6 @@
 """Multi-panel Shift-click view for raw evaluator traces.
 
-The view contains stacked shared-x panels for prices, rolling 90d annualized LP
+The view contains stacked shared-x panels for prices, rolling 60d annualized LP
 net APY with GM floor shading, YB releverage APY and balance sheet, pool skew
 with binned pool fee, and 1% TVL slippage over a datetime axis. Input is the
 raw evaluator JSON trace produced by Shift-click.
@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 SEC_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
-ROLLING_APY_WINDOW_DAYS = 90
+ROLLING_APY_WINDOW_DAYS = 60
 ROLLING_APY_WINDOW_S = float(ROLLING_APY_WINDOW_DAYS) * 24.0 * 60.0 * 60.0
 DEFAULT_MAX_POINTS = 10_000
 
@@ -157,7 +157,7 @@ def _load_embedded_yb_path(detailed: Mapping[str, np.ndarray], max_points: int, 
     summary = {
         "fee": float(finite_fees[-1]) if len(finite_fees) else None,
         "apy": metrics.get("yb_apy", np.nan),
-        "apy_gm": metrics.get("yb_apy_gm", np.nan),
+        "apy_gm": metrics.get(f"yb_apy_gm{ROLLING_APY_WINDOW_DAYS}", np.nan),
         "n_releverage_trades": int(trades[mask][-1]) if trades is not None else None,
     }
     return _make_yb_path(t, growth, summary, "pool trace", max_points)
@@ -236,7 +236,7 @@ def _plot_yb_axis(ax, yb_path):
     source = yb_path.get("source", "unknown source")
     title_parts = []
     if isinstance(final_apy, (int, float)):
-        title_parts.append(f"APY={final_apy * 100.0:.3g}% (GM={_format_pct(gm_apy)})")
+        title_parts.append(f"APY={final_apy * 100.0:.3g}% ({ROLLING_APY_WINDOW_DAYS}d GM={_format_pct(gm_apy)})")
     if isinstance(fee, (int, float)):
         title_parts.append(f"fee={fee * 100.0:.3g}%")
     if isinstance(trades, (int, float)):
@@ -436,7 +436,7 @@ def render_shiftclick_figure(
     with np.errstate(invalid="ignore", divide="ignore"):
         net_lp_growth = lp_xcp_profit / donation_growth
     lp_net_apy = metrics.get("apy_net", np.nan)
-    lp_gm_apy = metrics.get("apy_net_gm", np.nan)
+    lp_gm_apy = metrics.get(f"apy_net_gm{ROLLING_APY_WINDOW_DAYS}", np.nan)
     rolling_apy, rolling_floored = _rolling_window_growth_apy(timestamps, net_lp_growth)
     val0 = token0
     val1 = token1 * p_cex
@@ -521,7 +521,9 @@ def render_shiftclick_figure(
         )
     ax_apy.axhline(0, color="black", linewidth=0.7)
     ax_apy.set_ylabel(f"{ROLLING_APY_WINDOW_DAYS}d lp_xcp net APY (%)")
-    ax_apy.set_title(f"LP net APY={_format_pct(lp_net_apy)} (GM={_format_pct(lp_gm_apy)})", fontsize=10)
+    ax_apy.set_title(
+        f"LP net APY={_format_pct(lp_net_apy)} ({ROLLING_APY_WINDOW_DAYS}d GM={_format_pct(lp_gm_apy)})",
+        fontsize=10)
     ax_apy.legend(loc="upper left")
     ax_apy.grid(True, alpha=0.3)
     ax_apy_growth = ax_apy.twinx()
