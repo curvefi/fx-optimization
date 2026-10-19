@@ -44,7 +44,6 @@ class ArtifactPaths:
 class ResultColumns:
     """Selected NumPy columns plus lazy access to one stored candidate."""
 
-    root: Path
     run_id: str
     metadata: Mapping[str, Any]
     available_metrics: tuple[str, ...]
@@ -74,9 +73,6 @@ class ResultColumns:
         if code < 0 or code >= len(_CODE_TO_STATUS):
             raise ValueError(f"invalid stored status code: {code}")
         return _CODE_TO_STATUS[code]
-
-    def error_at(self, row: int) -> str | None:
-        return self.failures.get(int(self.ordinals[row]))
 
     def candidate_at(self, ordinal: int) -> Candidate:
         """Construct only the candidate selected by its stored result ordinal."""
@@ -262,7 +258,6 @@ def read_result_columns(
     if np.any(status_codes >= len(_CODE_TO_STATUS)):
         raise ValueError("grid result contains an invalid status")
     return ResultColumns(
-        root=root,
         run_id=run_id,
         metadata=dict(metadata),
         available_metrics=metric_names,

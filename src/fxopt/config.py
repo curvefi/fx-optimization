@@ -84,11 +84,8 @@ def _number_value(value: Decimal) -> int | float:
 
 
 def _axis_values(spec: object, label: str) -> tuple[Any, ...]:
-    multiplier: Decimal | None = None
     targets: tuple[str, ...] = ()
     if isinstance(spec, Mapping):
-        if "multiply" in spec:
-            multiplier = _decimal(spec["multiply"], f"{label}.multiply")
         if "targets" in spec:
             raw_targets = spec["targets"]
             if (
@@ -114,10 +111,6 @@ def _axis_values(spec: object, label: str) -> tuple[Any, ...]:
         raise ConfigError(f"{label}.values must be an array")
     if not values:
         raise ConfigError(f"{label}.values must not be empty")
-    if multiplier is not None:
-        values = tuple(
-            _number_value(_decimal(value, f"{label}.value") * multiplier) for value in values
-        )
     if targets:
         if any(isinstance(value, Mapping) for value in values):
             raise ConfigError(f"{label}.targets requires scalar values")

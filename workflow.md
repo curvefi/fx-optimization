@@ -61,9 +61,12 @@ Do not borrow manifests, commands, YB modes, or result schemas from
 authority for a run; the source TOML under ignored `configs/autoresearch/` is
 only a convenient recipe.
 
-There is currently no supported `fxopt optimize` or Nevergrad surface. Use the
-registered-grid runner for exhaustive work. Do not add optimizer state or an
-ask/tell loop merely to complete an ordinary grid campaign.
+`fxopt` has no optimizer surface; use the registered-grid runner for exhaustive
+work. The one Nevergrad tool, `scripts/nevergrad_12x12_cluster.py`, polishes a
+single slice of a completed grid inside a small donation × RPF window (see the
+README for it and for the report_lean keeper grids of `scripts/yb_lean_study.py`).
+Do not add optimizer state or an ask/tell loop merely to complete an ordinary
+grid campaign.
 
 Use a workbench layout like:
 
@@ -108,7 +111,7 @@ old winner under its original objective.
 Useful objective lanes are:
 
 ```text
-consistency-first: apy_net_robust_90d, then lp_detach_score
+consistency-first: apy_net_robust_90d, then its axial-star floor
 raw-yield gate:    require minimum apy_net, then maximize neighborhood floor
 balanced earnings: sqrt(max(apy_net,0) * max(apy_net_gm,0))
 YB consistency:    yb_apy_gm, with LP and attachment constraints independent
@@ -220,7 +223,7 @@ ranges over premature density. Retain at least:
 apy_net
 apy_net_robust_90d
 max_7d_rel_price_diff
-detach_energy_ungated
+final_rel_price_diff
 trades
 n_rebalances
 elapsed_ms
@@ -302,7 +305,7 @@ env -u VIRTUAL_ENV UV_CACHE_DIR=/tmp/uv-cache \
   uv run --no-sync fxopt heatmap runs/RUN \
   --metric apy_net_masked \
   --metric apy_net_robust_90d_masked \
-  --metric detach_energy_ungated \
+  --metric final_rel_price_diff \
   --metric max_7d_rel_price_diff \
   --max-price-diff-bps PRICE_LIMIT_BPS \
   --columns 2
@@ -316,14 +319,14 @@ Run hard filters before ranking:
 ```sh
 env -u VIRTUAL_ENV UV_CACHE_DIR=/tmp/uv-cache \
   uv run --no-sync python scripts/analyze_basins.py runs/RUN \
-  --rank apy-net-robust \
+  --metric apy_net_robust_90d \
   --max-price-diff-bps PRICE_LIMIT_BPS \
-  --max-fee-bps FEE_CEILING_BPS \
+  --final-price-diff-bps FINAL_LIMIT_BPS \
   --top 100
 ```
 
-Available rank modes are `lp-score`, `score`, `gm`, `yb-gm`, and
-`apy-net-robust`. `--max-fee-bps` is inclusive.
+`--metric` takes any stored metric; higher values rank first and `--min` sets a
+floor. Express fee ceilings as grid bounds or in a campaign-local analysis.
 
 For each result report:
 
@@ -468,7 +471,7 @@ Compare:
 ```text
 hard-feasibility flips
 point and star floors
-worst max 7-day price difference and detach energy
+worst max 7-day and final price difference
 trades and rebalances
 worst mismatching arm
 ```
@@ -528,7 +531,7 @@ yb_final_growth
 yb_apy_gm90_floor_share
 yb_releverage_trades
 apy_net and apy_net_gm
-max_7d_rel_price_diff and detach_energy_ungated
+max_7d_rel_price_diff and final_rel_price_diff
 donations and donation_coin0_total
 trades and n_rebalances
 ```

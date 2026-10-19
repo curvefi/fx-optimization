@@ -17,7 +17,6 @@ from .masked_metrics import (
     is_masked_metric,
     masked_metric_slippage_source,
     masked_metric_source,
-    masked_metric_uses_detach,
     masked_metric_uses_slippage,
 )
 
@@ -168,7 +167,6 @@ class HeatmapAxis:
 @dataclass(frozen=True)
 class MaskSpec:
     max_price_diff_bps: float | None = None
-    max_detach_energy: float | None = None
     max_final_price_diff_bps: float | None = None
     slippage_thr_bps: float | None = None
 
@@ -177,17 +175,12 @@ class MaskSpec:
             if value is not None and (not math.isfinite(value) or value < 0):
                 raise HeatmapValidationError(f"{name} must be finite and nonnegative")
 
-    @property
-    def enabled(self) -> bool:
-        return any(value is not None for value in self.__dict__.values())
-
     def to_dict(self) -> dict[str, float | None]:
         # Core visual filters are always explicit in saved explorer state.
         # Slippage fields remain conditional because most grids do not load
         # those diagnostics.
         payload: dict[str, float | None] = {
             "max_price_diff_bps": self.max_price_diff_bps,
-            "max_detach_energy": self.max_detach_energy,
             "max_final_price_diff_bps": self.max_final_price_diff_bps,
         }
         if self.slippage_thr_bps is not None:
@@ -281,17 +274,7 @@ class HeatmapDataset:
                 | (pdiff < 0.0)
                 | (np.abs(pdiff) > mask.max_price_diff_bps / 10_000.0)
             ] = np.nan
-        uses_detach = masked_metric_uses_detach(name, self.metrics)
-        if mask.max_detach_energy is not None and uses_detach:
-            if "detach_energy_ungated" not in self.metrics:
-                raise HeatmapValidationError("detachment mask metric is unavailable")
-            detach = np.asarray(self.metrics["detach_energy_ungated"][selection], dtype=float)
-            values[
-                ~np.isfinite(detach)
-                | (detach < 0.0)
-                | (detach > mask.max_detach_energy)
-            ] = np.nan
-        if mask.max_final_price_diff_bps is not None and uses_detach:
+        if mask.max_final_price_diff_bps is not None:
             if "final_rel_price_diff" not in self.metrics:
                 raise HeatmapValidationError("final price-difference mask metric is unavailable")
             final_diff = np.asarray(self.metrics["final_rel_price_diff"][selection], dtype=float)

@@ -324,7 +324,6 @@ class HeatmapExplorer:
         x_axis: str | None = None,
         y_axis: str | None = None,
         max_pricethr: float | None = 100.0,
-        max_detach_energy: float | None = None,
         slipthr: float | None = None,
         final_pdiffthr: float | None = None,
         run_id: str | None = None,
@@ -360,7 +359,6 @@ class HeatmapExplorer:
         self.last_selection: HeatmapSelection | None = None
         mask = MaskSpec(
             max_price_diff_bps=max_pricethr,
-            max_detach_energy=max_detach_energy,
             max_final_price_diff_bps=final_pdiffthr,
             slippage_thr_bps=slipthr,
         )
@@ -603,7 +601,6 @@ class HeatmapExplorer:
         mask = self.state.mask
         values = {
             "max_price_diff_bps": mask.max_price_diff_bps,
-            "max_detach_energy": mask.max_detach_energy,
             "max_final_price_diff_bps": mask.max_final_price_diff_bps,
             "slippage_thr_bps": mask.slippage_thr_bps,
         }
@@ -771,7 +768,7 @@ class HeatmapExplorer:
                 self.dataset.point(indices)
             except ValueError:
                 return ""
-            value = self.dataset.metric_array(metric, self.state.mask)[tuple(indices)]
+            value = float(self.dataset.metric_array(metric, self.state.mask, selection=tuple(indices)))
             return (
                 f"x={x_view.labels[xi]}, y={y_view.labels[yi]}, "
                 f"{metric}={format_metric_value(metric, value)}"

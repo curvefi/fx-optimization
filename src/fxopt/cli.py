@@ -367,10 +367,9 @@ def worker_command(
               help="Render this numeric grid axis logarithmically; repeat as needed.")
 @click.option("--columns", type=click.IntRange(min=1), default=3, show_default=True)
 @click.option("--metric", "metrics", multiple=True,
-              default=("apy_net_robust_90d", "detach_energy_ungated", "max_7d_rel_price_diff"),
+              default=("apy_net_robust_90d", "max_7d_rel_price_diff"),
               show_default=True)
 @click.option("--max-price-diff-bps", type=float, default=100.0, show_default=True)
-@click.option("--max-detach-energy", type=click.FloatRange(min=0.0))
 @click.option("--slippage-bps", type=float)
 @click.option("--final-price-diff-bps", type=float)
 @click.option(
@@ -398,7 +397,6 @@ def heatmap_command(
     run_dir: Path, x_axis: str | None, y_axis: str | None,
     log_axes: tuple[str, ...], columns: int, metrics: tuple[str, ...],
     max_price_diff_bps: float,
-    max_detach_energy: float | None,
     slippage_bps: float | None,
     final_price_diff_bps: float | None,
     shiftclick_yb_mode: str,
@@ -419,7 +417,6 @@ def heatmap_command(
             run_dir, metrics=metrics, x_axis=x_axis, y_axis=y_axis,
             log_axes=log_axes, columns=columns,
             max_price_diff_bps=max_price_diff_bps,
-            max_detach_energy=max_detach_energy,
             slippage_bps=slippage_bps,
             final_price_diff_bps=final_price_diff_bps,
             shiftclick_yb_mode=shiftclick_yb_mode,

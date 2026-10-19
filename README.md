@@ -169,8 +169,12 @@ starting the supplied config. It refuses directories containing a detached-job
 handle and cannot be combined with the four remote job-control flags.
 
 `--transfer` rsyncs the pool, harness, and workflow sources once to the first
-configured blade. `--rebuild` implies transfer and builds the configured
-evaluator target—f64 or long double—once there. Dated market inputs remain
+configured blade (build trees, `_install*/` prefixes and repository `archive/`
+directories stay local). `--rebuild` implies transfer and builds the configured
+evaluator target—f64 or long double—once there, with the reference build flags
+(no native tuning, no IPO). It replaces the target's build directory, except
+one holding a `.fxopt-keep` marker: such a build serves stored runs and the
+rebuild stops instead. Dated market inputs remain
 copy-if-missing; the small pool template is refreshed through ordinary rsync.
 Workers send compact progress snapshots every two seconds and the coordinator
 prints one aggregate heartbeat every two seconds. Rate and ETA remain hidden
@@ -267,7 +271,7 @@ Open the mature interactive heatmap explorer directly (or save a PNG and its sta
 ```sh
 uv run fxopt heatmap runs/GRID
 uv run fxopt heatmap runs/GRID \
-  --metric apy_net_robust_90d_masked --metric detach_energy_ungated --columns 2 \
+  --metric apy_net_robust_90d_masked --metric max_7d_rel_price_diff --columns 2 \
   --max-price-diff-bps 1000 \
   --output runs/GRID/heatmap.png \
   --no-show
@@ -276,8 +280,8 @@ uv run fxopt heatmap runs/GRID \
 The explorer supports metric filters, slice-local color limits (or, with
 `--freeze-colorbar`, limits fixed to each metric's full-grid range under the
 current mask), an interactive
-adaptive limit for price difference, fixed CLI filters for detachment,
-slippage and final price difference, axis selection,
+adaptive limit for price difference, fixed CLI filters for final price
+difference and slippage, axis selection,
 and multi-metric views. `--columns` controls the panel layout. Clicking a cell
 selects its exact candidate. Right-click replays that candidate with YieldBasis
 disabled. Shift-left-click replays it with the configured YB mode. Plain left-click
@@ -287,22 +291,21 @@ use the local replay metrics.
 
 Raw panels never hide observations. Append `_masked` to any stored metric name
 to filter that panel by the interactive 7-day price-difference control and the
-fixed detachment limit—for example `apy_net_masked` or
+fixed CLI filters—for example `apy_net_masked` or
 `apy_net_robust_90d_masked` (`apy_masked` is an alias that shows `apy_net`).
 `--max-price-diff-bps` sets the initial threshold. The fixed
-`--max-detach-energy`, `--final-price-diff-bps` and `--slippage-bps` filters apply when explicitly
-provided; unsuffixed diagnostic panels remain unmasked.
+`--final-price-diff-bps` (absolute `final_rel_price_diff`) and `--slippage-bps`
+filters apply when explicitly provided; unsuffixed diagnostic panels remain unmasked.
 
 The legacy-compatible `apy_1_masked` and `apy_5_masked` views use `apy_net`
 and mask it against the matching 1%- or 5%-of-TVL slippage probe. Selecting
 either view adds an interactive slippage-cap slider (0-100 bp, 20 bp default).
 The raw `tw_real_slippage_*_masked` panels remain price-difference-masked only.
 
-No-YB discovery ranks `apy_net_robust_90d` with detachment. The earnings
+No-YB discovery ranks `apy_net_robust_90d`. The earnings
 metric gives equal weight to the mean and worst-5% mean of daily-sampled
 trailing-90-day net log returns, then converts that blended rate to APY.
-Negative weak regimes remain finite and rankable. `lp_detach_score` subtracts
-`2.5 * detach_energy_ungated` from the metric's log-growth form. This avoids
+Negative weak regimes remain finite and rankable. This avoids
 the positive floor and hourly power/log work of legacy `apy_net_gm`, which
 remains available in full reference and YB runs.
 
@@ -333,19 +336,22 @@ radii, configured evaluator path, validated policy contract, session settings,
 and local replay inputs. `results.npz` contains candidate results and metrics.
 Heatmaps and Shift-click use this bundle directly.
 
-Rank point values or exact axial stars without creating another manifest:
+Rank one stored metric, per cell or over exact axial stars, without creating
+another manifest:
 
 ```sh
-uv run python scripts/analyze_basins.py runs/RUN --rank score
-uv run python scripts/analyze_basins.py runs/RUN --rank yb-gm \
-  --min-lp-gm 0.05 --max-detach 5
-uv run python scripts/analyze_basins.py runs/RUN --rank apy-net-robust \
-  --max-price-diff-bps 2000 --max-fee-bps 200
+uv run python scripts/analyze_basins.py runs/RUN --metric yb_apy_gm30 \
+  --max-price-diff-bps 1000 --final-price-diff-bps 100
+uv run python scripts/analyze_basins.py runs/RUN --metric apy_net_robust_90d \
+  --max-price-diff-bps 2000 --min 0
 ```
 
-Override embedded robustness radii for a one-off analysis with
-`--robust AXIS=RADIUS`, for example
-`--robust pool.mid_fee=0.0002 --robust pool.out_fee=0.0002`.
+Higher values rank first; the price limits apply to `max_7d_rel_price_diff` and
+the absolute `final_rel_price_diff`. Override embedded robustness radii for a
+one-off analysis with `--robust AXIS=RADIUS`, for example
+`--robust pool.donation_apy=0.001 --robust pool.reserved_profit_fraction=0.01`;
+the ranked value is then the star minimum and each price limit applies to the
+star maximum.
 Do not copy evaluator or pool code into this repository. Run outputs are
 ordinary local artifacts and can be inspected or plotted again without
 rebuilding the grid.
@@ -357,8 +363,9 @@ git lfs pull --include="data/market/btcusd/**"
 ```
 
 Use `fxopt` for runs, heatmaps, replay, and remote lifecycle. The small
-`scripts/` surface contains event fair-price feed generation, basin analysis,
-and the cluster Python launcher;
+`scripts/` surface contains the heatmap launchers, the report_lean keeper-grid
+driver, the Nevergrad slice polisher, event fair-price feed generation, basin
+and blob analysis, and the cluster Python launcher;
 pool and evaluator implementation details stay in their sibling repositories.
 
 Compiled policies can provide optional heatmap labels in parameter order:

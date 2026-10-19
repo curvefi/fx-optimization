@@ -48,8 +48,6 @@ def _metric_columns(
         )
         if price_diff is not None:
             needed.add(price_diff)
-        if "detach_energy_ungated" in available_set:
-            needed.add("detach_energy_ungated")
         if need_final_price_diff and "final_rel_price_diff" in available_set:
             needed.add("final_rel_price_diff")
         slippage_source = masked_metric_slippage_source(name)
@@ -125,7 +123,6 @@ def open_fxopt_explorer(
     y_axis: str | None = None,
     log_axes: Sequence[str] = (),
     max_price_diff_bps: float | None = 100.0,
-    max_detach_energy: float | None = None,
     slippage_bps: float | None = None,
     final_price_diff_bps: float | None = None,
     shiftclick_yb_mode: str = "active_2l",
@@ -192,7 +189,6 @@ def open_fxopt_explorer(
         y_axis=aliases.get(y_axis, y_axis),
         log_axes=tuple(aliases.get(name, name) for name in log_axes),
         max_pricethr=max_price_diff_bps,
-        max_detach_energy=max_detach_energy,
         slipthr=slippage_bps,
         final_pdiffthr=final_price_diff_bps,
         run_id=results.run_id,

@@ -144,7 +144,7 @@ def transfer_workspace(host: str, workspace: str | Path) -> None:
     root = Path(workspace)
     excludes = (
         ".git/", ".venv/", ".venv-cluster/", "__pycache__/", "build/",
-        "build-*/", "_install/",
+        "build-*/", "_install*/", "/archive/",
     )
     for name in ("twocrypto-cpp", "curve-fx-arb-harness", "curve-fx-optimization"):
         source = root / name
@@ -176,7 +176,11 @@ def rebuild_shared_evaluator(
     policy_header: str | None = None,
     policy_id: str | None = None,
 ) -> None:
-    """Build the configured evaluator once in the shared cluster workspace."""
+    """Build the configured evaluator once in the shared cluster workspace.
+
+    The flags match the reference evaluator builds (no native tuning, no IPO). A build
+    directory holding ``.fxopt-keep`` serves stored runs and is never replaced.
+    """
     remote_host = _token(host, "host")
     executable = PurePosixPath(_token(evaluator, "evaluator"))
     if (policy_header is None) != (policy_id is None):
@@ -197,6 +201,8 @@ def rebuild_shared_evaluator(
     build_script = " ".join((
         "set -euo pipefail;",
         f"root={shlex.quote(str(REMOTE_BASE))};",
+        f"if test -e {quoted_build}/.fxopt-keep; then",
+        f"echo {shlex.quote(f'refusing to replace kept evaluator build {build_dir}')} >&2; exit 3; fi;",
         'cmake -S "$root/twocrypto-cpp" -B "$root/twocrypto-cpp/build/cluster-release"',
         '-DCMAKE_BUILD_TYPE=Release -DTWOCRYPTO_POOL_BUILD_TESTS=OFF',
         '-DTWOCRYPTO_POOL_BUILD_BENCHMARKS=OFF',
@@ -204,8 +210,8 @@ def rebuild_shared_evaluator(
         'cmake --build "$root/twocrypto-cpp/build/cluster-release" --parallel --target install;',
         f"rm -rf -- {quoted_build};",
         f'cmake -S "$root/curve-fx-arb-harness" -B {quoted_build}',
-        '-DCMAKE_BUILD_TYPE=Release -DCURVE_FX_NATIVE_TUNING=ON',
-        '-DCURVE_FX_ENABLE_IPO=ON -DCMAKE_PREFIX_PATH="$root/twocrypto-cpp/_install"'
+        '-DCMAKE_BUILD_TYPE=Release -DCURVE_FX_NATIVE_TUNING=OFF',
+        '-DCURVE_FX_ENABLE_IPO=OFF -DCMAKE_PREFIX_PATH="$root/twocrypto-cpp/_install"'
         f'{policy_options};',
         f'cmake --build {quoted_build} --parallel --target {quoted_target}',
     ))

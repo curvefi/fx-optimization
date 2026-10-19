@@ -35,7 +35,6 @@ class RemoteRunStatus:
     coordinator: str
     remote_output: str | None
     detail: str = ""
-    exit_code: int | None = None
 
 
 def _remote_paths(output_dir: str | Path) -> tuple[Path, ArtifactPaths, Path]:
@@ -210,17 +209,16 @@ def remote_run_status(
     job = _read_remote_job(config, job_path)
     script = " ".join((
         f"work={shlex.quote(job.remote_output)};",
-        "state=stopped; code=;",
+        "state=stopped;",
         "if ! test -d \"$work\"; then state=missing;",
         "elif test -s \"$work/run.json\" && test -s \"$work/results.npz\"; "
-        "then state=complete; code=0;",
+        "then state=complete;",
         "elif test -s \"$work/stopped\"; then state=stopped;",
-        "elif test -s \"$work/exit_code\"; then "
-        "code=$(cat \"$work/exit_code\"); state=failed;",
+        "elif test -s \"$work/exit_code\"; then state=failed;",
         "elif test -s \"$work/pid\" && "
         "kill -0 \"$(cat \"$work/pid\")\" 2>/dev/null; then state=running;",
         "fi;",
-        "printf '%s\\n%s\\n' \"$state\" \"$code\";",
+        "printf '%s\\n' \"$state\";",
         "tail -n 1 \"$work/coordinator.log\" 2>/dev/null || true",
     ))
     checked = subprocess.run(
@@ -230,20 +228,15 @@ def remote_run_status(
         check=True,
     )
     lines = checked.stdout.splitlines()
-    if len(lines) < 2 or lines[0] not in {
+    if not lines or lines[0] not in {
         "running", "complete", "failed", "stopped", "missing"
     }:
         raise RuntimeError("coordinator returned an invalid job status")
-    try:
-        exit_code = int(lines[1]) if lines[1] else None
-    except ValueError as exc:
-        raise RuntimeError("coordinator returned an invalid exit code") from exc
     return RemoteRunStatus(
         lines[0],
         job.coordinator,
         job.remote_output,
-        detail=lines[2] if len(lines) > 2 else "",
-        exit_code=exit_code,
+        detail=lines[1] if len(lines) > 1 else "",
     )
 
 

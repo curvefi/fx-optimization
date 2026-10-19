@@ -31,14 +31,6 @@ def is_masked_metric(name: str, available: Collection[str]) -> bool:
     return masked_metric_source(name, available) is not None
 
 
-def masked_metric_uses_detach(name: str, available: Collection[str]) -> bool:
-    return (
-        is_masked_metric(name, available)
-        and name not in _SLIPPAGE_APY_SOURCES
-        and not name.startswith("tw_real_slippage_")
-    )
-
-
 def masked_metric_slippage_source(name: str) -> str | None:
     return _SLIPPAGE_APY_SOURCES.get(name)
 
@@ -68,6 +60,5 @@ __all__ = [
     "masked_metric_slippage_source",
     "masked_metric_slippage_sources",
     "masked_metric_source",
-    "masked_metric_uses_detach",
     "masked_metric_uses_slippage",
 ]
