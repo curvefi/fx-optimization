@@ -2,9 +2,13 @@
 """Full-cluster Nevergrad 12x12 (+-0.25% Don, +-0.025 RPF) block gm30 optimizer.
 
   uv sync --group nevergrad   # once: nevergrad is an optional dependency group
+  uv run --no-sync python scripts/yb_lean_study.py write clean_live_2x2_128x128   # the default --config
   uv run --no-sync python scripts/nevergrad_12x12_cluster.py --output-dir runs/<new-run> [--budget-seconds S] [--max-hosts N]
 
-The output directory receives evaluations.jsonl and best_summary.json; a directory that already holds them is refused.
+The config supplies the evaluator, session, hosts and default pool (live pool settings and keeper in the default);
+policy parameters past the eight tuned ones (report_lifetime_s) keep the config's defaults, and step_cap stays within
+the policy's 60 bp bound. The output directory receives evaluations.jsonl and best_summary.json; a directory that
+already holds them is refused.
 """
 
 from __future__ import annotations
@@ -83,7 +87,7 @@ PARAM_BOUNDS_LOCAL_072 = {
     "fast_half_life_s": (3000.0, 7200.0),
     "slow_ratio": (1.40, 2.50),
     "trend_gate": (0.0035, 0.0105),
-    "step_cap": (0.0030, 0.0075),
+    "step_cap": (0.0030, 0.0060),
     "yb_releverage_fee": (0.0100, 0.0200),
     "don_center": (0.0050, 0.0200),
     "rpf_center": (0.3400, 0.4650),
@@ -97,7 +101,7 @@ PARAM_BOUNDS_FULL_075 = {
     "fast_half_life_s": (2400.0, 9000.0),
     "slow_ratio": (1.25, 2.80),
     "trend_gate": (0.0020, 0.0125),
-    "step_cap": (0.0025, 0.0085),
+    "step_cap": (0.0025, 0.0060),
     "yb_releverage_fee": (0.0090, 0.0210),
     "don_center": (0.0035, 0.0220),
     "rpf_center": (0.3100, 0.4700),
@@ -137,6 +141,7 @@ def build_12x12_candidates(
     params: dict[str, float],
     base_pool: dict[str, Any],
     *,
+    policy_tail: tuple[float, ...] = (),
     grid_n: int = 12,
     don_radius: float = 0.0025,
     rpf_radius: float = 0.025,
@@ -154,7 +159,7 @@ def build_12x12_candidates(
     don0 = round(float(params["don_center"]), 8)
     rpf0 = round(float(params["rpf_center"]), 8)
 
-    pp = (bf, cap, fb, relax, fast_s, slow_s, tg, sc)
+    pp = (bf, cap, fb, relax, fast_s, slow_s, tg, sc, *policy_tail)
     dons = np.linspace(max(0.0005, don0 - don_radius), don0 + don_radius, grid_n)
     rpfs = np.linspace(max(0.15, rpf0 - rpf_radius), min(0.55, rpf0 + rpf_radius), grid_n)
 
@@ -331,7 +336,7 @@ def main() -> int:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/autoresearch/top100-128x128-don01to35-rpf20to50-1638400-20261018.toml"),
+        default=Path("configs/autoresearch/clean-live-2x2-ema-relax-128x128-65536-20261019.toml"),
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--budget-seconds", type=float, default=3600.0)
@@ -346,6 +351,7 @@ def main() -> int:
     open_req = open_session_request(cfg, remote=True)
     contract = _evaluator_policy_contract(cfg)
     base_pool = dict(cfg.candidate.defaults["pool"])
+    policy_tail = tuple(float(v) for v in cfg.candidate.defaults["policy_params"][8:])
 
     hosts = list(cfg.hosts[: args.max_hosts])
     nodes = cfg.numa_nodes or (None,)
@@ -625,6 +631,7 @@ def main() -> int:
                 eval_id,
                 raw_params,
                 base_pool,
+                policy_tail=policy_tail,
                 grid_n=args.grid_n,
                 don_radius=args.don_radius,
                 rpf_radius=args.rpf_radius,

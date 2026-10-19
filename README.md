@@ -205,21 +205,29 @@ use its descriptor's parameter order. Policy headers are repository-local
 build inputs, not part of the installed pool library.
 
 The current research policy is `report_lean.hpp` (id `report_lean`): a report
-fee over a half-gap price-scale step. Its 8 parameters, in order: `base_fee`,
+fee over a half-gap price-scale step. Its 9 parameters, in order: `base_fee`,
 `capture`, `fallback_fee`, `relax_time_s`, `fast_half_life_s`,
-`slow_half_life_s`, `trend_gate`, `step_cap`. The report window, keeper and
-settle delay are `pool.run` fields (`arb_report_offset`, `keeper_report`,
-`arb_settle_offset_s`). Report probabilities grid independently of the policy
+`slow_half_life_s`, `trend_gate`, `step_cap`, `report_lifetime_s` (how long the
+EMAs observe a report; `-1` reproduces the 8-parameter runs, which replay on the
+evaluator `report-lean-20261016`). The report window, keeper and settle delay
+are `pool.run` fields (`arb_report_offset`, `keeper_report`,
+`arb_settle_offset_s`); `keeper_report = 3` delivers the latest report hourly
+(`dustswap_freq_s`) or once it has moved the policy's fallback fee from the
+stored one. Report probabilities grid independently of the policy
 parameters, for example
 `"pool.run.arb_report_rate" = { start = 0.1, stop = 1.0, count = 10 }`.
 
 `scripts/yb_lean_study.py write|run|analyze [STAGE...]` writes, runs and ranks
-the three report_lean keeper grids, 128 × 128 donation × RPF planes kept in
-`configs/autoresearch/`: the top 100 slices (`top100_128x128`), the seed and
-its Nevergrad-polished slices (`ng_top13_128x128`), and a round-parameter
-2 × 2 (`clean_2x2_128x128`). `scripts/nevergrad_12x12_cluster.py --output-dir
-runs/NEW` polishes one slice with Nevergrad on the blades; install its optional
-dependency once with `uv sync --group nevergrad`.
+the report_lean grids kept in `configs/autoresearch/`: the three 128 × 128
+donation × RPF keeper grids of 2026-10-18, the top 100 slices
+(`top100_128x128`), the seed and its Nevergrad-polished slices
+(`ng_top13_128x128`) and a round-parameter 2 × 2 (`clean_2x2_128x128`); and the
+live stage `clean_live_2x2_128x128` on the live pool settings (`ma_time` 865,
+step max 0.5%, donation share cap 10%), report lifetime 90 min and
+`keeper_report = 3`, evaluator `report-lean-live-20261019`.
+`scripts/nevergrad_12x12_cluster.py --output-dir runs/NEW` polishes one slice
+with Nevergrad on the blades (default config: the clean live 2 × 2); install its
+optional dependency once with `uv sync --group nevergrad`.
 
 Use blade f64 for broad discovery and x86-64 blade long double for production
 finalist ranking. Apple ARM `long double` has binary64 width, so local Mac replay

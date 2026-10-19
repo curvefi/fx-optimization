@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""report_lean 128 x 128 slice heatmaps: write, run, view and rank the grids.
+"""report_lean slice heatmaps: write, run, view and rank the grids.
 
-Every stage is a Don 0.1..3.5% (128) x RPF 0.20..0.50 (128) plane on the Half-Gap report_lean.hpp policy with real
-Pyth reports, the picky [B - 12 s, B + 3 s] report window (arb_report_offset 2003), the hourly report keeper
-(keeper_report 2), a 1 s settle delay and the active_2l YieldBasis actor; the remaining axes are the slices:
+Every stage is a Don x RPF plane on the Half-Gap report_lean.hpp policy with real Pyth reports, the picky
+[B - 12 s, B + 3 s] report window (arb_report_offset 2003), a report keeper, a 1 s settle delay and the active_2l
+YieldBasis actor; the remaining axes are the slices. The 2026-10-18 stages (128 x 128, Don 0.1..3.5%, RPF 0.20..0.50,
+8 policy parameters, the legacy idle keeper, evaluator report-lean-20261016):
   top100_128x128     the 100 top slices of the 16 x 16 discovery grids (configs/autoresearch/top100_slices_20261018.json)
   ng_top13_128x128   seed 637315 and the 12 Nevergrad 12x12 basin winners (configs/autoresearch/nevergrad_top13_20261018.json)
   clean_2x2_128x128  round parameters: 2 EMA regimes x 2 relax times
+The live stage (the live pool's ma_time 865, 0.5% step and 10% donation share cap; report_lifetime_s; the report keeper
+keeper_report 3, due hourly or on a report move of the fallback fee; evaluator report-lean-live-20261019):
+  clean_live_2x2_128x128  clean_2x2_128x128 on the live pool and keeper
 
   uv run --no-sync python scripts/yb_lean_study.py write [STAGE...]    write and parse configs/autoresearch/<rid>.toml
   uv run --no-sync python scripts/yb_lean_study.py run [STAGE...]      fxopt run into runs/<rid>, then the 4x4 heatmap PNG
@@ -62,6 +66,23 @@ LEAN_BASE = {
     "fast_half_life_s": 3600.0, "slow_half_life_s": 10800.0, "trend_gate": 0.008,
     "step_cap": 0.00125,
 }
+# The live WETH pool and the agreed report keeper (2026-10-19): raw ma_time 865 (a 600 s half-life), a 0.5% largest step,
+# a 10% donation share cap; a report observed for 90 min; keeper_report 3, a touch with the latest report once the stored
+# one is an hour old (dustswap_freq_s) or the latest has moved the fallback fee from it. Its evaluator is a separate
+# build: report-lean-20261016 keeps replaying the 8-parameter runs.
+LIVE_EVALUATOR = "report-lean-live-20261019"
+LIVE_NAMES = [*LEAN_NAMES, "report_lifetime_s"]
+LIVE_BASE = {**LEAN_BASE, "report_lifetime_s": 5400.0}
+LIVE_POOL = {"ma_time": 865, "adjustment_step_max": 0.005, "donation_shares_max_ratio": 0.10}
+LIVE_RUN = {"keeper_report": 3}
+CLEAN_2X2_SET = {"base_fee": 0.005, "capture": 0.675, "fallback_fee": 0.0175, "relax_time_s": 150.0, "fast_half_life_s": 4800.0, "slow_half_life_s": 9600.0, "trend_gate": 0.0070, "step_cap": 0.0050}
+CLEAN_2X2_AXES = {
+    "ma_regime": [
+        {"policy_params.4": 4500.0, "policy_params.5": 9000.0, "policy_params.6": 0.0067},
+        {"policy_params.4": 4800.0, "policy_params.5": 9600.0, "policy_params.6": 0.0070},
+    ],
+    "policy_params.3": [150.0, 300.0],
+}
 
 
 def slices(name: str) -> list[dict]:
@@ -85,14 +106,15 @@ STAGES = {
     "clean_2x2_128x128": {
         "rid": "clean-2x2-ema-relax-128x128-65536-20261018",
         "note": "Clean Round-Parameter 2x2 Grid on 128x128 Don x RPF (4 slices = 65,536 pools on Half-Gap report_lean.hpp, bf=50bp, cap=0.675, fb=175bp, sc=50bp, yb=150bp): Don 0.1..3.5% (128) x RPF 0.20..0.50 (128) x 2 EMAs(75/150m@67bp, 80/160m@70bp) x 2 RelaxTime(150s, 300s)",
-        "set": {"base_fee": 0.005, "capture": 0.675, "fallback_fee": 0.0175, "relax_time_s": 150.0, "fast_half_life_s": 4800.0, "slow_half_life_s": 9600.0, "trend_gate": 0.0070, "step_cap": 0.0050},
-        "axes": lambda: {
-            "ma_regime": [
-                {"policy_params.4": 4500.0, "policy_params.5": 9000.0, "policy_params.6": 0.0067},
-                {"policy_params.4": 4800.0, "policy_params.5": 9600.0, "policy_params.6": 0.0070},
-            ],
-            "policy_params.3": [150.0, 300.0],
-        },
+        "set": CLEAN_2X2_SET,
+        "axes": lambda: CLEAN_2X2_AXES,
+    },
+    "clean_live_2x2_128x128": {
+        "rid": "clean-live-2x2-ema-relax-128x128-65536-20261019",
+        "note": "Clean Round-Parameter 2x2 Grid on the live pool and keeper (65,536 pools; ma_time 865, step max 0.5%, donation share cap 10%, report lifetime 90 min, keeper hourly or on a fallback-fee report move; bf=50bp, cap=0.675, fb=175bp, sc=50bp, yb=150bp): Don 0.1..3.5% (128) x RPF 0.20..0.50 (128) x 2 EMAs(75/150m@67bp, 80/160m@70bp) x 2 RelaxTime(150s, 300s)",
+        "live": True,
+        "set": CLEAN_2X2_SET,
+        "axes": lambda: CLEAN_2X2_AXES,
     },
 }
 
@@ -127,9 +149,12 @@ def run_of(s: str) -> Path:
 
 def write_stage_cfg(s: str) -> Path:
     S = STAGES[s]
-    p = [LEAN_BASE[k] for k in LEAN_NAMES]
+    live = S.get("live", False)
+    names = LIVE_NAMES if live else LEAN_NAMES
+    base = LIVE_BASE if live else LEAN_BASE
+    p = [base[k] for k in names]
     for k, v in S["set"].items():
-        p[LEAN_NAMES.index(k)] = v
+        p[names.index(k)] = v
     pool = {
         "donation_apy": 0.025,
         "adjustment_step_max": 0.03,
@@ -148,6 +173,9 @@ def write_stage_cfg(s: str) -> Path:
             "yb_releverage_fee": 0.015,
         },
     }
+    if live:
+        pool.update(LIVE_POOL)
+        pool["run"].update(LIVE_RUN)
     ses = {
         "event_mode": "block",
         "event_cursor": "fast_skip",
@@ -165,7 +193,7 @@ def write_stage_cfg(s: str) -> Path:
         f"# {S['note']}",
         "[run]",
         f'id = "{S["rid"]}"',
-        'evaluator = "../../../curve-fx-arb-harness/build/report-lean-20261016/arb_evaluator_f64"',
+        f'evaluator = "../../../curve-fx-arb-harness/build/{LIVE_EVALUATOR if live else "report-lean-20261016"}/arb_evaluator_f64"',
         'template = "../templates/ethusd-yb-weth-live-20250324.json"',
         "batch_size = 1024",
         "workers = 128",
@@ -187,7 +215,7 @@ def write_stage_cfg(s: str) -> Path:
         "[compiled_policy]",
         'id = "report_lean"',
         'header = "../../../twocrypto-cpp/include/pools/twocrypto_fx/policies/report_lean.hpp"',
-        f"parameter_names = {toml(LEAN_NAMES)}",
+        f"parameter_names = {toml(names)}",
         "",
         "[candidate.defaults]",
         f"policy_params = {toml(p)}",
