@@ -132,6 +132,7 @@ def open_fxopt_explorer(
     shiftclick_yb_cash_multiplier: float = 3.0,
     shiftclick_evaluator: str | Path | None = None,
     shiftclick_excluded_time_ranges: list[list[int]] | None = None,
+    freeze_colorbar: bool = False,
 ) -> HeatmapExplorer:
     """Open the interactive UI from columnar run results."""
     root = Path(run_dir).expanduser().resolve()
@@ -196,6 +197,7 @@ def open_fxopt_explorer(
         final_pdiffthr=final_price_diff_bps,
         run_id=results.run_id,
         on_replay=replay,
+        freeze_colorbar=freeze_colorbar,
     )
 
 

@@ -392,6 +392,8 @@ def worker_command(
               help="Use this local evaluator for Shift-click only; grid and right-click stay unchanged.")
 @click.option("--shiftclick-exclude-utc-day", type=click.DateTime(formats=["%Y-%m-%d"]),
               help="Skip this UTC day in Shift-click replay only (YYYY-MM-DD).")
+@click.option("--freeze-colorbar/--no-freeze-colorbar", default=False, show_default=True,
+              help="Keep colorbar limits fixed across all slider slices.")
 def heatmap_command(
     run_dir: Path, x_axis: str | None, y_axis: str | None,
     log_axes: tuple[str, ...], columns: int, metrics: tuple[str, ...],
@@ -403,6 +405,7 @@ def heatmap_command(
     shiftclick_yb_cash_multiplier: float,
     output: Path | None, show: bool,
     shiftclick_evaluator: Path | None, shiftclick_exclude_utc_day: datetime | None,
+    freeze_colorbar: bool,
 ) -> None:
     """Open the interactive filtered heatmap explorer."""
     explorer = None
@@ -423,6 +426,7 @@ def heatmap_command(
             shiftclick_yb_cash_multiplier=shiftclick_yb_cash_multiplier,
             shiftclick_evaluator=shiftclick_evaluator,
             shiftclick_excluded_time_ranges=excluded,
+            freeze_colorbar=freeze_colorbar,
         )
         if output is not None:
             image, state = explorer.save(output)

@@ -200,13 +200,22 @@ Select the header under `twocrypto-cpp/include/pools/twocrypto_fx/policies/` and
 use its descriptor's parameter order. Policy headers are repository-local
 build inputs, not part of the installed pool library.
 
-The current research policy is `report_dual_ema.hpp` (id `report_dual_ema`): a
-report fee over the dual-EMA price-scale driver. Its 13 parameters, in order:
-`base_fee`, `away_capture`, `toward_ratio`, `fallback_fee`, `fast_half_life_s`,
-`slow_half_life_s`, `kappa`, `deadband`, `min_cap`, `max_cap`, `age_offset_s`,
-`future_window_s`, `aging_s`. Report probabilities grid independently of the
-policy parameters, for example
+The current research policy is `report_lean.hpp` (id `report_lean`): a report
+fee over a half-gap price-scale step. Its 8 parameters, in order: `base_fee`,
+`capture`, `fallback_fee`, `relax_time_s`, `fast_half_life_s`,
+`slow_half_life_s`, `trend_gate`, `step_cap`. The report window, keeper and
+settle delay are `pool.run` fields (`arb_report_offset`, `keeper_report`,
+`arb_settle_offset_s`). Report probabilities grid independently of the policy
+parameters, for example
 `"pool.run.arb_report_rate" = { start = 0.1, stop = 1.0, count = 10 }`.
+
+`scripts/yb_lean_study.py write|run|analyze [STAGE...]` writes, runs and ranks
+the three report_lean keeper grids, 128 × 128 donation × RPF planes kept in
+`configs/autoresearch/`: the top 100 slices (`top100_128x128`), the seed and
+its Nevergrad-polished slices (`ng_top13_128x128`), and a round-parameter
+2 × 2 (`clean_2x2_128x128`). `scripts/nevergrad_12x12_cluster.py --output-dir
+runs/NEW` polishes one slice with Nevergrad on the blades; install its optional
+dependency once with `uv sync --group nevergrad`.
 
 Use blade f64 for broad discovery and x86-64 blade long double for production
 finalist ranking. Apple ARM `long double` has binary64 width, so local Mac replay
@@ -231,6 +240,28 @@ Masked panels exclude price divergence above 1500 bp (15%); they do not require
 positive yields. Shift-click defaults to `active_2l` and cash multiplier 3.
 Append heatmap options to override axes or thresholds while retaining the layout.
 
+For the report_lean keeper grids, `scripts/heatmap-pool-yb.sh` takes the same
+arguments and shows four rows over donation × RPF: the pool ledger, price
+tracking with steady XCP growth (`xcp_apy_gm30/60/90`), and the masked YB yields
+(`yb_apy_masked`, `yb_apy_gm30/60/90_masked`), masked at 1000 bp maximum and
+100 bp final price difference:
+
+```sh
+bash scripts/heatmap-pool-yb.sh configs/autoresearch/clean-2x2-ema-relax-128x128-65536-20261018.toml runs/clean-2x2-ema-relax-128x128-65536-20261018
+```
+
+For standalone pool grids (`yb_mode = "off"`), `scripts/heatmap-pool.sh` takes the
+same arguments and shows the pool ledger over base fee (`policy_params.0`) ×
+fast half-life (`policy_params.4`), masked at 1500 bp; Shift-click replays with YB off.
+Column 4 shows steady growth: the rolling 30/60/90-day geometric mean of the
+annualized pool XCP growth (`xcp_apy_gm*`), against all-in `xcp_growth_apy`:
+
+| Row | Panels |
+| --- | --- |
+| Value | `vp_growth_apy`, `donation_burn_apy`, `xcp_growth_apy`, `xcp_apy_gm30` |
+| Flows | `fee_xcp_apy`, `net_step_cost_apy`, `arb_take_apy`, `xcp_apy_gm60` |
+| Tracking | `avg_rel_price_diff`, `max_7d_rel_price_diff`, `trades_per_year`, `xcp_apy_gm90` |
+
 Open the mature interactive heatmap explorer directly (or save a PNG and its state):
 
 ```sh
@@ -242,7 +273,9 @@ uv run fxopt heatmap runs/GRID \
   --no-show
 ```
 
-The explorer supports metric filters, slice-local color limits, an interactive
+The explorer supports metric filters, slice-local color limits (or, with
+`--freeze-colorbar`, limits fixed to each metric's full-grid range under the
+current mask), an interactive
 adaptive limit for price difference, fixed CLI filters for detachment,
 slippage and final price difference, axis selection,
 and multi-metric views. `--columns` controls the panel layout. Clicking a cell

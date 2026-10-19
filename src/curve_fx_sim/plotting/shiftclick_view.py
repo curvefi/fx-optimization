@@ -81,18 +81,18 @@ def _donation_growth(timestamps: np.ndarray, donation_apy: np.ndarray, donation_
 
 
 def _rolling_window_growth_apy(
-    timestamps: np.ndarray, growth: np.ndarray,
+    timestamps: np.ndarray, growth: np.ndarray, window_s: float = ROLLING_APY_WINDOW_S,
 ) -> tuple[np.ndarray, np.ndarray]:
     rolling = np.full(len(timestamps), np.nan, dtype=float)
     floored = np.zeros(len(timestamps), dtype=bool)
     start = 0
     for i, ts in enumerate(timestamps):
-        cutoff = ts - ROLLING_APY_WINDOW_S
+        cutoff = ts - window_s
         while start + 1 < len(timestamps) and timestamps[start + 1] <= cutoff:
             start += 1
         dt = ts - timestamps[start]
         if (
-            dt < ROLLING_APY_WINDOW_S
+            dt < window_s
             or not np.isfinite(growth[start])
             or not (growth[start] > 0.0)
         ):
@@ -110,6 +110,36 @@ def _rolling_window_growth_apy(
     return rolling, floored
 
 
+def _rolling_window_growth_apr(
+    timestamps: np.ndarray, growth: np.ndarray, window_s: float = 7.0 * 86400.0,
+) -> np.ndarray:
+    """Simple annualized growth over a trailing window: (g_i / g_start - 1) * year / dt.
+
+    NaN until the window has at least ``window_s`` of history or while the start growth is not positive. A
+    nonpositive endpoint is a total loss over the window, -year / dt, never dropped.
+    """
+    rolling = np.full(len(timestamps), np.nan, dtype=float)
+    start = 0
+    for i, ts in enumerate(timestamps):
+        cutoff = ts - window_s
+        while start + 1 < len(timestamps) and timestamps[start + 1] <= cutoff:
+            start += 1
+        dt = ts - timestamps[start]
+        if (
+            dt < window_s
+            or not np.isfinite(growth[start])
+            or not (growth[start] > 0.0)
+            or not np.isfinite(growth[i])
+        ):
+            continue
+        if growth[i] <= 0.0:
+            rolling[i] = -SEC_PER_YEAR / dt
+            continue
+        rolling[i] = (growth[i] / growth[start] - 1.0) * (SEC_PER_YEAR / dt)
+    return rolling
+
+
+
 def _make_yb_path(
     t: np.ndarray,
     growth: np.ndarray,
@@ -119,12 +149,16 @@ def _make_yb_path(
 ) -> dict[str, Any] | None:
     if len(t) == 0:
         return None
-    rolling_apy, rolling_floored = _rolling_window_growth_apy(t, growth)
+    rolling_apy, rolling_floored = _rolling_window_growth_apy(t, growth, ROLLING_APY_WINDOW_S)
+    rolling_apy_30d, _ = _rolling_window_growth_apy(t, growth, 30.0 * 86400.0)
+    rolling_apr_7d = _rolling_window_growth_apr(t, growth, 7.0 * 86400.0)
     if max_points > 0 and len(t) > max_points:
         idx = np.linspace(0, len(t) - 1, max_points, dtype=int)
         t = t[idx]
         growth = growth[idx]
         rolling_apy = rolling_apy[idx]
+        rolling_apy_30d = rolling_apy_30d[idx]
+        rolling_apr_7d = rolling_apr_7d[idx]
         rolling_floored = rolling_floored[idx]
     elapsed = t - t[0]
     apy = np.full(len(t), np.nan, dtype=np.float64)
@@ -135,6 +169,8 @@ def _make_yb_path(
         "growth": growth,
         "apy": apy,
         "rolling_apy": rolling_apy,
+        "rolling_apy_30d": rolling_apy_30d,
+        "rolling_apr_7d": rolling_apr_7d,
         "rolling_floored": rolling_floored,
         "summary": summary,
         "source": source,
@@ -158,6 +194,7 @@ def _load_embedded_yb_path(detailed: Mapping[str, np.ndarray], max_points: int, 
         "fee": float(finite_fees[-1]) if len(finite_fees) else None,
         "apy": metrics.get("yb_apy", np.nan),
         "apy_gm": metrics.get(f"yb_apy_gm{ROLLING_APY_WINDOW_DAYS}", np.nan),
+        "apy_gm30": metrics.get("yb_apy_gm30", np.nan),
         "n_releverage_trades": int(trades[mask][-1]) if trades is not None else None,
     }
     return _make_yb_path(t, growth, summary, "pool trace", max_points)
@@ -196,15 +233,33 @@ def _plot_yb_axis(ax, yb_path):
     yb_dates = [datetime.fromtimestamp(t, timezone.utc) for t in yb_path["t"]]
     growth_pct = (yb_path["growth"] - 1.0) * 100.0
     rolling_apy_pct = yb_path["rolling_apy"] * 100.0
+    rolling_30d_pct = yb_path.get("rolling_apy_30d", np.full_like(rolling_apy_pct, np.nan)) * 100.0
+    rolling_7d_pct = yb_path.get("rolling_apr_7d", np.full_like(rolling_apy_pct, np.nan)) * 100.0
     rolling_floored = yb_path["rolling_floored"] & np.isfinite(rolling_apy_pct)
     summary = yb_path["summary"]
 
     ax.plot(
         yb_dates,
+        rolling_7d_pct,
+        linewidth=0.65,
+        color="darkorange",
+        alpha=0.40,
+        label="rolling 7d YB APR (simple)",
+    )
+    ax.plot(
+        yb_dates,
+        rolling_30d_pct,
+        linewidth=0.8,
+        color="seagreen",
+        alpha=0.75,
+        label="rolling 30d YB APY",
+    )
+    ax.plot(
+        yb_dates,
         rolling_apy_pct,
-        linewidth=0.9,
+        linewidth=1.0,
         color="purple",
-        alpha=0.85,
+        alpha=0.90,
         label=f"rolling {ROLLING_APY_WINDOW_DAYS}d annualized YB APY",
     )
     if np.any(rolling_floored):
@@ -218,6 +273,14 @@ def _plot_yb_axis(ax, yb_path):
             label="floored in GM",
         )
     ax.axhline(0, color="black", linewidth=0.7)
+    # Scale the axis to the 30d / 60d curves (1st..99th percentile, 0 included) so 7d APR spikes cannot squash them.
+    anchored = np.concatenate([rolling_apy_pct, rolling_30d_pct])
+    anchored = anchored[np.isfinite(anchored)]
+    if anchored.size:
+        lo = min(0.0, float(np.percentile(anchored, 1.0)))
+        hi = max(0.0, float(np.percentile(anchored, 99.0)))
+        pad = max(1.0, 0.1 * (hi - lo))
+        ax.set_ylim(lo - pad, hi + pad)
     ax.set_ylabel(f"{ROLLING_APY_WINDOW_DAYS}d YB APY (%)", color="purple")
     ax.tick_params(axis="y", labelcolor="purple")
     ax.grid(True, alpha=0.3)
@@ -235,8 +298,9 @@ def _plot_yb_axis(ax, yb_path):
     trades = summary.get("n_releverage_trades")
     source = yb_path.get("source", "unknown source")
     title_parts = []
+    gm30_apy = summary.get("apy_gm30", np.nan)
     if isinstance(final_apy, (int, float)):
-        title_parts.append(f"APY={final_apy * 100.0:.3g}% ({ROLLING_APY_WINDOW_DAYS}d GM={_format_pct(gm_apy)})")
+        title_parts.append(f"APY={final_apy * 100.0:.3g}% (30d GM={_format_pct(gm30_apy)}, {ROLLING_APY_WINDOW_DAYS}d GM={_format_pct(gm_apy)})")
     if isinstance(fee, (int, float)):
         title_parts.append(f"fee={fee * 100.0:.3g}%")
     if isinstance(trades, (int, float)):

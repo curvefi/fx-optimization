@@ -36,3 +36,9 @@ cluster = [
 dev = [
     "pytest>=8.0.0",
 ]
+nevergrad = [
+    "nevergrad>=1.0.12",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

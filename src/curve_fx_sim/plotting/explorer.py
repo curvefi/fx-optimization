@@ -40,7 +40,17 @@ from .masked_metrics import (
 
 _LN2 = math.log(2.0)
 _MAX_TICKS = 12
-_CONTROL_ROW_PITCH = 0.10
+# Controls window layout, in inches at full size. The rows always fill the figure: when a run has more
+# dimensions than fit the tallest window, every row shrinks by the same factor (fonts follow, down to 6 pt).
+_CONTROLS_WIDTH = 3.2
+_CONTROLS_MAX_HEIGHT = 8.0
+_CONTROLS_HEADER = 0.50
+_CONTROLS_RADIO_ROW = 0.19
+_CONTROLS_SLIDER_ROW = 0.42
+_CONTROLS_VALUE_LINE = 0.16
+_CONTROLS_FOOTER = 0.32
+_CONTROLS_LINE_CHARS = 44  # characters of 8 pt text across the window
+_CONTROLS_SLIDER_LEFT = 0.22  # slider bars start here; dimension rows put their "i/N" index left of the bar
 
 
 @dataclass(frozen=True)
@@ -80,7 +90,7 @@ def _axis_name_and_labels(name: str, values: Sequence[float]) -> tuple[str, tupl
         return display_name, tuple(f"{value:.4g}" for value in values)
     if "fee_bps" in leaf:
         return f"{name} (bps)", tuple(f"{value:.2f}" for value in values)
-    if "fee" in leaf and "gamma" not in leaf:
+    if "fee" in leaf and "gamma" not in leaf and leaf not in {"fee_gap_slope", "fee_band"}:
         scale = 1e4 if values and max(abs(value) for value in values) <= 1 else 1e-6
         return f"{name} (bps)", tuple(f"{value * scale:.2f}" for value in values)
     if "ma_time" in key or "price_source_ema_half_time" in key:
@@ -89,7 +99,8 @@ def _axis_name_and_labels(name: str, values: Sequence[float]) -> tuple[str, tupl
     if key.endswith("_wad"):
         return f"{name} (/1e18)", tuple(f"{value / 1e18:.6g}" for value in values)
     if "gamma" in key:
-        return display_name, tuple(f"{value / 1e18:.5f}" for value in values)
+        scale = 1e-18 if values and max(abs(value) for value in values) > 1 else 1.0
+        return display_name, tuple(f"{value * scale:.4g}" for value in values)
     if "liquidity" in key or "balance" in key:
         return f"{name} (/1e18)", tuple(f"{value / 1e18:.2f}" for value in values)
     return display_name, tuple(f"{value:.4g}" for value in values)
@@ -102,7 +113,7 @@ def _format_slider_value(name: str, value: float) -> str:
         return f"{value:.1f} bps"
     if leaf in {"reserved_profit_fraction", "admin_fee"}:
         return f"{(value / 1e10 if abs(value) > 1 else value):.4f}"
-    if "fee" in leaf and "gamma" not in leaf:
+    if "fee" in leaf and "gamma" not in leaf and leaf not in {"fee_gap_slope", "fee_band"}:
         return f"{value * (1e4 if abs(value) <= 1 else 1e-6):.1f} bps"
     if "ma_time" in key or "price_source_ema_half_time" in key:
         return _format_duration_short(value * _LN2)
@@ -111,7 +122,7 @@ def _format_slider_value(name: str, value: float) -> str:
     if key.endswith("_wad"):
         return f"{value / 1e18:.6g}"
     if "gamma" in key:
-        return f"{value / 1e18:.6f}"
+        return f"{(value / 1e18 if abs(value) > 1 else value):.4g}"
     if "apy" in key or "ratio" in key:
         return f"{value:.4f}"
     return f"{value:.4g}"
@@ -283,6 +294,11 @@ def _metric_scale_info(metric: str) -> tuple[float, str]:
     return scale, " (%)" if percent else ""
 
 
+def _slider_index_label(position: int, total: int) -> str:
+    """1-based lattice position of a 0-based slider index, as the CLI/GUI tables print it."""
+    return f"{position + 1}/{total}"
+
+
 def _finite_max(dataset: HeatmapDataset, metric: str, scale: float = 1.0) -> float | None:
     raw = dataset.metrics.get(metric)
     if raw is None:
@@ -313,6 +329,7 @@ class HeatmapExplorer:
         final_pdiffthr: float | None = None,
         run_id: str | None = None,
         on_replay: Callable[[HeatmapSelection, str], Any] | None = None,
+        freeze_colorbar: bool = False,
     ) -> None:
         if not isinstance(data, HeatmapDataset):
             raise TypeError("HeatmapExplorer requires a HeatmapDataset")
@@ -337,6 +354,8 @@ class HeatmapExplorer:
             slipthr = 20.0
         self.run_id = run_id or ""
         self.on_replay = on_replay
+        self.freeze_colorbar = bool(freeze_colorbar)
+        self._frozen_clims: dict[tuple[str, MaskSpec | None], tuple[float, float]] = {}
         self._updating_radios = False
         self.last_selection: HeatmapSelection | None = None
         mask = MaskSpec(
@@ -373,6 +392,7 @@ class HeatmapExplorer:
         self._threshold_sliders: dict[str, Slider] = {}
         self._metric_axes: list[Any] = []
         self._slider_value_texts: dict[str, Any] = {}
+        self._slider_index_texts: dict[str, Any] = {}
         self._threshold_value_texts: dict[str, Any] = {}
         self._main_size_initialized = False
         self._controls_size_initialized = False
@@ -421,29 +441,43 @@ class HeatmapExplorer:
             bool(masked and price_source),
             bool(slippage_sources),
         ))
-        slider_count = len(self._get_slider_dims()) + threshold_count
-        radio_height = len(keys) * 0.03 + 0.01
-        content_height = (
-            0.03 + 0.01 + radio_height + 0.02
-            + slider_count * _CONTROL_ROW_PITCH + 0.02
+        # (label, value text) of every slider row, top to bottom: dimensions first, then mask thresholds.
+        rows: list[tuple[str, str]] = [
+            (self._axis_views[key].name, self._axis_views[key].labels[self.state.slider_indices[key]])
+            for _, key in self._get_slider_dims()
+        ]
+        rows += [("", "")] * threshold_count
+        # A value that does not fit beside its label takes a line of its own below the slider.
+        wide = [len(label) + len(value) + 2 > _CONTROLS_LINE_CHARS for label, value in rows]
+        radio_inches = len(keys) * _CONTROLS_RADIO_ROW
+        content = (
+            _CONTROLS_HEADER + radio_inches + 0.10
+            + sum(_CONTROLS_SLIDER_ROW + (_CONTROLS_VALUE_LINE if extra else 0.0) for extra in wide)
+            + _CONTROLS_FOOTER
         )
-        height_multiplier = 11.0 + max(0, len(keys) - 5) * 0.3
         if not self._controls_size_initialized:
-            self.fig_controls.set_size_inches(3.2, max(6.0, content_height * height_multiplier + 1.0))
+            self.fig_controls.set_size_inches(_CONTROLS_WIDTH, min(_CONTROLS_MAX_HEIGHT, max(4.0, content)))
             self._controls_size_initialized = True
+        shrink = min(1.0, float(self.fig_controls.get_size_inches()[1]) / content)
+        self._controls_font = max(6.0, 8.0 * shrink)
+        self._controls_unit = 1.0 / content  # figure fraction per layout inch
+        unit, font = self._controls_unit, self._controls_font
         self.fig_controls.text(
-            0.5, 0.98, "Dimension Controls", ha="center", va="top", fontsize=10, fontweight="bold"
+            0.5, 1.0 - 0.06 * unit, "Dimension Controls", ha="center", va="top",
+            fontsize=font + 2, fontweight="bold",
         )
-        radio_top = 0.94
+        header_y = 1.0 - 0.30 * unit
+        radio_top = 1.0 - _CONTROLS_HEADER * unit
+        radio_height = radio_inches * unit
         radio_bottom = radio_top - radio_height
         radio_columns = (("X", 0.05), ("Y", 0.23))
         radio_boxes = []
         for title, left in radio_columns:
-            self.fig_controls.text(left, 0.95, f"{title} axis:", ha="left", va="top", fontsize=9)
+            self.fig_controls.text(left, header_y, f"{title} axis:", ha="left", va="top", fontsize=font + 1)
             box = self.fig_controls.add_axes((left, radio_bottom, 0.16, radio_height))
             box.set_frame_on(False)
             radio_boxes.append(box)
-        self.fig_controls.text(0.43, 0.95, "Dimension", ha="left", va="top", fontsize=9)
+        self.fig_controls.text(0.43, header_y, "Dimension", ha="left", va="top", fontsize=font + 1)
         label_rows = np.linspace(
             1.0,
             0.0,
@@ -456,7 +490,7 @@ class HeatmapExplorer:
                 label,
                 ha="left",
                 va="center",
-                fontsize=8,
+                fontsize=font,
             )
         x_box, y_box = radio_boxes
         self.x_radio = RadioButtons(x_box, radio_labels, active=keys.index(self.state.x_axis))
@@ -468,28 +502,23 @@ class HeatmapExplorer:
                 label.set_visible(False)
         self.sliders = []
         self._slider_value_texts = {}
-        y = radio_bottom - 0.02
-        for _, key in self._get_slider_dims():
+        self._slider_index_texts = {}
+        y = radio_bottom - 0.10 * unit
+        for (_, key), extra in zip(self._get_slider_dims(), wide, strict=False):
             axis = self.dataset.axis(key)
             view = self._axis_views[key]
-            self.fig_controls.text(0.05, y, f"{view.name}:", ha="left", va="bottom", fontsize=8)
-            control_ax = self.fig_controls.add_axes((0.20, y - 0.04, 0.62, 0.025))
+            position = self.state.slider_indices[key]
+            control_ax, self._slider_value_texts[key], y = self._add_slider_row(
+                view.name, view.labels[position], y, extra
+            )
+            self._slider_index_texts[key] = self._add_slider_index(control_ax, position, len(axis.values))
             slider = Slider(
                 control_ax, "", 0, len(axis.values) - 1,
-                valinit=self.state.slider_indices[key], valstep=1,
+                valinit=position, valstep=1,
             )
             slider.valtext.set_visible(False)
-            self._slider_value_texts[key] = self.fig_controls.text(
-                0.20,
-                y - 0.05,
-                view.labels[self.state.slider_indices[key]],
-                ha="left",
-                va="top",
-                fontsize=8,
-            )
             slider.on_changed(lambda value, name=key: self._on_dimension_slider(name, value))
             self.sliders.append((key, slider))
-            y -= _CONTROL_ROW_PITCH
         self._threshold_sliders = {}
         self._threshold_value_texts = {}
         if masked and price_source:
@@ -505,8 +534,31 @@ class HeatmapExplorer:
                 max_pricethr=self.state.mask.slippage_thr_bps,
                 minimum_maximum=100.0,
             )
-        self.fig_controls.text(0.08, max(0.02, y - 0.02), "Shift+click / right-click: exact replay", fontsize=8)
+        self.fig_controls.text(
+            0.5, 0.10 * unit, "Shift+click / right-click: exact replay", ha="center", va="bottom", fontsize=font
+        )
         self.fig_controls.canvas.draw_idle()
+
+    def _add_slider_row(self, label: str, value: str, y: float, value_below: bool) -> tuple[Any, Any, float]:
+        """One slider row with its top at figure fraction y: label and value on a line, the slider under it."""
+        unit, font = self._controls_unit, self._controls_font
+        self.fig_controls.text(0.05, y - 0.03 * unit, f"{label}:", ha="left", va="top", fontsize=font)
+        control_ax = self.fig_controls.add_axes(
+            (_CONTROLS_SLIDER_LEFT, y - 0.34 * unit, 0.93 - _CONTROLS_SLIDER_LEFT, 0.12 * unit)
+        )
+        if value_below:
+            text = self.fig_controls.text(0.07, y - 0.40 * unit, value, ha="left", va="top", fontsize=font)
+        else:
+            text = self.fig_controls.text(0.95, y - 0.03 * unit, value, ha="right", va="top", fontsize=font)
+        return control_ax, text, y - (_CONTROLS_SLIDER_ROW + (_CONTROLS_VALUE_LINE if value_below else 0.0)) * unit
+
+    def _add_slider_index(self, control_ax: Any, position: int, total: int) -> Any:
+        """Small 1-based "i/N" lattice index left of a dimension slider bar, clear of the handle and value."""
+        _, bottom, _, height = control_ax.get_position().bounds
+        return self.fig_controls.text(
+            _CONTROLS_SLIDER_LEFT - 0.04, bottom + height / 2, _slider_index_label(position, total),
+            ha="right", va="center", fontsize=self._controls_font - 1, color="dimgray",
+        )
 
     def _mask_source(self, *names: str) -> str | None:
         return next((name for name in names if name in self.dataset.metrics), None)
@@ -529,21 +581,22 @@ class HeatmapExplorer:
             float(max_pricethr or 0.0),
         )
         initial = maximum if max_pricethr is None else min(maximum, max(0.0, float(max_pricethr)))
-        self.fig_controls.text(0.05, y, f"{label}:", ha="left", va="bottom", fontsize=8)
-        control_ax = self.fig_controls.add_axes((0.20, y - 0.04, 0.62, 0.025))
+        control_ax, self._threshold_value_texts[key], y = self._add_slider_row(label, f"{initial:.4g}", y, False)
         slider = Slider(control_ax, "", 0.0, maximum, valinit=initial)
         slider.valtext.set_visible(False)
-        self._threshold_value_texts[key] = self.fig_controls.text(
-            0.20, y - 0.05, f"{initial:.4g}", ha="left", va="top", fontsize=8
-        )
         slider.on_changed(lambda value, name=key: self._on_threshold_slider(name, value))
         self._threshold_sliders[key] = slider
-        return y - _CONTROL_ROW_PITCH
+        return y
 
     def _on_dimension_slider(self, key: str, value: float) -> None:
-        self.state.slider_indices[key] = int(value)
+        position = int(value)
+        self.state.slider_indices[key] = position
         if key in self._slider_value_texts:
-            self._slider_value_texts[key].set_text(self._axis_views[key].labels[int(value)])
+            self._slider_value_texts[key].set_text(self._axis_views[key].labels[position])
+        if key in self._slider_index_texts:
+            self._slider_index_texts[key].set_text(
+                _slider_index_label(position, len(self.dataset.axis(key).values))
+            )
         self._draw_heatmaps()
 
     def _on_threshold_slider(self, key: str, value: float) -> None:
@@ -604,6 +657,25 @@ class HeatmapExplorer:
     def _on_y_changed(self, value: str) -> None:
         self._swap_axes("y", self._radio_label_to_key[value])
 
+    def _clim(self, metric: str, values: np.ndarray, metric_scale: float) -> tuple[float, float]:
+        """Per-slice limits, or with freeze_colorbar the full-grid limits per metric and mask."""
+        if not self.freeze_colorbar:
+            return _finite_clim(np.asarray(values, dtype=float) * metric_scale)
+        key = (metric, self.state.mask if is_masked_metric(metric, self.dataset.metrics) else None)
+        clim = self._frozen_clims.get(key)
+        if clim is None:
+            full = self.dataset.metric_array(metric, self.state.mask)
+            finite = full[np.isfinite(full)]
+            if not finite.size:
+                clim = (0.0, 1.0)
+            else:
+                clim = _finite_clim(np.asarray(
+                    [float(np.min(finite)) * metric_scale, float(np.max(finite)) * metric_scale],
+                    dtype=float,
+                ))
+            self._frozen_clims[key] = clim
+        return clim
+
     def _draw_heatmaps(self) -> None:
         self.fig_main.clear()
         _window_title(self.fig_main, "Heatmaps")
@@ -641,7 +713,7 @@ class HeatmapExplorer:
             metric_scale, metric_suffix = _metric_scale_info(metric)
             display_values = np.ma.masked_invalid(values) * metric_scale
             mesh = axis.pcolormesh(x_edges, y_edges, display_values, shading="auto", cmap="turbo")
-            mesh.set_clim(*_finite_clim(np.asarray(values, dtype=float) * metric_scale))
+            mesh.set_clim(*self._clim(metric, values, metric_scale))
             self.meshes.append(mesh)
             if x_view.logarithmic:
                 axis.set_xscale("log")

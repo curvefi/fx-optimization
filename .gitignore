@@ -14,9 +14,15 @@ reports/
 .env
 .lake_cache/
 # Agent-generated search manifests are mutable workbench inputs. Completed runs
-# carry their resolved configuration and replay inputs in run.json.
+# carry their resolved configuration and replay inputs in run.json. The keeper
+# grids written by scripts/yb_lean_study.py and their slice files stay tracked.
 configs/autoresearch/*
 !configs/autoresearch/README.md
+!configs/autoresearch/top100-128x128-don01to35-rpf20to50-1638400-20261018.toml
+!configs/autoresearch/nevergrad-top13-128x128-don01to35-rpf20to50-212992-20261018.toml
+!configs/autoresearch/clean-2x2-ema-relax-128x128-65536-20261018.toml
+!configs/autoresearch/top100_slices_20261018.json
+!configs/autoresearch/nevergrad_top13_20261018.json
 .DS_Store
 # Keep local datasets and provenance untracked. Existing tracked files are unaffected.
 /data/
