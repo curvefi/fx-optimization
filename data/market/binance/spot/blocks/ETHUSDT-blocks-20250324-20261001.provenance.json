@@ -1,0 +1,761 @@
+{
+  "builder": "data/market/build_block_tape.py",
+  "builder_version": 1,
+  "created_utc": "2026-10-08T13:14:55Z",
+  "inputs_fingerprint": "6f4011c9a25b52835eff427d8a768f06dcc4c9de86af8f6b05daab4850ec6830",
+  "symbol": "ETHUSDT",
+  "source": "data.binance.vision spot 1 s klines (monthly zips, daily zips for months not yet published monthly)",
+  "kline_timestamp_unit": "microseconds",
+  "file": "ETHUSDT-blocks-20250324-20261001.npz",
+  "sha256": "2cd2c296fd30636423f3e610d8e2a2ca5cfcb501e4aea2976c156d90d776955b",
+  "bytes": 256206660,
+  "clock": {
+    "block_s": 12,
+    "slot_phase": "B % 12 == 11",
+    "t0": 1742774411,
+    "t0_utc": "2025-03-24T00:00:11Z",
+    "last_block": 1790812799,
+    "last_block_utc": "2026-09-30T23:59:59Z",
+    "blocks": 4003200,
+    "start_day": "2025-03-24",
+    "end_day_exclusive": "2026-10-01",
+    "end_rule": "last slot B with B <= last Pyth report time and B + 4 covered by the kline data",
+    "pyth_reports": {
+      "file": "reports.npz",
+      "sha256": "62afd56011bfee124395834d82cba6e7a19b93cb65099e66660f38fa8ddadc50",
+      "last_ts": 1790812799
+    }
+  },
+  "arrays": {
+    "price": "price[k, j]: last trade price strictly before t0 + 12 k + price_offsets_s[j] (close of the 1 s kline covering [t - 1, t)), forward-filled, NaN only before the first trade",
+    "volume": "volume[k, j]: base volume in [t0 + 12 k + o - 12, t0 + 12 k + o), o = volume_offsets_s[j]",
+    "price_offsets_s": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "volume_offsets_s": [
+      0,
+      1,
+      2
+    ]
+  },
+  "sources": [
+    {
+      "name": "ETHUSDT-1s-2025-03.zip",
+      "kind": "monthly",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/1s/ETHUSDT-1s-2025-03.zip",
+      "sha256": "1a124c451a52d73faae3d0d1d558cd926c2b9041209133be29e82e9003deba3e",
+      "bytes": 76002598,
+      "span_utc": [
+        "2025-03-01T00:00:00Z",
+        "2025-04-01T00:00:00Z"
+      ],
+      "rows": 2678400,
+      "unit": "microseconds",
+      "header_row": false,
+      "first_open_time": 1740787200000000,
+      "last_open_time": 1743465599000000,
+      "zero_trade_rows": 344590,
+      "omitted_seconds": 0,
+      "close_time_not_open_plus_1s": 0,
+      "trade_rows_with_inconsistent_ohlc": 0
+    },
+    {
+      "name": "ETHUSDT-1s-2025-04.zip",
+      "kind": "monthly",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/1s/ETHUSDT-1s-2025-04.zip",
+      "sha256": "5a4b18408c6063305dc18368dba5c50c4e6fc0dbba1136a8cec6a4833bc12396",
+      "bytes": 71274296,
+      "span_utc": [
+        "2025-04-01T00:00:00Z",
+        "2025-05-01T00:00:00Z"
+      ],
+      "rows": 2592000,
+      "unit": "microseconds",
+      "header_row": false,
+      "first_open_time": 1743465600000000,
+      "last_open_time": 1746057599000000,
+      "zero_trade_rows": 417068,
+      "omitted_seconds": 0,
+      "close_time_not_open_plus_1s": 0,
+      "trade_rows_with_inconsistent_ohlc": 0
+    },
+    {
+      "name": "ETHUSDT-1s-2025-05.zip",
+      "kind": "monthly",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/1s/ETHUSDT-1s-2025-05.zip",
+      "sha256": "efaab35b859962367d4fa5d6ebda0855c6abadab31b5d8e26011c777eca621cb",
+      "bytes": 78215584,
+      "span_utc": [
+        "2025-05-01T00:00:00Z",
+        "2025-06-01T00:00:00Z"
+      ],
+      "rows": 2678400,
+      "unit": "microseconds",
+      "header_row": false,
+      "first_open_time": 1746057600000000,
+      "last_open_time": 1748735999000000,
+      "zero_trade_rows": 310490,
+      "omitted_seconds": 0,
+      "close_time_not_open_plus_1s": 0,
+      "trade_rows_with_inconsistent_ohlc": 0
+    },
+    {
+      "name": "ETHUSDT-1s-2025-06.zip",
+      "kind": "monthly",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/1s/ETHUSDT-1s-2025-06.zip",
+      "sha256": "21eb228758c0cfac6cc0aceeaa25883831f17baf4d0817ff513ad3be25c8ef23",
+      "bytes": 69323051,
+      "span_utc": [
+        "2025-06-01T00:00:00Z",
+        "2025-07-01T00:00:00Z"
+      ],
+      "rows": 2592000,
+      "unit": "microseconds",
+      "header_row": false,
+      "first_open_time": 1748736000000000,
+      "last_open_time": 1751327999000000,
+      "zero_trade_rows": 431567,
+      "omitted_seconds": 0,
+      "close_time_not_open_plus_1s": 0,
+      "trade_rows_with_inconsistent_ohlc": 0
+    },
+    {
+      "name": "ETHUSDT-1s-2025-07.zip",
+      "kind": "monthly",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/1s/ETHUSDT-1s-2025-07.zip",
+      "sha256": "9447b4a113ac10287da85d306b6ad0d506c6abd7309e4effb0234967fa3a2be0",
+      "bytes": 76565201,
+      "span_utc": [
+        "2025-07-01T00:00:00Z",
+        "2025-08-01T00:00:00Z"
+      ],
+      "rows": 2678400,
+      "unit": "microseconds",
+      "header_row": false,
+      "first_open_time": 1751328000000000,
+      "last_open_time": 1754006399000000,
+      "zero_trade_rows": 337808,
+      "omitted_seconds": 0,
+      "close_time_not_open_plus_1s": 0,
+      "trade_rows_with_inconsistent_ohlc": 0
+    },
+    {
+      "name": "ETHUSDT-1s-2025-08.zip",
+      "kind": "monthly",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/1s/ETHUSDT-1s-2025-08.zip",
+      "sha256": "b67ddba56e3a6e3f6d325768f60b09bf901041581695a274d1b317e5e889d8d6",
+      "bytes": 80258297,
+      "span_utc": [
+        "2025-08-01T00:00:00Z",
+        "2025-09-01T00:00:00Z"
+      ],
+      "rows": 2678400,
+      "unit": "microseconds",
+      "header_row": false,
+      "first_open_time": 1754006400000000,
+      "last_open_time": 1756684799000000,
+      "zero_trade_rows": 257882,
+      "omitted_seconds": 0,
+      "close_time_not_open_plus_1s": 0,
+      "trade_rows_with_inconsistent_ohlc": 0
+    },
+    {
+      "name": "ETHUSDT-1s-2025-09.zip",
+      "kind": "monthly",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/1s/ETHUSDT-1s-2025-09.zip",
+      "sha256": "f469146a157027048b03f1d7518cf5a90e3a06d7622a55c75f57bc3fb1142011",
+      "bytes": 67779752,
+      "span_utc": [
+        "2025-09-01T00:00:00Z",
+        "2025-10-01T00:00:00Z"
+      ],
+      "rows": 2592000,
+      "unit": "microseconds",
+      "header_row": false,
+      "first_open_time": 1756684800000000,
+      "last_open_time": 1759276799000000,
+      "zero_trade_rows": 442318,
+      "omitted_seconds": 0,
+      "close_time_not_open_plus_1s": 0,
+      "trade_rows_with_inconsistent_ohlc": 0
+    },
+    {
+      "name": "ETHUSDT-1s-2025-10.zip",
+      "kind": "monthly",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/1s/ETHUSDT-1s-2025-10.zip",
+      "sha256": "d96ba8539522a9ec55263acc1781cc13ec6ce7d4ff70a3f4572d71f783f4640d",
+      "bytes": 75899488,
+      "span_utc": [
+        "2025-10-01T00:00:00Z",
+        "2025-11-01T00:00:00Z"
+      ],
+      "rows": 2678400,
+      "unit": "microseconds",
+      "header_row": false,
+      "first_open_time": 1759276800000000,
+      "last_open_time": 1761955199000000,
+      "zero_trade_rows": 366403,
+      "omitted_seconds": 0,
+      "close_time_not_open_plus_1s": 0,
+      "trade_rows_with_inconsistent_ohlc": 0
+    },
+    {
+      "name": "ETHUSDT-1s-2025-11.zip",
+      "kind": "monthly",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/1s/ETHUSDT-1s-2025-11.zip",
+      "sha256": "6e7ab259bb8867fae0c04757fd3f39ad317e1dec81bbe64cfe000a5267718d16",
+      "bytes": 72764980,
+      "span_utc": [
+        "2025-11-01T00:00:00Z",
+        "2025-12-01T00:00:00Z"
+      ],
+      "rows": 2592000,
+      "unit": "microseconds",
+      "header_row": false,
+      "first_open_time": 1761955200000000,
+      "last_open_time": 1764547199000000,
+      "zero_trade_rows": 412361,
+      "omitted_seconds": 0,
+      "close_time_not_open_plus_1s": 0,
+      "trade_rows_with_inconsistent_ohlc": 0
+    },
+    {
+      "name": "ETHUSDT-1s-2025-12.zip",
+      "kind": "monthly",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/1s/ETHUSDT-1s-2025-12.zip",
+      "sha256": "45cb97d49aa2a6e71bf61a82568bbe03a95160b9bbc2d8d31933ed539f16dfb5",
+      "bytes": 64895732,
+      "span_utc": [
+        "2025-12-01T00:00:00Z",
+        "2026-01-01T00:00:00Z"
+      ],
+      "rows": 2678400,
+      "unit": "microseconds",
+      "header_row": false,
+      "first_open_time": 1764547200000000,
+      "last_open_time": 1767225599000000,
+      "zero_trade_rows": 672524,
+      "omitted_seconds": 0,
+      "close_time_not_open_plus_1s": 0,
+      "trade_rows_with_inconsistent_ohlc": 0
+    },
+    {
+      "name": "ETHUSDT-1s-2026-01.zip",
+      "kind": "monthly",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/1s/ETHUSDT-1s-2026-01.zip",
+      "sha256": "25250805e9e151f2cdabc19ecacc4a8ab6e644ace7ea751456601e1d5dd69590",
+      "bytes": 63280095,
+      "span_utc": [
+        "2026-01-01T00:00:00Z",
+        "2026-02-01T00:00:00Z"
+      ],
+      "rows": 2678400,
+      "unit": "microseconds",
+      "header_row": false,
+      "first_open_time": 1767225600000000,
+      "last_open_time": 1769903999000000,
+      "zero_trade_rows": 708206,
+      "omitted_seconds": 0,
+      "close_time_not_open_plus_1s": 0,
+      "trade_rows_with_inconsistent_ohlc": 0
+    },
+    {
+      "name": "ETHUSDT-1s-2026-02.zip",
+      "kind": "monthly",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/1s/ETHUSDT-1s-2026-02.zip",
+      "sha256": "d84580d54a38781df4c14b3fccb954d8906e7a049878a43969aea6fff38d55a4",
+      "bytes": 66220897,
+      "span_utc": [
+        "2026-02-01T00:00:00Z",
+        "2026-03-01T00:00:00Z"
+      ],
+      "rows": 2419200,
+      "unit": "microseconds",
+      "header_row": false,
+      "first_open_time": 1769904000000000,
+      "last_open_time": 1772323199000000,
+      "zero_trade_rows": 452364,
+      "omitted_seconds": 0,
+      "close_time_not_open_plus_1s": 0,
+      "trade_rows_with_inconsistent_ohlc": 0
+    },
+    {
+      "name": "ETHUSDT-1s-2026-03.zip",
+      "kind": "monthly",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/1s/ETHUSDT-1s-2026-03.zip",
+      "sha256": "df3e3c64794ad78965e29e52a7085d66f66ca205e3bc70d7c9b0c3a0820c28bc",
+      "bytes": 65367983,
+      "span_utc": [
+        "2026-03-01T00:00:00Z",
+        "2026-04-01T00:00:00Z"
+      ],
+      "rows": 2678400,
+      "unit": "microseconds",
+      "header_row": false,
+      "first_open_time": 1772323200000000,
+      "last_open_time": 1775001599000000,
+      "zero_trade_rows": 701813,
+      "omitted_seconds": 0,
+      "close_time_not_open_plus_1s": 0,
+      "trade_rows_with_inconsistent_ohlc": 0
+    },
+    {
+      "name": "ETHUSDT-1s-2026-04.zip",
+      "kind": "monthly",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/1s/ETHUSDT-1s-2026-04.zip",
+      "sha256": "e66fa294bc98985e01013bb705ce1c554216702da3b787e099c218ef6b7f0d33",
+      "bytes": 59205390,
+      "span_utc": [
+        "2026-04-01T00:00:00Z",
+        "2026-05-01T00:00:00Z"
+      ],
+      "rows": 2592000,
+      "unit": "microseconds",
+      "header_row": false,
+      "first_open_time": 1775001600000000,
+      "last_open_time": 1777593599000000,
+      "zero_trade_rows": 754556,
+      "omitted_seconds": 0,
+      "close_time_not_open_plus_1s": 0,
+      "trade_rows_with_inconsistent_ohlc": 0
+    },
+    {
+      "name": "ETHUSDT-1s-2026-05.zip",
+      "kind": "monthly",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/1s/ETHUSDT-1s-2026-05.zip",
+      "sha256": "34c9cefd68b3a841ad3c0c1f9c3fa041ccc89a6f75b0b359e1a3eb4d69d02563",
+      "bytes": 57740488,
+      "span_utc": [
+        "2026-05-01T00:00:00Z",
+        "2026-06-01T00:00:00Z"
+      ],
+      "rows": 2678400,
+      "unit": "microseconds",
+      "header_row": false,
+      "first_open_time": 1777593600000000,
+      "last_open_time": 1780271999000000,
+      "zero_trade_rows": 866794,
+      "omitted_seconds": 0,
+      "close_time_not_open_plus_1s": 0,
+      "trade_rows_with_inconsistent_ohlc": 0
+    },
+    {
+      "name": "ETHUSDT-1s-2026-06.zip",
+      "kind": "monthly",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/1s/ETHUSDT-1s-2026-06.zip",
+      "sha256": "fad739a41cdd5574d9262cc182490cbcf09400ca7821b3fec8ea6d2ed978645d",
+      "bytes": 62358002,
+      "span_utc": [
+        "2026-06-01T00:00:00Z",
+        "2026-07-01T00:00:00Z"
+      ],
+      "rows": 2592000,
+      "unit": "microseconds",
+      "header_row": false,
+      "first_open_time": 1780272000000000,
+      "last_open_time": 1782863999000000,
+      "zero_trade_rows": 679676,
+      "omitted_seconds": 0,
+      "close_time_not_open_plus_1s": 0,
+      "trade_rows_with_inconsistent_ohlc": 0
+    },
+    {
+      "name": "ETHUSDT-1s-2026-07.zip",
+      "kind": "monthly",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/1s/ETHUSDT-1s-2026-07.zip",
+      "sha256": "093f882bd1c0bea9367e0c4a6a50ea82b9d7d6274f5c62a1810d15b39a958d39",
+      "bytes": 61509863,
+      "span_utc": [
+        "2026-07-01T00:00:00Z",
+        "2026-08-01T00:00:00Z"
+      ],
+      "rows": 2678400,
+      "unit": "microseconds",
+      "header_row": false,
+      "first_open_time": 1782864000000000,
+      "last_open_time": 1785542399000000,
+      "zero_trade_rows": 708711,
+      "omitted_seconds": 0,
+      "close_time_not_open_plus_1s": 0,
+      "trade_rows_with_inconsistent_ohlc": 0
+    },
+    {
+      "name": "ETHUSDT-1s-2026-08.zip",
+      "kind": "monthly",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/1s/ETHUSDT-1s-2026-08.zip",
+      "sha256": "cf65149d610676dc3c10364ad151fc69a410c280cb24793d4135dcfd540142cb",
+      "bytes": 57228148,
+      "span_utc": [
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z"
+      ],
+      "rows": 2678400,
+      "unit": "microseconds",
+      "header_row": false,
+      "first_open_time": 1785542400000000,
+      "last_open_time": 1788220799000000,
+      "zero_trade_rows": 887565,
+      "omitted_seconds": 0,
+      "close_time_not_open_plus_1s": 0,
+      "trade_rows_with_inconsistent_ohlc": 0
+    },
+    {
+      "name": "ETHUSDT-1s-2026-09.zip",
+      "kind": "monthly",
+      "url": "https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/1s/ETHUSDT-1s-2026-09.zip",
+      "sha256": "aecc6196852931e5941269d7ae8c71f284392eae7056168ce317e8af5a1f9631",
+      "bytes": 61089564,
+      "span_utc": [
+        "2026-09-01T00:00:00Z",
+        "2026-10-01T00:00:00Z"
+      ],
+      "rows": 2592000,
+      "unit": "microseconds",
+      "header_row": false,
+      "first_open_time": 1788220800000000,
+      "last_open_time": 1790812799000000,
+      "zero_trade_rows": 635616,
+      "omitted_seconds": 0,
+      "close_time_not_open_plus_1s": 0,
+      "trade_rows_with_inconsistent_ohlc": 0
+    },
+    {
+      "name": "ETHUSDT-1s-2026-10-01.zip",
+      "kind": "daily",
+      "url": "https://data.binance.vision/data/spot/daily/klines/ETHUSDT/1s/ETHUSDT-1s-2026-10-01.zip",
+      "sha256": "9672ee25ec2d7944c8ae86c267b729a92e84ae0e87d8021675b7d89d849a3a29",
+      "bytes": 1939134,
+      "span_utc": [
+        "2026-10-01T00:00:00Z",
+        "2026-10-02T00:00:00Z"
+      ],
+      "rows": 86400,
+      "unit": "microseconds",
+      "header_row": false,
+      "first_open_time": 1790812800000000,
+      "last_open_time": 1790899199000000,
+      "zero_trade_rows": 25236,
+      "omitted_seconds": 0,
+      "close_time_not_open_plus_1s": 0,
+      "trade_rows_with_inconsistent_ohlc": 0
+    }
+  ],
+  "coverage": {
+    "data_utc": [
+      "2025-03-01T00:00:00Z",
+      "2026-10-02T00:00:00Z"
+    ],
+    "data_seconds": 50112000,
+    "kline_rows": 50112000,
+    "zero_trade_rows": 10413548,
+    "omitted_seconds": 0,
+    "seconds_forward_filled": 10413548,
+    "unpublished_days_inside_window": [],
+    "unpublished_days_at_the_end": [],
+    "tape_window_utc": [
+      "2025-03-23T23:59:59Z",
+      "2026-10-01T00:00:03Z"
+    ],
+    "tape_window_seconds": 48038404,
+    "tape_window_seconds_forward_filled": 10153482,
+    "price_cells": 20016000,
+    "price_cells_forward_filled_by_offset": {
+      "0": 837243,
+      "1": 874985,
+      "2": 811455,
+      "3": 792769,
+      "4": 831783
+    },
+    "price_cells_nan": 0,
+    "no_trade_runs_in_tape_window": {
+      "runs_of_at_least_60s": 0,
+      "longest": [
+        {
+          "start": "2026-08-12T04:34:18Z",
+          "seconds": 28
+        },
+        {
+          "start": "2026-07-25T03:41:26Z",
+          "seconds": 27
+        },
+        {
+          "start": "2026-08-09T05:35:08Z",
+          "seconds": 26
+        },
+        {
+          "start": "2026-08-02T00:18:19Z",
+          "seconds": 24
+        },
+        {
+          "start": "2025-07-06T00:28:39Z",
+          "seconds": 23
+        },
+        {
+          "start": "2026-05-24T18:08:21Z",
+          "seconds": 23
+        },
+        {
+          "start": "2026-07-25T21:15:58Z",
+          "seconds": 23
+        },
+        {
+          "start": "2026-08-01T03:57:29Z",
+          "seconds": 23
+        },
+        {
+          "start": "2026-08-09T05:27:52Z",
+          "seconds": 23
+        },
+        {
+          "start": "2026-01-11T11:50:01Z",
+          "seconds": 22
+        }
+      ]
+    }
+  },
+  "download": {
+    "connections": 16,
+    "seconds": 2.3,
+    "archives": 20,
+    "archive_bytes_total": 1288918543,
+    "zips_kept": true,
+    "build_seconds": 8.5
+  },
+  "validation": {
+    "flow12s": {
+      "reference": "ETHUSDT-flow12s-20250324-20261001.npz",
+      "reference_sha256": "249ea31055a60a4f42fbfb1eb9b060b69d8c0ab5e1cccf9172985246f32313f1",
+      "reference_bins": 4003200,
+      "first_bin": 0,
+      "blocks_compared": 4003200,
+      "last_block_matches_last_bin": true,
+      "bins_with_trades": 4002776,
+      "bins_without_trades": 424,
+      "price_close_mismatches": 0,
+      "price_max_abs_diff": 0.0,
+      "price_worst_block": 1742774411,
+      "volume_mismatches_rtol_1e-9": 0,
+      "volume_not_bit_equal": 2915006,
+      "volume_max_abs_diff": 4.802132025361061e-10,
+      "volume_worst_abs_block": 1788525023,
+      "volume_max_rel_diff": 9.525458046262071e-14,
+      "volume_worst_rel_block": 1743239015,
+      "empty_bins_price_not_carried": 0,
+      "empty_bins_volume_nonzero": 0,
+      "mismatches": 0
+    },
+    "flow1s": {
+      "reference": "ETHUSDT-1s-20260601-20260929.npz",
+      "reference_sha256": "036a9d989f2d07eaf523d7831f98d84717dc39437fc7f9b90d1f489f30170339",
+      "blocks_compared": 863998,
+      "first_block": 1780272023,
+      "last_block": 1790639987,
+      "price": {
+        "0": {
+          "mismatches": 0,
+          "reference_unknown": 0,
+          "max_abs_diff": 0.0
+        },
+        "1": {
+          "mismatches": 0,
+          "reference_unknown": 0,
+          "max_abs_diff": 0.0
+        },
+        "2": {
+          "mismatches": 0,
+          "reference_unknown": 0,
+          "max_abs_diff": 0.0
+        },
+        "3": {
+          "mismatches": 0,
+          "reference_unknown": 0,
+          "max_abs_diff": 0.0
+        },
+        "4": {
+          "mismatches": 0,
+          "reference_unknown": 0,
+          "max_abs_diff": 0.0
+        }
+      },
+      "volume": {
+        "0": {
+          "mismatches_rtol_1e-9": 0,
+          "max_abs_diff": 1.8189894035458565e-12,
+          "max_rel_diff": 8.614727640156396e-16
+        },
+        "1": {
+          "mismatches_rtol_1e-9": 0,
+          "max_abs_diff": 1.8189894035458565e-12,
+          "max_rel_diff": 8.637942284592435e-16
+        },
+        "2": {
+          "mismatches_rtol_1e-9": 0,
+          "max_abs_diff": 1.8189894035458565e-12,
+          "max_rel_diff": 7.956215294891055e-16
+        }
+      },
+      "mismatches": 0,
+      "examples": [
+        {
+          "block": 1780272023,
+          "utc": "2026-06-01T00:00:23Z",
+          "tape_price": [
+            2006.95,
+            2006.95,
+            2006.94,
+            2006.94,
+            2006.94
+          ],
+          "flow1s_price": [
+            2006.95,
+            2006.95,
+            2006.94,
+            2006.94,
+            2006.94
+          ],
+          "tape_volume": [
+            23.208800000000004,
+            22.6771,
+            22.4369
+          ],
+          "flow1s_volume": [
+            23.2088,
+            22.677100000000003,
+            22.436899999999998
+          ]
+        },
+        {
+          "block": 1785456011,
+          "utc": "2026-07-31T00:00:11Z",
+          "tape_price": [
+            1918.84,
+            1918.84,
+            1918.85,
+            1918.85,
+            1918.84
+          ],
+          "flow1s_price": [
+            1918.84,
+            1918.84,
+            1918.85,
+            1918.85,
+            1918.84
+          ],
+          "tape_volume": [
+            19.364699999999996,
+            19.376699999999996,
+            12.5778
+          ],
+          "flow1s_volume": [
+            19.364699999999996,
+            19.376699999999996,
+            12.5778
+          ]
+        },
+        {
+          "block": 1790639987,
+          "utc": "2026-09-28T23:59:47Z",
+          "tape_price": [
+            2688.71,
+            2688.71,
+            2688.71,
+            2688.71,
+            2688.71
+          ],
+          "flow1s_price": [
+            2688.71,
+            2688.71,
+            2688.71,
+            2688.71,
+            2688.71
+          ],
+          "tape_volume": [
+            1.7503,
+            1.7459,
+            0.8096
+          ],
+          "flow1s_volume": [
+            1.7503,
+            1.7459,
+            0.8096
+          ]
+        }
+      ]
+    },
+    "pyth_sanity": {
+      "blocks_compared": 4003200,
+      "binance_over_pyth_bp": {
+        "p0.1": -11.68443139376263,
+        "p1": -7.68492426456133,
+        "median": 0.8951087679794132,
+        "p99": 15.35185677840211,
+        "p99.9": 20.156137974363357,
+        "max_abs": 250.6450308591273,
+        "blocks_beyond_100bp": 4
+      },
+      "pyth_report_age_s": {
+        "median": 0.0,
+        "max": 2048
+      }
+    },
+    "structure": {
+      "blocks": 4003200,
+      "t0_mod_12": 11,
+      "price_nonpositive_or_nonfinite": 0,
+      "volume_negative_or_nonfinite": 0,
+      "price_min": 1386.76,
+      "price_max": 4956.51,
+      "volume_total": 256149853.91807997
+    },
+    "passed": true,
+    "layout": {
+      "members": [
+        "format_version",
+        "t0",
+        "block_s",
+        "price_offsets_s",
+        "volume_offsets_s",
+        "price",
+        "volume"
+      ],
+      "dtypes": {
+        "format_version": "<u4",
+        "t0": "<i8",
+        "block_s": "<i8",
+        "price_offsets_s": "<i8",
+        "volume_offsets_s": "<i8",
+        "price": "<f8",
+        "volume": "<f8"
+      },
+      "shapes": {
+        "format_version": [],
+        "t0": [],
+        "block_s": [],
+        "price_offsets_s": [
+          5
+        ],
+        "volume_offsets_s": [
+          3
+        ],
+        "price": [
+          4003200,
+          5
+        ],
+        "volume": [
+          4003200,
+          3
+        ]
+      },
+      "readback_identical": true
+    }
+  },
+  "environment": {
+    "python": "3.12.6",
+    "numpy": "2.5.2",
+    "pyarrow": "25.0.1"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "dataset_id": "binance-ethusdt-block-tape",
+  "files": {
+    "ETHUSDT-blocks-20250324-20261001.npz": {
+      "bytes": 256206660,
+      "sha256": "2cd2c296fd30636423f3e610d8e2a2ca5cfcb501e4aea2976c156d90d776955b"
+    }
+  },
+  "format": "fxopt-dataset-v1",
+  "revision": "20261008"
+}

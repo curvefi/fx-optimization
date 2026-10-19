@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
 """report_lean slice heatmaps: write, run, view and rank the grids.
 
-Every stage is a Don x RPF plane on the Half-Gap report_lean.hpp policy with real Pyth reports, the picky
-[B - 12 s, B + 3 s] report window (arb_report_offset 2003), a report keeper, a 1 s settle delay and the active_2l
-YieldBasis actor; the remaining axes are the slices. The 2026-10-18 stages (128 x 128, Don 0.1..3.5%, RPF 0.20..0.50,
-8 policy parameters, the legacy idle keeper, evaluator report-lean-20261016):
-  top100_128x128     the 100 top slices of the 16 x 16 discovery grids (configs/autoresearch/top100_slices_20261018.json)
-  ng_top13_128x128   seed 637315 and the 12 Nevergrad 12x12 basin winners (configs/autoresearch/nevergrad_top13_20261018.json)
-  clean_2x2_128x128  round parameters: 2 EMA regimes x 2 relax times
-The live stage (the live pool's ma_time 865, 0.5% step and 10% donation share cap; report_lifetime_s; the report keeper
-keeper_report 3, due hourly or on a report move of the fallback fee; evaluator report-lean-live-20261019):
-  clean_live_2x2_128x128  clean_2x2_128x128 on the live pool and keeper
+Every stage is a Don 0.1..3.5% (128) x RPF 0.20..0.50 (128) plane on the Half-Gap report_lean.hpp policy and the live
+WETH pool, with real Pyth reports, the picky [B - 12 s, B + 3 s] report window (arb_report_offset 2003), a 1 s settle
+delay, the active_2l YieldBasis actor and the report keeper; the remaining axes are the slices:
+  top100_128x128          the 100 top slices of the 16 x 16 discovery grids (configs/autoresearch/top100_slices_20261018.json)
+  ng_top13_128x128        seed 637315 and the 12 Nevergrad 12x12 basin winners (configs/autoresearch/nevergrad_top13_20261018.json)
+  clean_live_2x2_128x128  round parameters: 2 EMA regimes x 2 relax times
+The 2026-10-18 runs of these grids (8 policy parameters, the idle keeper, pool settings ma_time 600, step max 3% and
+donation share cap 55%, evaluator report-lean-20261016) are archived with their configs.
 
   uv run --no-sync python scripts/yb_lean_study.py write [STAGE...]    write and parse configs/autoresearch/<rid>.toml
   uv run --no-sync python scripts/yb_lean_study.py run [STAGE...]      fxopt run into runs/<rid>, then the 4x4 heatmap PNG
   uv run --no-sync python scripts/yb_lean_study.py analyze [STAGE...]  rank the slices by earning area
+  uv run --no-sync python scripts/yb_lean_study.py local STAGE ORDINAL [NAME=VALUE...]
+      write configs/autoresearch/local-<stage>-<ordinal>.toml: that cell of the stage's run and its 3 x 3 Don x RPF
+      neighbours on this machine, with any policy parameter (base_fee ... report_lifetime_s), donation_apy or
+      reserved_profit_fraction set to VALUE; run it with `uv run fxopt run CONFIG --output runs/<same name>`
 Without STAGE arguments every stage is used.
 """
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -30,7 +33,8 @@ from fxopt.results import read_result_columns
 
 OPT = Path(__file__).resolve().parents[1]
 CONFIGS = OPT / "configs" / "autoresearch"
-PYTH_FEED = "../../../data/market/pyth/ethusd/reports-20250324-20261001.npz"
+PYTH_FEED = "../../data/market/pyth/ethusd/reports-20250324-20261001.npz"
+BLOCK_TAPE = "../../data/market/binance/spot/blocks/ETHUSDT-blocks-20250324-20261001.npz"
 # The first host builds the evaluator and coordinates the run. blade-a4 since 2026-10-12: root's nix channel on
 # blade-a3 was moved to 26.05 that day, and what is built there links a glibc the other blades lack; blade-a4 is still
 # on the 23.05 channel that every blade can run.
@@ -59,22 +63,15 @@ DON_128 = [round(0.001 + (0.035 - 0.001) * i / 127, 8) for i in range(128)]
 RPF_128 = [round(0.20 + (0.50 - 0.20) * i / 127, 8) for i in range(128)]
 LEAN_NAMES = [
     "base_fee", "capture", "fallback_fee", "relax_time_s",
-    "fast_half_life_s", "slow_half_life_s", "trend_gate", "step_cap",
+    "fast_half_life_s", "slow_half_life_s", "trend_gate", "step_cap", "report_lifetime_s",
 ]
 LEAN_BASE = {
     "base_fee": 0.003, "capture": 0.80, "fallback_fee": 0.015, "relax_time_s": 300.0,
     "fast_half_life_s": 3600.0, "slow_half_life_s": 10800.0, "trend_gate": 0.008,
-    "step_cap": 0.00125,
+    "step_cap": 0.00125, "report_lifetime_s": 5400.0,
 }
-# The live WETH pool and the agreed report keeper (2026-10-19): raw ma_time 865 (a 600 s half-life), a 0.5% largest step,
-# a 10% donation share cap; a report observed for 90 min; keeper_report 3, a touch with the latest report once the stored
-# one is an hour old (dustswap_freq_s) or the latest has moved the fallback fee from it. Its evaluator is a separate
-# build: report-lean-20261016 keeps replaying the 8-parameter runs.
-LIVE_EVALUATOR = "report-lean-live-20261019"
-LIVE_NAMES = [*LEAN_NAMES, "report_lifetime_s"]
-LIVE_BASE = {**LEAN_BASE, "report_lifetime_s": 5400.0}
-LIVE_POOL = {"ma_time": 865, "adjustment_step_max": 0.005, "donation_shares_max_ratio": 0.10}
-LIVE_RUN = {"keeper_report": 3}
+# The evaluator of the 9-parameter report_lean with the report keeper (report-lean-20261016 replays the archived runs).
+EVALUATOR = "report-lean-live-20261019"
 CLEAN_2X2_SET = {"base_fee": 0.005, "capture": 0.675, "fallback_fee": 0.0175, "relax_time_s": 150.0, "fast_half_life_s": 4800.0, "slow_half_life_s": 9600.0, "trend_gate": 0.0070, "step_cap": 0.0050}
 CLEAN_2X2_AXES = {
     "ma_regime": [
@@ -92,27 +89,20 @@ def slices(name: str) -> list[dict]:
 
 STAGES = {
     "top100_128x128": {
-        "rid": "top100-128x128-don01to35-rpf20to50-1638400-20261018",
-        "note": "Top 100 Slices High-Resolution 128x128 Don x RPF Grid (100 slices = 1,638,400 pools on Half-Gap report_lean.hpp, relax=300s fixed): Don 0.1..3.5% (128) x RPF 0.20..0.50 (128) x 100 Top Slices across prod1b_1to2, prod1a_1to2, prod1a_30m, prod1a_20m, hm7, and hm6 (1..54 pure 1:2 EMAs, 55..100 pre-1:2 EMAs)",
+        "rid": "top100-128x128-don01to35-rpf20to50-1638400-20261019",
+        "note": "Top 100 Slices High-Resolution 128x128 Don x RPF Grid on the live pool and keeper (100 slices = 1,638,400 pools on Half-Gap report_lean.hpp, relax=300s fixed; ma_time 865, step max 0.5%, donation share cap 10%, report lifetime 90 min, keeper hourly or on a fallback-fee report move): Don 0.1..3.5% (128) x RPF 0.20..0.50 (128) x 100 Top Slices across prod1b_1to2, prod1a_1to2, prod1a_30m, prod1a_20m, hm7, and hm6 (1..54 pure 1:2 EMAs, 55..100 pre-1:2 EMAs)",
         "set": {"base_fee": 0.005, "capture": 0.75, "fallback_fee": 0.020, "relax_time_s": 300.0, "fast_half_life_s": 4800.0, "slow_half_life_s": 9600.0, "trend_gate": 0.0070, "step_cap": 0.0045},
         "axes": lambda: {"top_slice": slices("top100_slices_20261018.json")},
     },
     "ng_top13_128x128": {
-        "rid": "nevergrad-top13-128x128-don01to35-rpf20to50-212992-20261018",
-        "note": "Nevergrad 1h Polished Top 12 Slices + Baseline Seed 637315 on 128x128 Don x RPF Grid (13 slices = 212,992 pools on Half-Gap report_lean.hpp): Don 0.1..3.5% (128) x RPF 0.20..0.50 (128) x 13 Polished Slices (1=Seed 637315, 2..13=Top 12 Nevergrad 12x12-Block Polished Winners)",
+        "rid": "nevergrad-top13-128x128-don01to35-rpf20to50-212992-20261019",
+        "note": "Nevergrad 1h Polished Top 12 Slices + Baseline Seed 637315 on 128x128 Don x RPF Grid on the live pool and keeper (13 slices = 212,992 pools on Half-Gap report_lean.hpp; ma_time 865, step max 0.5%, donation share cap 10%, report lifetime 90 min, keeper hourly or on a fallback-fee report move): Don 0.1..3.5% (128) x RPF 0.20..0.50 (128) x 13 Polished Slices (1=Seed 637315, 2..13=Top 12 Nevergrad 12x12-Block Polished Winners)",
         "set": {"base_fee": 0.005, "capture": 0.675, "fallback_fee": 0.0175, "relax_time_s": 300.0, "fast_half_life_s": 4800.0, "slow_half_life_s": 9600.0, "trend_gate": 0.0070, "step_cap": 0.0050},
         "axes": lambda: {"polished_slice": slices("nevergrad_top13_20261018.json")},
-    },
-    "clean_2x2_128x128": {
-        "rid": "clean-2x2-ema-relax-128x128-65536-20261018",
-        "note": "Clean Round-Parameter 2x2 Grid on 128x128 Don x RPF (4 slices = 65,536 pools on Half-Gap report_lean.hpp, bf=50bp, cap=0.675, fb=175bp, sc=50bp, yb=150bp): Don 0.1..3.5% (128) x RPF 0.20..0.50 (128) x 2 EMAs(75/150m@67bp, 80/160m@70bp) x 2 RelaxTime(150s, 300s)",
-        "set": CLEAN_2X2_SET,
-        "axes": lambda: CLEAN_2X2_AXES,
     },
     "clean_live_2x2_128x128": {
         "rid": "clean-live-2x2-ema-relax-128x128-65536-20261019",
         "note": "Clean Round-Parameter 2x2 Grid on the live pool and keeper (65,536 pools; ma_time 865, step max 0.5%, donation share cap 10%, report lifetime 90 min, keeper hourly or on a fallback-fee report move; bf=50bp, cap=0.675, fb=175bp, sc=50bp, yb=150bp): Don 0.1..3.5% (128) x RPF 0.20..0.50 (128) x 2 EMAs(75/150m@67bp, 80/160m@70bp) x 2 RelaxTime(150s, 300s)",
-        "live": True,
         "set": CLEAN_2X2_SET,
         "axes": lambda: CLEAN_2X2_AXES,
     },
@@ -149,33 +139,27 @@ def run_of(s: str) -> Path:
 
 def write_stage_cfg(s: str) -> Path:
     S = STAGES[s]
-    live = S.get("live", False)
-    names = LIVE_NAMES if live else LEAN_NAMES
-    base = LIVE_BASE if live else LEAN_BASE
-    p = [base[k] for k in names]
+    p = [LEAN_BASE[k] for k in LEAN_NAMES]
     for k, v in S["set"].items():
-        p[names.index(k)] = v
-    pool = {
+        p[LEAN_NAMES.index(k)] = v
+    pool = {  # the live WETH pool: raw ma_time 865 (a 600 s half-life), a 0.5% largest step, a 10% donation share cap
         "donation_apy": 0.025,
-        "adjustment_step_max": 0.03,
-        "ma_time": 600,
+        "adjustment_step_max": 0.005,
+        "ma_time": 865,
         "initial_donation_days": 0,
         "donation_frequency": 86400,
         "donation_coins_ratio": 0.5,
         "reserved_profit_fraction": 0.5,
-        "donation_shares_max_ratio": 0.55,
+        "donation_shares_max_ratio": 0.10,
         "costs": {"entry_edge_bps": 1.5, "arb_fee_bps": 0.0, "gas_coin0": 0.0, "report_coin0": 0.0},
         "run": {
             "arb_report_offset": 2003,  # [B - 12 s, B + 3 s]: the arbitrageur picks the most profitable report
-            "keeper_report": 2,         # the hourly idle touch carries the latest report
+            "keeper_report": 3,         # the latest report, hourly (dustswap_freq_s) or once it moved the fallback fee
             "arb_report_rate": 1.0,
             "arb_settle_offset_s": 1,
             "yb_releverage_fee": 0.015,
         },
     }
-    if live:
-        pool.update(LIVE_POOL)
-        pool["run"].update(LIVE_RUN)
     ses = {
         "event_mode": "block",
         "event_cursor": "fast_skip",
@@ -193,7 +177,7 @@ def write_stage_cfg(s: str) -> Path:
         f"# {S['note']}",
         "[run]",
         f'id = "{S["rid"]}"',
-        f'evaluator = "../../../curve-fx-arb-harness/build/{LIVE_EVALUATOR if live else "report-lean-20261016"}/arb_evaluator_f64"',
+        f'evaluator = "../../../curve-fx-arb-harness/build/{EVALUATOR}/arb_evaluator_f64"',
         'template = "../templates/ethusd-yb-weth-live-20250324.json"',
         "batch_size = 1024",
         "workers = 128",
@@ -208,14 +192,14 @@ def write_stage_cfg(s: str) -> Path:
         "",
         "[scenario]",
         'id = "ethusd-blocks"',
-        'block_tape = "../../../data/market/binance/spot/blocks/ETHUSDT-blocks-20250324-20261001.npz"',
+        f'block_tape = "{BLOCK_TAPE}"',
         f'price_feed = "{PYTH_FEED}"',
         'yb_mode = "active_2l"',
         "",
         "[compiled_policy]",
         'id = "report_lean"',
         'header = "../../../twocrypto-cpp/include/pools/twocrypto_fx/policies/report_lean.hpp"',
-        f"parameter_names = {toml(names)}",
+        f"parameter_names = {toml(LEAN_NAMES)}",
         "",
         "[candidate.defaults]",
         f"policy_params = {toml(p)}",
@@ -232,6 +216,48 @@ def write_stage_cfg(s: str) -> Path:
     path = cfg_of(s)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(L) + "\n")
+    return path
+
+
+def write_local_cfg(s: str, ordinal: int, assignments: list[str]) -> Path:
+    """A config for this machine (no placement): cell `ordinal` of stage s's run, with the assignments applied, at the
+    centre of a 3 x 3 Don x RPF neighbourhood one grid step apart."""
+    cell = read_result_columns(run_of(s), metrics=["yb_apy_gm60"]).candidate_at(ordinal)
+    params = list(cell.policy_params)
+    pool = json.loads(json.dumps(dict(cell.pool_overrides)))
+    for assignment in assignments:
+        name, _, value = assignment.partition("=")
+        if name in LEAN_NAMES:
+            params[LEAN_NAMES.index(name)] = float(value)
+        elif name in ("donation_apy", "reserved_profit_fraction"):
+            pool[name] = float(value)
+        else:
+            raise SystemExit(f"unknown NAME {name!r}: one of {', '.join(LEAN_NAMES)}, donation_apy, reserved_profit_fraction")
+    don, rpf = pool["donation_apy"], pool["reserved_profit_fraction"]
+    axes = {"pool.donation_apy": [round(don + k * (DON_128[1] - DON_128[0]), 8) for k in (-1, 0, 1)],
+            "pool.reserved_profit_fraction": [round(rpf + k * (RPF_128[1] - RPF_128[0]), 8) for k in (-1, 0, 1)]}
+    rid = f"local-{s}-{ordinal}"
+    lines, section = [], ""
+    for line in cfg_of(s).read_text().splitlines():
+        if line.startswith("["):
+            section = line
+        if section in ("[placement]", "[candidate.axes]"):
+            continue
+        if line.startswith("# "):
+            line = f"# {rid}: {s} ordinal {ordinal}, its 3 x 3 Don x RPF neighbours, this machine" + "".join(f"; {a}" for a in assignments)
+        elif section == "[run]" and line.startswith("id = "):
+            line = f'id = "{rid}"'
+        elif line.startswith("batch_size = "):
+            line = "batch_size = 9"
+        elif line.startswith("workers = "):
+            line = f"workers = {min(9, os.cpu_count() or 1)}"
+        elif line.startswith("policy_params = "):
+            line = f"policy_params = {toml(params)}"
+        elif line.startswith("pool = "):
+            line = f"pool = {inline(pool)}"
+        lines.append(line)
+    path = CONFIGS / f"{rid}.toml"
+    path.write_text("\n".join(lines).rstrip("\n") + "\n\n[candidate.axes]\n" + "".join(f'"{k}" = {toml(v)}\n' for k, v in axes.items()))
     return path
 
 
@@ -370,6 +396,17 @@ def analyze_stage(stage_key: str, top_k: int = 12) -> dict:
 
 def main() -> int:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "write"
+    if cmd == "local":
+        if len(sys.argv) < 4 or sys.argv[2] not in STAGES or not sys.argv[3].isdigit():
+            print(__doc__, file=sys.stderr)
+            return 2
+        path = write_local_cfg(sys.argv[2], int(sys.argv[3]), sys.argv[4:])
+        from fxopt.run import RunConfig
+        RunConfig.from_toml(path)
+        rel = path.relative_to(OPT)
+        print(f"wrote {rel}; run it with:\n  uv run fxopt run {rel} --output runs/{path.stem}\n"
+              f"  bash scripts/hm-yb.sh {rel} runs/{path.stem}")
+        return 0
     stages = sys.argv[2:] or list(STAGES)
     unknown = [s for s in stages if s not in STAGES]
     if cmd not in ("write", "run", "analyze") or unknown:

@@ -28,6 +28,25 @@ class ReplaySpec:
     evaluator_policy: Mapping[str, str | int]
 
 
+# The sibling repositories whose files a run's replay inputs name; WORKSPACE holds them side by side.
+_REPOSITORIES = ("curve-fx-optimization", "curve-fx-arb-harness", "twocrypto-cpp")
+WORKSPACE = Path(__file__).resolve().parents[3]
+
+
+def _local_path(path: str) -> Path:
+    """A replay input as stored, or, when that path does not exist here, the same file in this workspace's checkout of
+    its repository: a run recorded on another machine or in another checkout replays on this one."""
+    stored = Path(path).expanduser()
+    if stored.exists():
+        return stored
+    for repository in _REPOSITORIES:
+        if repository in stored.parts:
+            moved = WORKSPACE.joinpath(*stored.parts[stored.parts.index(repository):])
+            if moved.exists():
+                return moved
+    return stored
+
+
 def _replay_from_metadata(
     run_id: str,
     metadata: Mapping[str, Any],
@@ -45,7 +64,10 @@ def _replay_from_metadata(
         raise ValueError("run replay metadata has no local work directory")
     if not isinstance(open_session, Mapping):
         raise ValueError("run replay metadata has no local session request")
-    normalized_open_session = dict(open_session)
+    normalized_open_session = {
+        name: str(_local_path(value)) if name.endswith("_path") and isinstance(value, str) and value else value
+        for name, value in open_session.items()
+    }
     if (
         not isinstance(evaluator_policy, Mapping)
         or set(evaluator_policy)
@@ -62,8 +84,8 @@ def _replay_from_metadata(
         raise ValueError("run metadata has no valid expected evaluator policy")
     return ReplaySpec(
         run_id=run_id,
-        evaluator=Path(evaluator).expanduser(),
-        work_dir=Path(work_dir).expanduser(),
+        evaluator=_local_path(evaluator),
+        work_dir=_local_path(work_dir),
         open_session=normalized_open_session,
         evaluator_policy=dict(evaluator_policy),
     )

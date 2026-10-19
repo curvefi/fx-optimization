@@ -9,7 +9,11 @@ htmlcov/
 build/
 dist/
 *.egg-info/
-runs/
+# Run artifacts stay local, except the kept report_lean grids (results.npz and heatmap.png in Git LFS).
+runs/*
+!runs/top100-128x128-don01to35-rpf20to50-1638400-20261019/
+!runs/nevergrad-top13-128x128-don01to35-rpf20to50-212992-20261019/
+!runs/clean-live-2x2-ema-relax-128x128-65536-20261019/
 reports/
 .env
 .lake_cache/
@@ -18,12 +22,12 @@ reports/
 # grids written by scripts/yb_lean_study.py and their slice files stay tracked.
 configs/autoresearch/*
 !configs/autoresearch/README.md
-!configs/autoresearch/top100-128x128-don01to35-rpf20to50-1638400-20261018.toml
-!configs/autoresearch/nevergrad-top13-128x128-don01to35-rpf20to50-212992-20261018.toml
-!configs/autoresearch/clean-2x2-ema-relax-128x128-65536-20261018.toml
+!configs/autoresearch/top100-128x128-don01to35-rpf20to50-1638400-20261019.toml
+!configs/autoresearch/nevergrad-top13-128x128-don01to35-rpf20to50-212992-20261019.toml
 !configs/autoresearch/top100_slices_20261018.json
 !configs/autoresearch/nevergrad_top13_20261018.json
 !configs/autoresearch/clean-live-2x2-ema-relax-128x128-65536-20261019.toml
 .DS_Store
-# Keep local datasets and provenance untracked. Existing tracked files are unaffected.
+# Keep local datasets and provenance untracked; the keeper grids' ETH tapes under data/market/binance/spot/blocks and
+# data/market/pyth/ethusd are force-added (Git LFS). Existing tracked files are unaffected.
 /data/

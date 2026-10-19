@@ -11,6 +11,92 @@
 The iterative stable-plateau research process is documented in
 [`workflow.md`](workflow.md).
 
+## Quick start: the report_lean keeper grids
+
+The three repositories sit side by side in one workspace, under these directory
+names (configs and runs refer to `../../../curve-fx-arb-harness` and
+`../../../twocrypto-cpp`):
+
+```text
+curve-fx-sim/
+  twocrypto-cpp/  curve-fx-arb-harness/  curve-fx-optimization/
+```
+
+**1. Fetch the tapes and the precomputed runs (Git LFS), then open the 100-slice heatmap.**
+No evaluator is needed to browse. The `top_slice` slider (with its `i/N` index)
+scrolls the 100 slices; `--freeze-colorbar` keeps the color limits fixed across
+them.
+
+```sh
+cd curve-fx-sim/curve-fx-optimization
+git lfs install
+git lfs pull --include="data/market/binance/**,data/market/pyth/**,runs/**"
+uv sync --frozen --group dev
+
+# pool ledger, price tracking and masked YB yields (4 x 4)
+bash scripts/heatmap-pool-yb.sh \
+  configs/autoresearch/top100-128x128-don01to35-rpf20to50-1638400-20261019.toml \
+  runs/top100-128x128-don01to35-rpf20to50-1638400-20261019 --freeze-colorbar
+# the four masked YB panels only (raw, gm30, gm60, gm90)
+bash scripts/hm-yb.sh \
+  configs/autoresearch/top100-128x128-don01to35-rpf20to50-1638400-20261019.toml \
+  runs/top100-128x128-don01to35-rpf20to50-1638400-20261019
+```
+
+The same works for `nevergrad-top13-128x128-don01to35-rpf20to50-212992-20261019`
+and `clean-live-2x2-ema-relax-128x128-65536-20261019`. Both launchers open a run
+that is present; only a missing run would start `fxopt run` on the cluster.
+
+**2. Build the evaluator once** (C++17, CMake, Boost with JSON, MiniZip; see the
+harness README). Shift-click and local runs use exactly this path:
+
+```sh
+cd ../twocrypto-cpp
+cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PWD/_install" \
+  -DTWOCRYPTO_POOL_BUILD_TESTS=OFF -DTWOCRYPTO_POOL_BUILD_BENCHMARKS=OFF
+cmake --build build/release --target install
+
+cd ../curve-fx-arb-harness
+cmake -S . -B build/report-lean-live-20261019 -DCMAKE_BUILD_TYPE=Release \
+  -DCURVE_FX_NATIVE_TUNING=OFF -DCURVE_FX_ENABLE_IPO=OFF \
+  -DCMAKE_PREFIX_PATH="$PWD/../twocrypto-cpp/_install" -DPOLICY_ID=report_lean \
+  -DPOLICY_HEADER_PATH="$PWD/../twocrypto-cpp/include/pools/twocrypto_fx/policies/report_lean.hpp"
+cmake --build build/report-lean-live-20261019 --target arb_evaluator_f64 --parallel
+cd ../curve-fx-optimization
+```
+
+**3. Replay one cell with a full trace.** In the heatmap viewer, Shift-click a
+cell to replay it with YieldBasis (`active_2l`, cash x3) and plot price, fees,
+price_scale and YB growth; right-click replays it with YieldBasis off. From the
+shell, by ordinal (`(don * 128 + rpf) * 100 + slice` for top100; 637315 is the
+seed, slice 16):
+
+```sh
+uv run fxopt shiftclick runs/top100-128x128-don01to35-rpf20to50-1638400-20261019 \
+  --ordinal 637315 --output runs/inspections/top100-637315
+```
+
+Replay reads the inputs recorded in `run.json`; when those paths do not exist on
+this machine, it uses the same files in this workspace's repositories.
+
+**4. Re-run cells locally with your own parameters.** `local` writes a config
+for this machine (no cluster placement): the chosen cell of a stage's run at the
+centre of its 3 x 3 donation x RPF neighbourhood, with any policy parameter
+(`base_fee`, `capture`, `fallback_fee`, `relax_time_s`, `fast_half_life_s`,
+`slow_half_life_s`, `trend_gate`, `step_cap`, `report_lifetime_s`),
+`donation_apy` or `reserved_profit_fraction` overridden. Nine pools take a few
+seconds; the result opens like any run, Shift-click included:
+
+```sh
+uv run --no-sync python scripts/yb_lean_study.py local top100_128x128 637315 step_cap=0.004 report_lifetime_s=3600
+uv run fxopt run configs/autoresearch/local-top100_128x128-637315.toml --output runs/local-top100_128x128-637315
+bash scripts/hm-yb.sh configs/autoresearch/local-top100_128x128-637315.toml runs/local-top100_128x128-637315
+```
+
+For a larger local sweep, edit `[candidate.axes]` of that config (any
+`policy_params.N` or `pool.*` field, see below) and set `workers` to the
+machine's cores; a config without `[placement]` always runs locally.
+
 ## Setup
 
 Use Python 3.12 and `uv`. Build the pool and harness first, then install this checkout:
@@ -218,13 +304,16 @@ parameters, for example
 `"pool.run.arb_report_rate" = { start = 0.1, stop = 1.0, count = 10 }`.
 
 `scripts/yb_lean_study.py write|run|analyze [STAGE...]` writes, runs and ranks
-the report_lean grids kept in `configs/autoresearch/`: the three 128 × 128
-donation × RPF keeper grids of 2026-10-18, the top 100 slices
-(`top100_128x128`), the seed and its Nevergrad-polished slices
-(`ng_top13_128x128`) and a round-parameter 2 × 2 (`clean_2x2_128x128`); and the
-live stage `clean_live_2x2_128x128` on the live pool settings (`ma_time` 865,
-step max 0.5%, donation share cap 10%), report lifetime 90 min and
-`keeper_report = 3`, evaluator `report-lean-live-20261019`.
+the report_lean keeper grids, 128 × 128 donation × RPF planes on the live pool
+settings (`ma_time` 865, step max 0.5%, donation share cap 10%), report
+lifetime 90 min and `keeper_report = 3`, evaluator `report-lean-live-20261019`:
+the top 100 slices (`top100_128x128`), the seed and its Nevergrad-polished
+slices (`ng_top13_128x128`) and a round-parameter 2 × 2
+(`clean_live_2x2_128x128`). Their configs are tracked in `configs/autoresearch/`
+and their runs in `runs/` (`results.npz` and `heatmap.png` in Git LFS); they
+read the ETH block tape and Pyth reports under `data/market/` (Git LFS). The
+2026-10-18 runs of these grids (8 parameters, the idle keeper, the old pool
+settings) are archived outside the repository.
 `scripts/nevergrad_12x12_cluster.py --output-dir runs/NEW` polishes one slice
 with Nevergrad on the blades (default config: the clean live 2 × 2); install its
 optional dependency once with `uv sync --group nevergrad`.
@@ -259,7 +348,7 @@ tracking with steady XCP growth (`xcp_apy_gm30/60/90`), and the masked YB yields
 100 bp final price difference:
 
 ```sh
-bash scripts/heatmap-pool-yb.sh configs/autoresearch/clean-2x2-ema-relax-128x128-65536-20261018.toml runs/clean-2x2-ema-relax-128x128-65536-20261018
+bash scripts/heatmap-pool-yb.sh configs/autoresearch/top100-128x128-don01to35-rpf20to50-1638400-20261019.toml runs/top100-128x128-don01to35-rpf20to50-1638400-20261019
 ```
 
 For standalone pool grids (`yb_mode = "off"`), `scripts/heatmap-pool.sh` takes the
@@ -362,12 +451,13 @@ the ranked value is then the star minimum and each price limit applies to the
 star maximum.
 Do not copy evaluator or pool code into this repository. Run outputs are
 ordinary local artifacts and can be inspected or plotted again without
-rebuilding the grid.
+rebuilding the grid; only the keeper grids' runs are tracked.
 
 For a production run, fetch the published Git-LFS inputs required by the config:
 
 ```sh
 git lfs pull --include="data/market/btcusd/**"
+git lfs pull --include="data/market/binance/**,data/market/pyth/**,runs/**"  # the report_lean keeper grids
 ```
 
 Use `fxopt` for runs, heatmaps, replay, and remote lifecycle. The small

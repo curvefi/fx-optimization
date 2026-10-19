@@ -1,7 +1,7 @@
-# Top 100 Slices High-Resolution 128x128 Don x RPF Grid (100 slices = 1,638,400 pools on Half-Gap report_lean.hpp, relax=300s fixed): Don 0.1..3.5% (128) x RPF 0.20..0.50 (128) x 100 Top Slices across prod1b_1to2, prod1a_1to2, prod1a_30m, prod1a_20m, hm7, and hm6 (1..54 pure 1:2 EMAs, 55..100 pre-1:2 EMAs)
+# Top 100 Slices High-Resolution 128x128 Don x RPF Grid on the live pool and keeper (100 slices = 1,638,400 pools on Half-Gap report_lean.hpp, relax=300s fixed; ma_time 865, step max 0.5%, donation share cap 10%, report lifetime 90 min, keeper hourly or on a fallback-fee report move): Don 0.1..3.5% (128) x RPF 0.20..0.50 (128) x 100 Top Slices across prod1b_1to2, prod1a_1to2, prod1a_30m, prod1a_20m, hm7, and hm6 (1..54 pure 1:2 EMAs, 55..100 pre-1:2 EMAs)
 [run]
-id = "top100-128x128-don01to35-rpf20to50-1638400-20261018"
-evaluator = "../../../curve-fx-arb-harness/build/report-lean-20261016/arb_evaluator_f64"
+id = "top100-128x128-don01to35-rpf20to50-1638400-20261019"
+evaluator = "../../../curve-fx-arb-harness/build/report-lean-live-20261019/arb_evaluator_f64"
 template = "../templates/ethusd-yb-weth-live-20250324.json"
 batch_size = 1024
 workers = 128
@@ -26,18 +26,18 @@ early_stop_max_7d_rel_price_diff = 0.3
 
 [scenario]
 id = "ethusd-blocks"
-block_tape = "../../../data/market/binance/spot/blocks/ETHUSDT-blocks-20250324-20261001.npz"
-price_feed = "../../../data/market/pyth/ethusd/reports-20250324-20261001.npz"
+block_tape = "../../data/market/binance/spot/blocks/ETHUSDT-blocks-20250324-20261001.npz"
+price_feed = "../../data/market/pyth/ethusd/reports-20250324-20261001.npz"
 yb_mode = "active_2l"
 
 [compiled_policy]
 id = "report_lean"
 header = "../../../twocrypto-cpp/include/pools/twocrypto_fx/policies/report_lean.hpp"
-parameter_names = ["base_fee", "capture", "fallback_fee", "relax_time_s", "fast_half_life_s", "slow_half_life_s", "trend_gate", "step_cap"]
+parameter_names = ["base_fee", "capture", "fallback_fee", "relax_time_s", "fast_half_life_s", "slow_half_life_s", "trend_gate", "step_cap", "report_lifetime_s"]
 
 [candidate.defaults]
-policy_params = [0.005, 0.75, 0.02, 300.0, 4800.0, 9600.0, 0.007, 0.0045]
-pool = { donation_apy = 0.025, adjustment_step_max = 0.03, ma_time = 600, initial_donation_days = 0, donation_frequency = 86400, donation_coins_ratio = 0.5, reserved_profit_fraction = 0.5, donation_shares_max_ratio = 0.55, costs = { entry_edge_bps = 1.5, arb_fee_bps = 0.0, gas_coin0 = 0.0, report_coin0 = 0.0 }, run = { arb_report_offset = 2003, keeper_report = 2, arb_report_rate = 1.0, arb_settle_offset_s = 1, yb_releverage_fee = 0.015 } }
+policy_params = [0.005, 0.75, 0.02, 300.0, 4800.0, 9600.0, 0.007, 0.0045, 5400.0]
+pool = { donation_apy = 0.025, adjustment_step_max = 0.005, ma_time = 865, initial_donation_days = 0, donation_frequency = 86400, donation_coins_ratio = 0.5, reserved_profit_fraction = 0.5, donation_shares_max_ratio = 0.1, costs = { entry_edge_bps = 1.5, arb_fee_bps = 0.0, gas_coin0 = 0.0, report_coin0 = 0.0 }, run = { arb_report_offset = 2003, keeper_report = 3, arb_report_rate = 1.0, arb_settle_offset_s = 1, yb_releverage_fee = 0.015 } }
 
 [candidate.axes]
 "pool.donation_apy" = [0.001, 0.00126772, 0.00153543, 0.00180315, 0.00207087, 0.00233858, 0.0026063, 0.00287402, 0.00314173, 0.00340945, 0.00367717, 0.00394488, 0.0042126, 0.00448031, 0.00474803, 0.00501575, 0.00528346, 0.00555118, 0.0058189, 0.00608661, 0.00635433, 0.00662205, 0.00688976, 0.00715748, 0.0074252, 0.00769291, 0.00796063, 0.00822835, 0.00849606, 0.00876378, 0.0090315, 0.00929921, 0.00956693, 0.00983465, 0.01010236, 0.01037008, 0.0106378, 0.01090551, 0.01117323, 0.01144094, 0.01170866, 0.01197638, 0.01224409, 0.01251181, 0.01277953, 0.01304724, 0.01331496, 0.01358268, 0.01385039, 0.01411811, 0.01438583, 0.01465354, 0.01492126, 0.01518898, 0.01545669, 0.01572441, 0.01599213, 0.01625984, 0.01652756, 0.01679528, 0.01706299, 0.01733071, 0.01759843, 0.01786614, 0.01813386, 0.01840157, 0.01866929, 0.01893701, 0.01920472, 0.01947244, 0.01974016, 0.02000787, 0.02027559, 0.02054331, 0.02081102, 0.02107874, 0.02134646, 0.02161417, 0.02188189, 0.02214961, 0.02241732, 0.02268504, 0.02295276, 0.02322047, 0.02348819, 0.02375591, 0.02402362, 0.02429134, 0.02455906, 0.02482677, 0.02509449, 0.0253622, 0.02562992, 0.02589764, 0.02616535, 0.02643307, 0.02670079, 0.0269685, 0.02723622, 0.02750394, 0.02777165, 0.02803937, 0.02830709, 0.0285748, 0.02884252, 0.02911024, 0.02937795, 0.02964567, 0.02991339, 0.0301811, 0.03044882, 0.03071654, 0.03098425, 0.03125197, 0.03151969, 0.0317874, 0.03205512, 0.03232283, 0.03259055, 0.03285827, 0.03312598, 0.0333937, 0.03366142, 0.03392913, 0.03419685, 0.03446457, 0.03473228, 0.035]

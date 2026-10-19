@@ -1,0 +1,21 @@
+{
+  "format": "fxopt-dataset-v1",
+  "dataset_id": "pyth-ethusd-whole-second-retried-20261001",
+  "revision": "20261001",
+  "files": {
+    "reports-20250324-20261001.npz": {
+      "bytes": 340192720,
+      "sha256": "62afd56011bfee124395834d82cba6e7a19b93cb65099e66660f38fa8ddadc50"
+    }
+  },
+  "provenance": {
+    "base": "/Users/michael/Documents/projects/curve-fx-sim/data/market/pyth/ethusd-retried-20260928/reports.npz",
+    "base_reports": 47776468,
+    "appended": "/Users/michael/Documents/projects/curve-fx-sim/data/market/pyth/ethusd-1s-20260928-20261001/reports.csv",
+    "appended_reports": 259200,
+    "appended_missing_ranges": [],
+    "timestamp": "original Pyth publication time, Unix seconds",
+    "sampling": "actual integer-second quotes; no interpolation",
+    "note": "File renamed from ethusd-retried-20261001/reports.npz on 2026-10-08 (bytes unchanged). It contains every report of the earlier combined files (ethusd-retried-20260919, -20260928), which were removed; raw downloads are under pyth/ethusd-raw/."
+  }
+}
